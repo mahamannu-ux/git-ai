@@ -1124,26 +1124,48 @@ fn aggregate_session_tokens(
     let Some(raw) = event.values.get(SESSION_RAW_JSON_KEY) else {
         return;
     };
-    let Some(message) = raw.get("message") else {
+    let Some(message_envelope) = raw.get("message") else {
         return;
     };
+    // File-backed agents (Claude, etc.) put the provider message directly in
+    // `message`. OpenCode's SQLite adapter wraps the provider payload in
+    // `message.data` alongside database columns. Normalize both shapes here.
+    let message = message_envelope.get("data").unwrap_or(message_envelope);
     if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
         return;
     }
-    let Some(usage) = message.get("usage") else {
+    let Some(usage) = message.get("usage").or_else(|| message.get("tokens")) else {
         return;
     };
-    let Some(id) = message.get("id").and_then(|i| i.as_str()) else {
+    let Some(id) = message_envelope
+        .get("id")
+        .or_else(|| message.get("id"))
+        .and_then(|i| i.as_str())
+    else {
         return;
     };
 
     let model = message
         .get("model")
         .and_then(|m| m.as_str())
+        .or_else(|| message.get("modelID").and_then(|m| m.as_str()))
+        .or_else(|| {
+            message
+                .get("model")
+                .and_then(|m| m.get("modelID"))
+                .and_then(|m| m.as_str())
+        })
         .unwrap_or("unknown")
         .to_string();
 
     let get = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache = usage.get("cache");
+    let cache_get = |key: &str| {
+        cache
+            .and_then(|value| value.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
 
     let (stored_model, acc, _ts, stored_sid) =
         message_usage.entry(id.to_string()).or_insert_with(|| {
@@ -1165,10 +1187,14 @@ fn aggregate_session_tokens(
     }
     // Field-wise max: input/cache are fixed per message; output grows while
     // streaming, so the final (largest) value is authoritative.
-    acc.input = acc.input.max(get("input_tokens"));
-    acc.output = acc.output.max(get("output_tokens"));
-    acc.cache_read = acc.cache_read.max(get("cache_read_input_tokens"));
-    acc.cache_creation = acc.cache_creation.max(get("cache_creation_input_tokens"));
+    acc.input = acc.input.max(get("input_tokens").max(get("input")));
+    acc.output = acc.output.max(get("output_tokens").max(get("output")));
+    acc.cache_read = acc
+        .cache_read
+        .max(get("cache_read_input_tokens").max(cache_get("read")));
+    acc.cache_creation = acc
+        .cache_creation
+        .max(get("cache_creation_input_tokens").max(cache_get("write")));
 }
 
 /// Extract token usage from a codex session event. Codex emits `token_count`
@@ -1380,6 +1406,54 @@ mod tests {
             &values,
             attrs(repo_url, "claude", Some(session_id)),
         ))
+    }
+
+    fn opencode_session(ts: u32, repo_url: Option<&str>, session_id: &str) -> MetricHistoryRecord {
+        let values = SessionEventValues::new(json!({
+            "message": {
+                "id": "msg-opencode-1",
+                "session_id": session_id,
+                "data": {
+                    "role": "assistant",
+                    "modelID": "deepseek-v4",
+                    "tokens": {
+                        "input": 40,
+                        "output": 12,
+                        "reasoning": 2,
+                        "cache": { "read": 7, "write": 3 }
+                    },
+                    "cost": 0
+                }
+            }
+        }));
+        record(MetricEvent::with_timestamp(
+            ts,
+            &values,
+            attrs(repo_url, "opencode", Some(session_id)),
+        ))
+    }
+
+    #[test]
+    fn opencode_wrapped_session_events_contribute_tokens_and_model() {
+        let now = now_ts();
+        let records = [opencode_session(
+            now - 1,
+            Some("github.com/acme/repo"),
+            "session-open",
+        )];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+        let stats = compute_activity_from_records(
+            &refs,
+            now.saturating_sub(3600),
+            "last hour".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+        assert_eq!(stats.tokens.input, 40);
+        assert_eq!(stats.tokens.output, 12);
+        assert_eq!(stats.tokens.cache_read, 7);
+        assert_eq!(stats.tokens.cache_creation, 3);
+        assert_eq!(stats.tokens.by_model[0].model, "deepseek-v4");
     }
 
     #[test]

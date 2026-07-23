@@ -329,11 +329,11 @@ fn extract_model_from_opencode_sqlite(
     //   Assistant messages: data.modelID        (top-level string)
     let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match session_id {
         Some(sid) => (
-            "SELECT data FROM message WHERE session_id = ? AND (data LIKE '%\"modelID\"%' OR data LIKE '%\"model\"%') LIMIT 1",
+            "SELECT data FROM message WHERE session_id = ? AND (data LIKE '%\"modelID\"%' OR data LIKE '%\"model\"%') ORDER BY time_updated DESC, id DESC LIMIT 1",
             vec![Box::new(sid.to_string())],
         ),
         None => (
-            "SELECT data FROM message WHERE (data LIKE '%\"modelID\"%' OR data LIKE '%\"model\"%') LIMIT 1",
+            "SELECT data FROM message WHERE (data LIKE '%\"modelID\"%' OR data LIKE '%\"model\"%') ORDER BY time_updated DESC, id DESC LIMIT 1",
             vec![],
         ),
     };
@@ -523,6 +523,22 @@ mod tests {
 
         let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
         assert_eq!(result, Some("claude-opus-4-6".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_opencode_uses_latest_model_after_switch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO message VALUES ('msg-1', 'sess-1', 1000, 1000, '{\"role\":\"assistant\",\"modelID\":\"nemotron\"}');
+             INSERT INTO message VALUES ('msg-2', 'sess-1', 2000, 2000, '{\"role\":\"assistant\",\"modelID\":\"deepseek-v4\"}');",
+        ).unwrap();
+        drop(conn);
+
+        let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
+        assert_eq!(result, Some("deepseek-v4".to_string()));
     }
 
     #[test]

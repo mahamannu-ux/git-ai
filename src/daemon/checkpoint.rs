@@ -1,7 +1,7 @@
 use crate::authorship::attribution_tracker::{
     Attribution, AttributionTracker, INITIAL_ATTRIBUTION_TS, LineAttribution,
 };
-use crate::authorship::authorship_log_serialization::generate_session_id;
+use crate::authorship::authorship_log_serialization::generate_model_session_id;
 #[cfg(not(any(test, feature = "test-support")))]
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::imara_diff_utils::{
@@ -94,7 +94,7 @@ pub fn build_agent_usage_attrs(
     repo: Option<&Repository>,
     agent_id: &AgentId,
 ) -> crate::metrics::EventAttributes {
-    let session_id = generate_session_id(&agent_id.id, &agent_id.tool);
+    let session_id = generate_model_session_id(&agent_id.id, &agent_id.tool, &agent_id.model);
 
     let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
         .session_id(session_id)
@@ -128,7 +128,7 @@ fn build_checkpoint_attrs(
     // Extract session_id from agent_id if available
     let session_id = agent_id
         .as_ref()
-        .map(|aid| generate_session_id(&aid.id, &aid.tool))
+        .map(|aid| generate_model_session_id(&aid.id, &aid.tool, &aid.model))
         .unwrap_or_default();
 
     let mut attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
@@ -849,7 +849,7 @@ async fn get_checkpoint_entries(
                 .agent_id
                 .as_ref()
                 .map(|aid| {
-                    let session_id = generate_session_id(&aid.id, &aid.tool);
+                    let session_id = generate_model_session_id(&aid.id, &aid.tool, &aid.model);
                     format!("{}::{}", session_id, trace_id)
                 })
                 .unwrap_or_else(|| kind.to_str())

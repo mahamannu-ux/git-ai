@@ -497,6 +497,19 @@ pub fn generate_session_id(agent_id: &str, tool: &str) -> String {
     format!("s_{}", &hex[..14])
 }
 
+/// Generate the internal attribution session ID for a concrete model invocation.
+///
+/// The external agent conversation can outlive a model switch. Including the model
+/// prevents a later checkpoint from replacing the earlier model's SessionRecord,
+/// while `AgentId::id` continues to preserve the customer-visible conversation ID.
+pub fn generate_model_session_id(agent_id: &str, tool: &str, model: &str) -> String {
+    let combined = format!("{}:{}:{}", tool, agent_id, model);
+    let mut hasher = Sha256::new();
+    hasher.update(combined.as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    format!("s_{}", &hex[..14])
+}
+
 /// Generate a trace ID: "t_" + 14 random hex chars = 16 chars total.
 /// Unique per checkpoint call (not deterministic). Used for per-checkpoint granularity
 /// in attestation keys.
@@ -850,6 +863,22 @@ mod tests {
         assert_eq!(id, generate_session_id("session_123", "cursor"));
         // Different inputs produce different output
         assert_ne!(id, generate_session_id("session_456", "cursor"));
+    }
+
+    #[test]
+    fn test_model_session_id_splits_models_but_preserves_conversation_input() {
+        let nemotron =
+            generate_model_session_id("session_123", "opencode", "nemotron-3-ultra-free");
+        let deepseek =
+            generate_model_session_id("session_123", "opencode", "deepseek-v4-flash-free");
+
+        assert!(nemotron.starts_with("s_"));
+        assert_eq!(nemotron.len(), 16);
+        assert_ne!(nemotron, deepseek);
+        assert_eq!(
+            nemotron,
+            generate_model_session_id("session_123", "opencode", "nemotron-3-ultra-free")
+        );
     }
 
     #[test]

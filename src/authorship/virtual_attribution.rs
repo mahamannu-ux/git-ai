@@ -456,9 +456,10 @@ impl VirtualAttributions {
                 if is_session_format {
                     // New format: derive session_id from this checkpoint's own agent_id
                     let session_id =
-                        crate::authorship::authorship_log_serialization::generate_session_id(
+                        crate::authorship::authorship_log_serialization::generate_model_session_id(
                             &agent_id.id,
                             &agent_id.tool,
+                            &agent_id.model,
                         );
 
                     let session_record = SessionRecord {
@@ -653,9 +654,10 @@ impl VirtualAttributions {
                 if is_session_format {
                     // New format: derive session_id from this checkpoint's own agent_id
                     let session_id =
-                        crate::authorship::authorship_log_serialization::generate_session_id(
+                        crate::authorship::authorship_log_serialization::generate_model_session_id(
                             &agent_id.id,
                             &agent_id.tool,
+                            &agent_id.model,
                         );
 
                     let session_record = SessionRecord {
@@ -839,9 +841,10 @@ impl VirtualAttributions {
                 if is_session_format {
                     // New format: derive session_id from this checkpoint's own agent_id
                     let session_id =
-                        crate::authorship::authorship_log_serialization::generate_session_id(
+                        crate::authorship::authorship_log_serialization::generate_model_session_id(
                             &agent_id.id,
                             &agent_id.tool,
+                            &agent_id.model,
                         );
 
                     let session_record = SessionRecord {
