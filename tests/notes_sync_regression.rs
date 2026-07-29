@@ -2,6 +2,7 @@
 #[path = "integration/repos/mod.rs"]
 mod repos;
 
+use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::notes::db::NotesDatabase;
 use git_ai::notes::reference_server::ReferenceServer;
 use repos::test_repo::{DaemonTestScope, TestRepo, real_git_executable};
@@ -553,7 +554,7 @@ fn notes_sync_http_backend_clone_warms_notes_cache() {
 }
 
 worktree_test_wrappers! {
-    fn notes_sync_fetch_does_not_import_authorship_notes() {
+    fn notes_sync_fetch_imports_authorship_notes() {
         let (local, _upstream) = TestRepo::new_with_remote();
 
         fs::write(local.path().join("fetch-seed.txt"), "seed\n")
@@ -600,8 +601,8 @@ worktree_test_wrappers! {
 
         let fetched_note = local.read_authorship_note(&seed_sha);
         assert!(
-            fetched_note.is_none(),
-            "plain git fetch should not import authorship note for commit {}",
+            fetched_note.is_some(),
+            "plain git fetch should import authorship note for commit {}",
             seed_sha
         );
     }
@@ -1291,6 +1292,142 @@ fn notes_sync_http_backend_plain_pull_warms_notes_cache() {
         "daemon log should record the HTTP notes fetch\npath: {}\ncontents:\n{}",
         daemon_log_path.display(),
         daemon_log
+    );
+}
+
+#[test]
+fn notes_sync_http_backend_pull_rebase_preserves_force_pushed_target_note() {
+    let server = ReferenceServer::start("127.0.0.1:0").expect("start notes reference server");
+    let backend_url = server.base_url();
+    let local = TestRepo::new_with_daemon_env(&[
+        ("GIT_AI_NOTES_BACKEND_KIND", "http"),
+        ("GIT_AI_NOTES_BACKEND_URL", backend_url.as_str()),
+        ("GIT_AI_API_KEY", "notes-sync-http-rebase-test-key"),
+    ]);
+    let notes_db_path = local
+        .test_home_path()
+        .join(".git-ai")
+        .join("internal")
+        .join("notes-db");
+    let upstream = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let upstream_str = upstream.path().to_string_lossy().to_string();
+
+    local
+        .git_og(&["remote", "add", "origin", upstream_str.as_str()])
+        .expect("add origin");
+    let feature_path = local.path().join("feature.txt");
+    fs::write(&feature_path, "base\n").expect("write base");
+    local.git_og(&["add", "feature.txt"]).expect("add base");
+    local
+        .git_og(&["commit", "-m", "base commit"])
+        .expect("commit base");
+
+    local
+        .git_ai(&["checkpoint", "human", "feature.txt"])
+        .expect("checkpoint before AI edit");
+    fs::write(&feature_path, "base\nold AI line\n").expect("write old feature");
+    local
+        .git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .expect("checkpoint AI edit");
+    local.git(&["add", "feature.txt"]).expect("add old feature");
+    local
+        .git(&["commit", "-m", "old feature version"])
+        .expect("commit old feature");
+    local.sync_daemon_force();
+    let old_commit = local
+        .git_og(&["rev-parse", "HEAD"])
+        .expect("read old feature commit")
+        .trim()
+        .to_string();
+    let old_note = NotesDatabase::open_at_path(&notes_db_path)
+        .expect("open notes db")
+        .get_note(&old_commit)
+        .expect("read old note")
+        .expect("local rewrite source should have an HTTP-backed note");
+    local
+        .git_og(&["push", "-u", "origin", "HEAD"])
+        .expect("push old feature");
+
+    let remote_clone = unique_temp_path("notes-sync-http-rebase-remote");
+    let remote_clone_str = remote_clone.to_string_lossy().to_string();
+    run_git(&["clone", upstream_str.as_str(), remote_clone_str.as_str()]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "config",
+        "user.name",
+        "Test User",
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "config",
+        "user.email",
+        "test@example.com",
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "reset",
+        "--hard",
+        &format!("{old_commit}^"),
+    ]);
+    fs::write(
+        remote_clone.join("feature.txt"),
+        "base\nold AI line\nremote AI line\n",
+    )
+    .expect("write force-pushed feature");
+    run_git(&["-C", remote_clone_str.as_str(), "add", "feature.txt"]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "commit",
+        "-m",
+        "force-pushed feature version",
+    ]);
+    let remote_sha = run_git(&["-C", remote_clone_str.as_str(), "rev-parse", "HEAD"]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "push",
+        "--force",
+        "origin",
+        "HEAD",
+    ]);
+
+    let mut remote_log =
+        AuthorshipLog::deserialize_from_string(&old_note).expect("parse old authorship note");
+    remote_log.metadata.base_commit_sha = "authoritative-remote-target".to_string();
+    let remote_note = remote_log
+        .serialize_to_string()
+        .expect("serialize remote authorship note");
+    server.store().put(remote_sha.clone(), remote_note.clone());
+    assert_eq!(
+        NotesDatabase::open_at_path(&notes_db_path)
+            .expect("open notes db before pull")
+            .get_note(&remote_sha)
+            .expect("read target note before pull"),
+        None,
+        "precondition: local cache must be missing User A's rewritten note"
+    );
+
+    local
+        .git(&["pull", "--rebase"])
+        .expect("pull --rebase should succeed");
+    local.sync_daemon_force();
+
+    assert_eq!(
+        local.git_og(&["rev-parse", "HEAD"]).unwrap().trim(),
+        remote_sha,
+        "Git should recognize the local patch in the force-pushed target"
+    );
+    assert_eq!(
+        NotesDatabase::open_at_path(&notes_db_path)
+            .expect("open notes db after pull")
+            .get_note(&remote_sha)
+            .expect("read target note after pull"),
+        Some(remote_note),
+        "transport hydration must cache User A's target note before rewrite shifting"
     );
 }
 
