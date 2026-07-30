@@ -249,12 +249,12 @@ fn build_rewrite_committed_metric_event(
     metric_commit: &RewriteMetricCommit,
     batch_context: &RewriteMetricBatchContext,
 ) -> Result<Option<MetricEvent>, GitAiError> {
-    let Some(raw_note) = metric_commit.authorship_note.as_ref() else {
-        return Ok(None);
-    };
-    let authorship_log = match AuthorshipLog::deserialize_from_string(raw_note) {
-        Ok(log) => log,
-        Err(_) => return Ok(None),
+    let authorship_log = match metric_commit.authorship_note.as_ref() {
+        Some(raw_note) => match AuthorshipLog::deserialize_from_string(raw_note) {
+            Ok(log) => Some(log),
+            Err(_) => return Ok(None),
+        },
+        None => None,
     };
 
     let Some(parent_diff) = metric_commit.parent_diff.as_ref() else {
@@ -268,7 +268,7 @@ fn build_rewrite_committed_metric_event(
     let stats = crate::authorship::stats::stats_for_commit_stats_from_hunks_with_merge_flag(
         &batch_context.ignore_patterns,
         &diff_hunks,
-        Some(&authorship_log),
+        authorship_log.as_ref(),
         false,
     );
     let Some(breakdown) = metric_tool_model_breakdown(&stats) else {
@@ -282,9 +282,13 @@ fn build_rewrite_committed_metric_event(
         .tool_model_pairs(breakdown.tool_model_pairs)
         .ai_additions(breakdown.ai_additions)
         .ai_accepted(breakdown.ai_accepted)
-        .authorship_note(raw_note.clone())
         .operation_kind(metric_commit.operation.as_str())
         .original_commit_shas(metric_commit.original_shas.clone());
+
+    values = match metric_commit.authorship_note.as_ref() {
+        Some(raw_note) => values.authorship_note(raw_note.clone()),
+        None => values.authorship_note_null(),
+    };
 
     values = values.commit_subject_null().commit_body_null().hunks_null();
 
@@ -500,6 +504,60 @@ mod tests {
         assert_eq!(
             sparse.get(&rewrite_committed_pos::ORIGINAL_COMMIT_SHAS.to_string()),
             Some(&serde_json::json!(["old"]))
+        );
+    }
+
+    #[test]
+    fn deletion_only_revert_without_note_emits_lifecycle_metric() {
+        let parent_diff = DiffTreeResult {
+            hunks_by_file: HashMap::from([(
+                "fixture.txt".to_string(),
+                vec![crate::authorship::hunk_shift::DiffHunk {
+                    old_start: 2,
+                    old_count: 12,
+                    new_start: 1,
+                    new_count: 0,
+                }],
+            )]),
+            added_lines_by_file: HashMap::new(),
+            renames: Vec::new(),
+        };
+        let commit = metric_commit("revert", &["source"], RewriteMetricOperation::Revert)
+            .with_parent_sha("parent")
+            .with_parent_diff(parent_diff);
+        let context = RewriteMetricBatchContext {
+            ignore_patterns: Vec::new(),
+            repo_url: None,
+            custom_attributes_json: None,
+        };
+
+        let event = build_rewrite_committed_metric_event(&commit, &context)
+            .expect("metric build should succeed")
+            .expect("note-less deletion-only revert must remain observable");
+
+        assert_eq!(
+            event
+                .values
+                .get(&rewrite_committed_pos::GIT_DIFF_ADDED_LINES.to_string()),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            event
+                .values
+                .get(&rewrite_committed_pos::GIT_DIFF_DELETED_LINES.to_string()),
+            Some(&serde_json::json!(12))
+        );
+        assert_eq!(
+            event
+                .values
+                .get(&rewrite_committed_pos::AUTHORSHIP_NOTE.to_string()),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            event
+                .values
+                .get(&rewrite_committed_pos::OPERATION_KIND.to_string()),
+            Some(&serde_json::json!("revert"))
         );
     }
 

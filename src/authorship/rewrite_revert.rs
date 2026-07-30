@@ -1,12 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::authorship::authorship_log::LineRange;
-use crate::authorship::authorship_log_serialization::{
-    AttestationEntry, AuthorshipLog, FileAttestation,
-};
+use crate::authorship::authorship_log_serialization::{AttestationEntry, FileAttestation};
 use crate::authorship::hunk_shift::apply_hunk_shifts_to_file_attestation;
 use crate::authorship::rewrite::compute_diff_trees_batch;
 use crate::authorship::rewrite::{RewriteMetricCommit, RewriteMetricOperation};
+use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::error::GitAiError;
 use crate::git::notes_api;
 use crate::git::repository::{Repository, exec_git, exec_git_stdin};
@@ -17,6 +16,24 @@ pub struct RevertSpec {
     pub revert_commit: String,
     pub parent: Option<String>,
     pub reverted_commit: Option<String>,
+}
+
+fn deletion_only_revert_metric(
+    collect_metrics: bool,
+    revert_commit: &str,
+    original_shas: &[String],
+    parent_sha: &str,
+    parent_diff: &crate::authorship::rewrite::DiffTreeResult,
+) -> Option<RewriteMetricCommit> {
+    collect_metrics.then(|| {
+        RewriteMetricCommit::new(
+            revert_commit.to_string(),
+            original_shas.to_vec(),
+            RewriteMetricOperation::Revert,
+        )
+        .with_parent_sha(parent_sha.to_string())
+        .with_parent_diff(parent_diff.clone())
+    })
 }
 
 /// Batched revert-attribution reconstruction for one `git revert A B C ...`
@@ -131,31 +148,16 @@ pub(crate) fn handle_revert_commits_with_metrics(
         return Ok(Vec::new());
     }
 
-    // Batch-read all source notes in one call.
-    let source_base_shas: Vec<String> = {
-        let mut v: Vec<String> = resolved.iter().map(|r| r.source_base_sha.clone()).collect();
-        v.sort();
-        v.dedup();
-        v
-    };
-    let notes = notes_api::read_notes_batch(repo, &source_base_shas)?;
-
     // Build one batched diff-tree request covering, for each reverted commit:
     //  - (source_base, revert_commit): hunks to shift the source note forward,
     //  - (parent, revert_commit): added lines re-introduced by the revert.
     // Track each pair's index so we can read its result back.
     let mut diff_pairs: Vec<(String, String)> = Vec::new();
-    let mut shift_idx: Vec<Option<usize>> = Vec::new();
+    let mut shift_idx: Vec<usize> = Vec::new();
     let mut added_idx: Vec<usize> = Vec::new();
     for r in &resolved {
-        // Only need the shift pair if the source note exists.
-        let shift = if notes.contains_key(&r.source_base_sha) {
-            let idx = diff_pairs.len();
-            diff_pairs.push((r.source_base_sha.clone(), r.revert_commit.clone()));
-            Some(idx)
-        } else {
-            None
-        };
+        let shift = diff_pairs.len();
+        diff_pairs.push((r.source_base_sha.clone(), r.revert_commit.clone()));
         shift_idx.push(shift);
         let aidx = diff_pairs.len();
         diff_pairs.push((r.parent_sha.clone(), r.revert_commit.clone()));
@@ -167,24 +169,47 @@ pub(crate) fn handle_revert_commits_with_metrics(
     let mut writes: Vec<(String, String)> = Vec::new();
     let mut metric_commits: Vec<RewriteMetricCommit> = Vec::new();
     for (i, r) in resolved.iter().enumerate() {
-        let Some(shift) = shift_idx[i] else {
-            continue;
-        };
-        let Some(source_note) = notes.get(&r.source_base_sha) else {
-            continue;
-        };
-        let Ok(mut log) = AuthorshipLog::deserialize_from_string(source_note) else {
-            continue;
-        };
-
         // Added lines re-introduced by the revert (new-side hunk ranges of the
         // parent->revert diff), keyed by file.
         let added_lines = added_lines_from_diff_result(&diff_results[added_idx[i]]);
         if added_lines.is_empty() {
+            // Reverting an addition can be deletion-only. There is no surviving
+            // line attribution to write as a Note, but the rewrite event and its
+            // deletion hunks are still required for lifecycle/rework accounting.
+            if let Some(metric) = deletion_only_revert_metric(
+                collect_metrics,
+                &r.revert_commit,
+                &r.original_shas,
+                &r.parent_sha,
+                &diff_results[added_idx[i]],
+            ) {
+                metric_commits.push(metric);
+            }
             continue;
         }
 
-        let shift_result = &diff_results[shift];
+        // A Note on source_base_sha contains only attribution changed by that
+        // commit, not a complete snapshot of inherited attribution. Rebuild the
+        // effective source state through blame so a revert restores authorship
+        // from older commits as well as the immediate source Note.
+        let source_files = added_lines.keys().cloned().collect::<Vec<_>>();
+        let source_attribution = crate::tokio_runtime::block_on(async {
+            VirtualAttributions::new_for_base_commit(
+                repo.clone(),
+                r.source_base_sha.clone(),
+                &source_files,
+                None,
+            )
+            .await
+        });
+        let Ok(source_attribution) = source_attribution else {
+            continue;
+        };
+        let Ok(mut log) = source_attribution.to_authorship_log() else {
+            continue;
+        };
+
+        let shift_result = &diff_results[shift_idx[i]];
         for (old_path, new_path) in &shift_result.renames {
             for attestation in &mut log.attestations {
                 if attestation.file_path == *old_path {
@@ -361,5 +386,36 @@ mod tests {
             Some("reverted-commit".to_string())
         );
         assert_eq!(legacy_revert_metric_original_sha(""), None);
+    }
+
+    #[test]
+    fn deletion_only_revert_has_no_added_lines_but_remains_metric_eligible() {
+        let diff = crate::authorship::rewrite::DiffTreeResult {
+            hunks_by_file: HashMap::from([(
+                "deleted.md".to_string(),
+                vec![crate::authorship::hunk_shift::DiffHunk {
+                    old_start: 1,
+                    old_count: 12,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+            )]),
+            added_lines_by_file: HashMap::new(),
+            renames: Vec::new(),
+        };
+        assert!(added_lines_from_diff_result(&diff).is_empty());
+        let metric = deletion_only_revert_metric(
+            true,
+            "revert-sha",
+            &["original-sha".to_string()],
+            "parent-sha",
+            &diff,
+        )
+        .expect("deletion-only revert must remain metric eligible");
+        assert_eq!(metric.new_sha, "revert-sha");
+        assert_eq!(metric.original_shas, vec!["original-sha"]);
+        assert_eq!(metric.operation, RewriteMetricOperation::Revert);
+        assert_eq!(metric.parent_sha.as_deref(), Some("parent-sha"));
+        assert_eq!(metric.parent_diff, Some(diff));
     }
 }

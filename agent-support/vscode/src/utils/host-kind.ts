@@ -13,12 +13,14 @@ export type IDEHostConfiguration = {
 export const IDEHostKindCursor = 'cursor' as const;
 export const IDEHostKindWindsurf = 'windsurf' as const;
 export const IDEHostKindVSCode = 'vscode' as const;
+export const IDEHostKindAntigravity = 'antigravity' as const;
 export const IDEHostKindUnknown = 'unknown' as const;
 
 export type IDEHostKind =
   | typeof IDEHostKindCursor
   | typeof IDEHostKindWindsurf
   | typeof IDEHostKindVSCode
+  | typeof IDEHostKindAntigravity
   | typeof IDEHostKindUnknown;
 
 /**
@@ -45,6 +47,7 @@ export function detectIDEHost(): IDEHostConfiguration {
   const has = (s: string) => appName.includes(s) || uriScheme === s || execPath.includes(`${path.sep}${s}`);
 
   let kind: IDEHostKind =
+    has("antigravity") ? "antigravity" :
     has("cursor") ? "cursor" :
     has("windsurf") ? "windsurf" :
     has("vscodium") || uriScheme === "vscode-insiders" || uriScheme === "vscode" || appName.includes("visual studio code") ? "vscode" :

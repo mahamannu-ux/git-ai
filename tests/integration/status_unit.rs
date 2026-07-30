@@ -259,6 +259,50 @@ fn test_ai_accepted_respects_ignore_patterns() {
 }
 
 #[test]
+fn test_status_gives_known_human_working_tree_evidence_precedence_over_unknown() {
+    let repo = TestRepo::new();
+    write_file(&repo, "human.txt", "base\n");
+    repo.stage_all_and_commit("initial").unwrap();
+
+    write_file(&repo, "human.txt", "base\nhuman one\nhuman two\n");
+    repo.git_ai(&["checkpoint", "mock_known_human", "human.txt"])
+        .unwrap();
+
+    let status = status_json(&repo);
+    assert_eq!(status.stats.human_additions, 2);
+    assert_eq!(status.stats.unknown_additions, 0);
+    assert_eq!(status.stats.ai_additions, 0);
+    assert_eq!(
+        status
+            .checkpoints
+            .first()
+            .and_then(|row| row["is_human"].as_bool()),
+        Some(true),
+    );
+}
+
+#[test]
+fn test_status_marks_known_human_working_tree_deletion_as_human() {
+    let repo = TestRepo::new();
+    write_file(&repo, "human-delete.txt", "keep\ndelete manually\n");
+    repo.stage_all_and_commit("initial").unwrap();
+
+    write_file(&repo, "human-delete.txt", "keep\n");
+    repo.git_ai(&["checkpoint", "mock_known_human", "human-delete.txt"])
+        .unwrap();
+
+    let status = status_json(&repo);
+    assert_eq!(status.stats.git_diff_deleted_lines, 1);
+    assert_eq!(
+        status
+            .checkpoints
+            .first()
+            .and_then(|row| row["is_human"].as_bool()),
+        Some(true),
+    );
+}
+
+#[test]
 fn test_status_preserves_lowercase_agent_identifier() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("status-agent.txt");

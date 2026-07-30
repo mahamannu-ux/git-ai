@@ -30,6 +30,9 @@ pub struct FileLineStats {
     pub deletions: u32,
     pub additions_sloc: u32,
     pub deletions_sloc: u32,
+    pub ai_authored_deletions: u32,
+    pub human_authored_deletions: u32,
+    pub unknown_authored_deletions: u32,
 }
 
 /// Latest checkpoint state needed to process a file in the next checkpoint.
@@ -369,7 +372,12 @@ fn execute_resolved_checkpoint(
                 .lines_added(file_stat.additions)
                 .lines_deleted(file_stat.deletions)
                 .lines_added_sloc(file_stat.additions_sloc)
-                .lines_deleted_sloc(file_stat.deletions_sloc);
+                .lines_deleted_sloc(file_stat.deletions_sloc)
+                .deleted_line_provenance(
+                    file_stat.ai_authored_deletions,
+                    file_stat.human_authored_deletions,
+                    file_stat.unknown_authored_deletions,
+                );
 
             if let Some(tuid) = tool_use_id {
                 values = values.external_tool_use_id(tuid);
@@ -1053,7 +1061,13 @@ fn make_entry_for_file(
 
     // Compute line stats while we already have both contents in memory
     let stats_start = Instant::now();
-    let line_stats = compute_file_line_stats(previous_content, content);
+    let mut line_stats = compute_file_line_stats(previous_content, content);
+    populate_deleted_line_provenance(
+        &mut line_stats,
+        previous_content,
+        content,
+        &filled_in_prev_attributions,
+    );
     tracing::debug!(
         "[BENCHMARK]   compute_file_line_stats for {} took {:?}",
         file_path,
@@ -1068,6 +1082,44 @@ fn make_entry_for_file(
     );
 
     Ok((entry, line_stats))
+}
+
+fn populate_deleted_line_provenance(
+    stats: &mut FileLineStats,
+    previous_content: &str,
+    current_content: &str,
+    previous_attributions: &[Attribution],
+) {
+    let line_attributions =
+        crate::authorship::attribution_tracker::attributions_to_line_attributions_for_checkpoint(
+            previous_attributions,
+            previous_content,
+            false,
+        );
+    let mut old_line = 1u32;
+    for change in compute_line_changes(previous_content, current_content) {
+        match change.tag() {
+            LineChangeTag::Delete => {
+                for _ in change.value().lines() {
+                    let authors = line_attributions
+                        .iter()
+                        .filter(|attr| attr.start_line <= old_line && old_line <= attr.end_line)
+                        .map(|attr| attr.author_id.as_str())
+                        .collect::<Vec<_>>();
+                    if authors.iter().any(|author| is_ai_author_id(author)) {
+                        stats.ai_authored_deletions += 1;
+                    } else if authors.is_empty() {
+                        stats.unknown_authored_deletions += 1;
+                    } else {
+                        stats.human_authored_deletions += 1;
+                    }
+                    old_line += 1;
+                }
+            }
+            LineChangeTag::Equal => old_line += change.value().lines().count() as u32,
+            LineChangeTag::Insert => {}
+        }
+    }
 }
 
 /// Compute line statistics for a single file by diffing previous and current content
@@ -1120,4 +1172,26 @@ fn compute_line_stats(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod deleted_line_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_lines_preserve_their_previous_ai_or_human_provenance() {
+        let previous = "ai one\nai two\nhuman\n";
+        let current = "ai one\nhuman\n";
+        let ai_end = "ai one\nai two\n".len();
+        let attributions = vec![
+            Attribution::new(0, ai_end, "s_session::t_trace".to_string(), 1),
+            Attribution::new(ai_end, previous.len(), "h_person".to_string(), 1),
+        ];
+        let mut stats = compute_file_line_stats(previous, current);
+        populate_deleted_line_provenance(&mut stats, previous, current, &attributions);
+        assert_eq!(stats.deletions, 1);
+        assert_eq!(stats.ai_authored_deletions, 1);
+        assert_eq!(stats.human_authored_deletions, 0);
+        assert_eq!(stats.unknown_authored_deletions, 0);
+    }
 }

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PostHog } from "posthog-node";
 import { AIEditManager } from "./ai-edit-manager";
-import { detectIDEHost, IDEHostKindVSCode } from "./utils/host-kind";
+import { detectIDEHost, IDEHostKindAntigravity, IDEHostKindVSCode } from "./utils/host-kind";
 import { AITabEditManager } from "./ai-tab-edit-manager";
 import { Config } from "./utils/config";
 import { BlameLensManager, registerBlameLensCommands } from "./blame-lens-manager";
@@ -61,10 +61,14 @@ export function activate(context: vscode.ExtensionContext) {
   const knownHumanManager = new KnownHumanCheckpointManager(
     vscode.version,
     context.extension.packageJSON.version,
+    ideHostCfg.kind === IDEHostKindAntigravity,
   );
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
       knownHumanManager.handleSaveEvent(doc);
+    }),
+    vscode.workspace.onDidDeleteFiles((event) => {
+      knownHumanManager.handleDeleteEvent(event);
     }),
     { dispose: () => knownHumanManager.dispose() },
   );

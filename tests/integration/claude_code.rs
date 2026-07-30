@@ -231,7 +231,8 @@ fn test_claude_e2e_prefers_latest_checkpoint_for_prompts() {
     assert_eq!(
         commit.authorship_log.metadata.sessions.len(),
         1,
-        "Expected a single session record"
+        "Expected a single session record; log={:?}",
+        commit.authorship_log
     );
     let session_record = commit
         .authorship_log

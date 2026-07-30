@@ -567,6 +567,13 @@ impl VirtualAttributions {
             }
         }
 
+        Self::collapse_unambiguous_unknown_model_sessions(
+            &mut attributions,
+            &mut sessions,
+            &mut session_additions,
+            &mut session_deletions,
+        );
+
         // Calculate final metrics for each prompt
         Self::calculate_and_update_prompt_metrics(
             &mut prompts,
@@ -753,6 +760,13 @@ impl VirtualAttributions {
             }
         }
 
+        Self::collapse_unambiguous_unknown_model_sessions(
+            &mut attributions,
+            &mut sessions,
+            &mut session_additions,
+            &mut session_deletions,
+        );
+
         Self::calculate_and_update_prompt_metrics(
             &mut prompts,
             &attributions,
@@ -928,6 +942,13 @@ impl VirtualAttributions {
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));
             }
         }
+
+        Self::collapse_unambiguous_unknown_model_sessions(
+            &mut attributions,
+            &mut sessions,
+            &mut session_additions,
+            &mut session_deletions,
+        );
 
         Self::calculate_and_update_prompt_metrics(
             &mut prompts,
@@ -2947,6 +2968,78 @@ impl VirtualAttributions {
         let mut result = a.clone();
         result.extend(b.iter().map(|(k, v)| (k.clone(), v.clone())));
         result
+    }
+
+    /// Replace a provisional `unknown` model session when the same external
+    /// conversation later resolves to exactly one concrete model. A known-to-known
+    /// model switch remains split into distinct sessions; when multiple concrete
+    /// candidates exist we keep the unknown evidence rather than guessing.
+    fn collapse_unambiguous_unknown_model_sessions(
+        attributions: &mut HashMap<String, (Vec<Attribution>, Vec<LineAttribution>)>,
+        sessions: &mut BTreeMap<String, SessionRecord>,
+        session_additions: &mut HashMap<String, u32>,
+        session_deletions: &mut HashMap<String, u32>,
+    ) {
+        let is_unknown =
+            |model: &str| model.trim().is_empty() || model.eq_ignore_ascii_case("unknown");
+        let mut replacements = HashMap::<String, String>::new();
+
+        for (unknown_id, unknown_record) in sessions.iter() {
+            if !is_unknown(&unknown_record.agent_id.model) {
+                continue;
+            }
+            let candidates = sessions
+                .iter()
+                .filter(|(_, candidate)| {
+                    candidate.agent_id.tool == unknown_record.agent_id.tool
+                        && candidate.agent_id.id == unknown_record.agent_id.id
+                        && !is_unknown(&candidate.agent_id.model)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            if candidates.len() == 1 {
+                replacements.insert(unknown_id.clone(), candidates[0].clone());
+            }
+        }
+
+        if replacements.is_empty() {
+            return;
+        }
+
+        let remap_author = |author_id: &mut String| {
+            let (session_id, suffix) = author_id
+                .split_once("::")
+                .map_or((author_id.as_str(), None), |(session, suffix)| {
+                    (session, Some(suffix))
+                });
+            if let Some(replacement) = replacements.get(session_id) {
+                *author_id = suffix
+                    .map(|suffix| format!("{replacement}::{suffix}"))
+                    .unwrap_or_else(|| replacement.clone());
+            }
+        };
+
+        for (char_attributions, line_attributions) in attributions.values_mut() {
+            for attribution in char_attributions {
+                remap_author(&mut attribution.author_id);
+            }
+            for attribution in line_attributions {
+                remap_author(&mut attribution.author_id);
+                if let Some(overrode) = attribution.overrode.as_mut() {
+                    remap_author(overrode);
+                }
+            }
+        }
+
+        for (unknown_id, replacement_id) in replacements {
+            sessions.remove(&unknown_id);
+            if let Some(additions) = session_additions.remove(&unknown_id) {
+                *session_additions.entry(replacement_id.clone()).or_insert(0) += additions;
+            }
+            if let Some(deletions) = session_deletions.remove(&unknown_id) {
+                *session_deletions.entry(replacement_id).or_insert(0) += deletions;
+            }
+        }
     }
 
     /// Calculate and update prompt metrics (accepted_lines, overridden_lines, total_additions, total_deletions)

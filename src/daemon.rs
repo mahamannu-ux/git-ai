@@ -1901,6 +1901,56 @@ fn apply_revert_complete_rewrite(
     Ok(())
 }
 
+fn recovered_revert_spec(
+    base: Option<&str>,
+    new_head: &str,
+    reverted_commit: String,
+) -> crate::authorship::rewrite_revert::RevertSpec {
+    crate::authorship::rewrite_revert::RevertSpec {
+        revert_commit: new_head.to_string(),
+        parent: base
+            .filter(|oid| is_valid_oid(oid) && !is_zero_oid(oid))
+            .map(str::to_string),
+        reverted_commit: Some(reverted_commit),
+    }
+}
+
+fn apply_recovered_revert_complete_rewrite(
+    repo: &Repository,
+    base: Option<&str>,
+    new_head: &str,
+    reverted_commit: String,
+) -> Result<(), GitAiError> {
+    let specs = [recovered_revert_spec(base, new_head, reverted_commit)];
+    let metric_commits =
+        crate::authorship::rewrite_revert::handle_revert_commits_with_metrics(repo, &specs)?;
+    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, metric_commits);
+    Ok(())
+}
+
+fn canonical_reverted_commit_from_message(message: &str) -> Option<String> {
+    message.lines().find_map(|line| {
+        let oid = line
+            .trim()
+            .strip_prefix("This reverts commit ")?
+            .strip_suffix('.')?;
+        is_valid_oid(oid).then(|| oid.to_string())
+    })
+}
+
+fn canonical_reverted_commit_for_commit(repo: &Repository, commit_oid: &str) -> Option<String> {
+    let body = repo.find_commit(commit_oid.to_string()).ok()?.body().ok()?;
+    canonical_reverted_commit_from_message(&body)
+}
+
+fn recovered_commit_is_revert(worktree: &Path, commit_oid: &str) -> bool {
+    worktree
+        .to_str()
+        .and_then(|worktree| find_repository_in_path(worktree).ok())
+        .and_then(|repo| canonical_reverted_commit_for_commit(&repo, commit_oid))
+        .is_some()
+}
+
 fn apply_cherry_pick_complete_rewrite(
     repo: &crate::git::repository::Repository,
     original_head: &str,
@@ -5025,6 +5075,7 @@ impl ActorDaemonCoordinator {
         let is_write_op = matches!(
             primary,
             "commit"
+                | "revert"
                 | "rebase"
                 | "merge"
                 | "cherry-pick"
@@ -5523,8 +5574,42 @@ impl ActorDaemonCoordinator {
                                         &repo, cmd,
                                     )?;
                                 }
-                                apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
+                                if source_oids.is_empty()
+                                    && let Some(source_oid) =
+                                        canonical_reverted_commit_for_commit(&repo, new_head)
+                                {
+                                    source_oids.push(source_oid);
+                                }
+                                if revert_destination_changes(cmd).is_empty() {
+                                    if let Some(source_oid) = source_oids.first().cloned() {
+                                        apply_recovered_revert_complete_rewrite(
+                                            &repo,
+                                            base.as_deref(),
+                                            new_head,
+                                            source_oid,
+                                        )?;
+                                    }
+                                } else {
+                                    apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
+                                }
                                 handled_revert_commits = true;
+                            }
+                        } else if !new_head.is_empty()
+                            && recovered_commit_is_revert(worktree.as_ref(), new_head)
+                        {
+                            if !handled_revert_commits {
+                                let repo = find_repository_in_path(&worktree)?;
+                                if let Some(source_oid) =
+                                    canonical_reverted_commit_for_commit(&repo, new_head)
+                                {
+                                    apply_recovered_revert_complete_rewrite(
+                                        &repo,
+                                        base.as_deref(),
+                                        new_head,
+                                        source_oid,
+                                    )?;
+                                    handled_revert_commits = true;
+                                }
                             }
                         } else if !new_head.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
@@ -8109,6 +8194,95 @@ mod tests {
             revert_source_args_from_command_args(&["-Smy-key".to_string(), "HEAD~1".to_string()]),
             vec!["HEAD~1"]
         );
+    }
+
+    #[test]
+    fn canonical_revert_message_recovers_full_source_oid() {
+        let source = "7de7ab30e95544c0d41a871269a31b17b396eebe";
+        let message = format!(
+            "Revert \"Recover lifecycle fixture after hard reset\"\n\nThis reverts commit {source}.\n"
+        );
+        assert_eq!(
+            canonical_reverted_commit_from_message(&message),
+            Some(source.to_string())
+        );
+    }
+
+    #[test]
+    fn noncanonical_or_abbreviated_revert_message_is_not_inferred() {
+        assert_eq!(
+            canonical_reverted_commit_from_message("This reverts commit 7de7ab30e955."),
+            None
+        );
+        assert_eq!(
+            canonical_reverted_commit_from_message(
+                "Documentation mentioning that this reverts commit is not metadata."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recovered_revert_spec_uses_semantic_event_transition_without_trace_ref_changes() {
+        let parent = "1111111111111111111111111111111111111111";
+        let revert = "2222222222222222222222222222222222222222";
+        let source = "3333333333333333333333333333333333333333";
+        let spec = recovered_revert_spec(Some(parent), revert, source.to_string());
+        assert_eq!(spec.parent.as_deref(), Some(parent));
+        assert_eq!(spec.revert_commit, revert);
+        assert_eq!(spec.reverted_commit.as_deref(), Some(source));
+    }
+
+    #[test]
+    #[serial]
+    fn recovered_deletion_only_revert_builds_metric_from_real_commit_diff() {
+        let _feature_flag = EnvVarGuard::set("GIT_AI_REWRITE_METRICS_EVENTS", "true");
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        run_git_for_test(&repo_path, &["init"]);
+        run_git_for_test(&repo_path, &["config", "user.name", "Test User"]);
+        run_git_for_test(&repo_path, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(repo_path.join("fixture.txt"), "base\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "fixture.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "base"]);
+
+        std::fs::write(repo_path.join("fixture.txt"), "base\nAI line\n").unwrap();
+        run_git_for_test(&repo_path, &["add", "fixture.txt"]);
+        run_git_for_test(&repo_path, &["commit", "-m", "add AI line"]);
+        let source = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
+
+        run_git_for_test(&repo_path, &["revert", "--no-edit", &source]);
+        let revert = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
+        let parent = run_git_for_test(&repo_path, &["rev-parse", "HEAD^"]);
+        let repo = find_repository_in_path(repo_path.to_str().unwrap()).unwrap();
+        let specs = [recovered_revert_spec(
+            Some(&parent),
+            &revert,
+            source.clone(),
+        )];
+        let metrics =
+            crate::authorship::rewrite_revert::handle_revert_commits_with_metrics(&repo, &specs)
+                .unwrap();
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].new_sha, revert);
+        assert_eq!(metrics[0].original_shas, vec![source]);
+        assert_eq!(
+            metrics[0].operation,
+            crate::authorship::rewrite::RewriteMetricOperation::Revert
+        );
+        let diff = metrics[0]
+            .parent_diff
+            .as_ref()
+            .expect("deletion-only revert metric must retain parent diff");
+        let hunks = diff
+            .hunks_by_file
+            .get("fixture.txt")
+            .expect("fixture deletion hunk");
+        assert_eq!(hunks.iter().map(|hunk| hunk.old_count).sum::<u32>(), 1);
+        assert_eq!(hunks.iter().map(|hunk| hunk.new_count).sum::<u32>(), 0);
     }
 
     #[test]

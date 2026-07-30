@@ -110,7 +110,10 @@ fn run_status(json: bool, diff_only: bool) -> Result<(), GitAiError> {
                 .map(|a| format!("{} {}", &a.tool, &a.model))
                 .unwrap_or_else(|| default_user_name.clone());
 
-            let is_human = checkpoint.kind == CheckpointKind::Human;
+            let is_human = matches!(
+                checkpoint.kind,
+                CheckpointKind::Human | CheckpointKind::KnownHuman
+            );
             checkpoint_infos.push(CheckpointInfo {
                 time_ago: format_time_ago(checkpoint.timestamp),
                 additions,
@@ -153,14 +156,15 @@ fn run_status(json: bool, diff_only: bool) -> Result<(), GitAiError> {
     // For status (uncommitted changes), the AI attributions are in `initial` (uncommitted),
     // not in authorship_log.attestations (which is for committed changes).
     // Count AI lines from the uncommitted attributions.
-    let ai_accepted = count_ai_lines_from_initial(&initial, &ignore_matcher);
+    let (ai_accepted, known_human_accepted) =
+        count_attributed_lines_from_initial(&initial, &ignore_matcher);
 
     let stats = stats_from_authorship_log(
         Some(&authorship_log),
         total_additions,
         total_deletions,
         ai_accepted,
-        0,
+        known_human_accepted,
         &BTreeMap::new(),
     );
 
@@ -312,11 +316,12 @@ fn get_working_dir_diff_stats(
 }
 
 /// Count AI-attributed lines from InitialAttributions (uncommitted changes)
-fn count_ai_lines_from_initial(
+fn count_attributed_lines_from_initial(
     initial: &InitialAttributions,
     ignore_matcher: &IgnoreMatcher,
-) -> u32 {
+) -> (u32, u32) {
     let mut ai_lines = 0u32;
+    let mut known_human_lines = 0u32;
 
     for (file_path, line_attrs) in &initial.files {
         if should_ignore_file_with_matcher(file_path, ignore_matcher) {
@@ -324,6 +329,11 @@ fn count_ai_lines_from_initial(
         }
 
         for line_attr in line_attrs {
+            let lines_count = line_attr.end_line - line_attr.start_line + 1;
+            if line_attr.author_id.starts_with("h_") {
+                known_human_lines += lines_count;
+                continue;
+            }
             let is_ai = if line_attr.author_id.starts_with("s_") {
                 let session_key = line_attr
                     .author_id
@@ -335,11 +345,10 @@ fn count_ai_lines_from_initial(
                 initial.prompts.contains_key(&line_attr.author_id)
             };
             if is_ai {
-                let lines_count = line_attr.end_line - line_attr.start_line + 1;
                 ai_lines += lines_count;
             }
         }
     }
 
-    ai_lines
+    (ai_lines, known_human_lines)
 }

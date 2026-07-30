@@ -1,7 +1,9 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::authorship_log::LineRange;
-use git_ai::authorship::authorship_log_serialization::{AuthorshipLog, generate_session_id};
+use git_ai::authorship::authorship_log_serialization::{
+    AuthorshipLog, generate_model_session_id, generate_session_id,
+};
 use git_ai::authorship::working_log::AgentId;
 use git_ai::daemon::bash_history_db::{BashCallEnd, BashCallStart, BashHistoryDatabase};
 use git_ai::metrics::db::MetricsDatabase;
@@ -524,7 +526,7 @@ unknown 6
         "unknown 5".ai(),
         "unknown 6".ai(),
     ]);
-    let expected_session_id = generate_session_id(external_session_id, "codex");
+    let expected_session_id = generate_model_session_id(external_session_id, "codex", "gpt-5");
     assert_session_attests_lines(
         &commit.authorship_log,
         "metadata-existing.txt",
@@ -590,7 +592,7 @@ edge 3
         "edge 2".ai(),
         "edge 3".ai(),
     ]);
-    let expected_session_id = generate_session_id(external_session_id, "codex");
+    let expected_session_id = generate_model_session_id(external_session_id, "codex", "gpt-5");
     assert_session_attests_lines(
         &commit.authorship_log,
         "metadata-edge-skip.txt",

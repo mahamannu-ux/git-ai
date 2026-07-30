@@ -26,6 +26,24 @@ use tokio::time::{Duration, interval};
 
 const TRIGGERED_SWEEP_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Session identifier to pass back to an agent's native transcript reader.
+///
+/// Git AI stores an internal, hashed session ID for correlation, but provider
+/// stores such as OpenCode SQLite are keyed by the provider's external ID.
+/// Shared streams do not represent one provider session and therefore retain
+/// their internal sentinel ID.
+fn provider_reader_session_id<'a>(
+    internal_session_id: &'a str,
+    external_session_id: &'a str,
+    is_shared_stream: bool,
+) -> &'a str {
+    if !is_shared_stream && !external_session_id.is_empty() {
+        external_session_id
+    } else {
+        internal_session_id
+    }
+}
+
 /// Extract a Unix-epoch u32 timestamp from a raw JSON event's "timestamp" field.
 /// Handles both ISO 8601 strings (e.g. "2026-05-11T23:13:12.819Z") and numeric
 /// milliseconds (e.g. 1759845073835). Returns None if the field is missing or unparseable.
@@ -1102,7 +1120,12 @@ impl StreamWorker {
                 break;
             }
 
-            let batch = agent.read_incremental(&path, current_watermark, &stream.session_id)?;
+            let reader_session_id = provider_reader_session_id(
+                &stream.session_id,
+                &stream.external_session_id,
+                is_shared_stream,
+            );
+            let batch = agent.read_incremental(&path, current_watermark, reader_session_id)?;
 
             if batch.events.is_empty() {
                 db.update_watermark(
@@ -1461,6 +1484,22 @@ mod extract_event_timestamp_tests {
 mod scheduling_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn provider_reader_uses_external_id_for_non_shared_streams() {
+        assert_eq!(
+            provider_reader_session_id("s_internal", "ses_external", false),
+            "ses_external"
+        );
+        assert_eq!(
+            provider_reader_session_id("s_internal", "", false),
+            "s_internal"
+        );
+        assert_eq!(
+            provider_reader_session_id(SHARED_STREAM_SESSION_ID, "ses_external", true),
+            SHARED_STREAM_SESSION_ID
+        );
+    }
 
     fn make_worker() -> (
         TempDir,

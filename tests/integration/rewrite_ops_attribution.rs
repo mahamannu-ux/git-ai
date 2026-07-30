@@ -157,6 +157,35 @@ fn test_revert_older_commit_restores_original_ai_attribution() {
 }
 
 #[test]
+fn test_revert_restores_ai_attribution_inherited_from_multiple_notes() {
+    let repo = TestRepo::new();
+    let older_path = repo.path().join("revert_inherited_older.txt");
+    let recent_path = repo.path().join("revert_inherited_recent.txt");
+
+    fs::write(&older_path, "older ai\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "revert_inherited_older.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("add older ai line").unwrap();
+
+    fs::write(&recent_path, "recent ai\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "revert_inherited_recent.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("add recent ai line").unwrap();
+
+    fs::remove_file(&older_path).unwrap();
+    fs::remove_file(&recent_path).unwrap();
+    repo.stage_all_and_commit("delete inherited ai files")
+        .unwrap();
+    let delete_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    repo.git(&["revert", &delete_commit]).unwrap();
+    let mut older = repo.filename("revert_inherited_older.txt");
+    let mut recent = repo.filename("revert_inherited_recent.txt");
+    older.assert_committed_lines(crate::lines!["older ai".ai()]);
+    recent.assert_committed_lines(crate::lines!["recent ai".ai()]);
+}
+
+#[test]
 fn test_revert_revision_expression_restores_original_ai_attribution() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("revert_expr.txt");

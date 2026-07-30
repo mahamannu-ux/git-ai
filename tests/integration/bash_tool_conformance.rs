@@ -143,6 +143,37 @@ fn test_bash_tool_detect_modification() {
     assert!(result.created.is_empty(), "no files should be created");
 }
 
+#[test]
+fn test_bash_tool_detect_deletion() {
+    let repo = TestRepo::new();
+    let root = repo_root(&repo);
+
+    add_and_commit(&repo, "deleted.txt", "AI-authored\n", "initial");
+    let pre =
+        snapshot(&root, "delete-sess", "delete-pre", None).expect("pre-snapshot should succeed");
+
+    fs::remove_file(repo.path().join("deleted.txt")).expect("delete should succeed");
+    let post =
+        snapshot(&root, "delete-sess", "delete-post", None).expect("post-snapshot should succeed");
+    let result = diff(&pre, &post);
+
+    assert!(
+        result
+            .deleted
+            .iter()
+            .any(|path| path == Path::new("deleted.txt")),
+        "deleted.txt should appear in deleted; got {:?}",
+        result.deleted,
+    );
+    assert!(
+        result
+            .all_changed_paths()
+            .iter()
+            .any(|path| path == "deleted.txt"),
+        "deleted path should be checkpointable",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_bash_tool_detect_permission_change() {
@@ -490,8 +521,6 @@ fn test_bash_tool_orchestration_create_file() {
 
 #[test]
 fn test_bash_tool_orchestration_delete_file() {
-    // Deletions are not tracked; a bash call that only deletes files
-    // produces NoChanges.
     let repo = TestRepo::new();
     let root = repo_root(&repo);
 
@@ -503,11 +532,17 @@ fn test_bash_tool_orchestration_delete_file() {
 
     let action = post_hook(&root, "del-sess", "del-tool");
 
-    // Deletion-only bash call: no changed paths to report.
-    assert!(
-        matches!(action.action, BashCheckpointAction::NoChanges),
-        "Expected NoChanges for deletion-only bash call"
-    );
+    match action.action {
+        BashCheckpointAction::Checkpoint(paths) => assert!(
+            paths.iter().any(|path| path == "doomed.txt"),
+            "Expected deleted path in checkpoint, got {:?}",
+            paths,
+        ),
+        other => panic!(
+            "Expected Checkpoint for deletion-only bash call, got {:?}",
+            other
+        ),
+    }
 }
 
 #[test]
@@ -1077,6 +1112,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
     let now = SystemTime::now();
     let pre = StatSnapshot {
         entries: HashMap::new(),
+        observed_paths: vec![],
         taken_at: None,
         invocation_key: "test:1".to_string(),
         repo_root: PathBuf::from("/tmp"),
@@ -1112,6 +1148,10 @@ fn test_diff_no_gitignore_includes_all_new_files() {
 
     let post = StatSnapshot {
         entries: post_entries,
+        observed_paths: vec![
+            normalize_path(Path::new("debug.log")),
+            normalize_path(Path::new("main.rs")),
+        ],
         taken_at: None,
         invocation_key: "test:2".to_string(),
         repo_root: PathBuf::from("/tmp"),
@@ -1235,14 +1275,23 @@ fn test_stat_diff_result_is_empty_single_category() {
     let created_only = StatDiffResult {
         created: vec![PathBuf::from("new.txt")],
         modified: vec![],
+        deleted: vec![],
     };
     assert!(!created_only.is_empty());
 
     let modified_only = StatDiffResult {
         created: vec![],
         modified: vec![PathBuf::from("changed.txt")],
+        deleted: vec![],
     };
     assert!(!modified_only.is_empty());
+
+    let deleted_only = StatDiffResult {
+        created: vec![],
+        modified: vec![],
+        deleted: vec![PathBuf::from("gone.txt")],
+    };
+    assert!(!deleted_only.is_empty());
 
     assert!(StatDiffResult::default().is_empty());
 }

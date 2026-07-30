@@ -3,7 +3,7 @@ use crate::repos::test_repo::TestRepo;
 use git_ai::metrics::MetricEvent;
 use git_ai::metrics::attrs::attr_pos;
 use git_ai::metrics::db::MetricsDatabase;
-use git_ai::metrics::events::committed_pos;
+use git_ai::metrics::events::{committed_pos, rewrite_committed_pos};
 use git_ai::metrics::types::{MetricEventId, SparseArray};
 use serde_json::json;
 use std::fs;
@@ -68,6 +68,65 @@ fn committed_metric_for_commit(db_path: &str, commit_sha: &str) -> MetricEvent {
 
         if Instant::now() >= deadline {
             panic!("committed metric for {commit_sha} was not persisted");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn rewrite_metric_diagnostics(repo: &TestRepo, db_path: &str) -> String {
+    let db = MetricsDatabase::open_at_path(Path::new(db_path))
+        .expect("metrics db should open for diagnostics");
+    let mut persisted = Vec::new();
+    for event_id in 1..=MetricEventId::RewriteCommitted as u16 {
+        let records = db
+            .get_metric_history(0, None, &[event_id])
+            .expect("metric diagnostics should load");
+        for record in records {
+            persisted.push((
+                record.event.event_id,
+                sparse_str(&record.event.attrs, attr_pos::COMMIT_SHA)
+                    .unwrap_or("")
+                    .to_string(),
+            ));
+        }
+    }
+
+    let daemon_dir = repo.daemon_home_path().join(".git-ai/internal/daemon");
+    let stderr = fs::read_to_string(daemon_dir.join("daemon.test.stderr.log"))
+        .unwrap_or_else(|_| "<no daemon stderr>".to_string());
+    let mut logs = String::new();
+    if let Ok(entries) = fs::read_dir(daemon_dir.join("logs")) {
+        for entry in entries.flatten() {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                logs.push_str(&format!("\n--- {} ---\n{content}", entry.path().display()));
+            }
+        }
+    }
+    format!(
+        "persisted={persisted:?}\ncompletions={:?}\nstderr={stderr}\nlogs={logs}",
+        repo.daemon_completion_entries()
+    )
+}
+
+fn rewrite_metric_for_commit(repo: &TestRepo, db_path: &str, commit_sha: &str) -> MetricEvent {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let db = MetricsDatabase::open_at_path(Path::new(db_path))
+            .expect("metrics db should open at isolated path");
+        let records = db
+            .get_metric_history(0, None, &[MetricEventId::RewriteCommitted as u16])
+            .expect("rewrite metric history should load");
+        if let Some(record) = records.into_iter().find(|record| {
+            sparse_str(&record.event.attrs, attr_pos::COMMIT_SHA) == Some(commit_sha)
+        }) {
+            return record.event;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "rewrite metric for {commit_sha} was not persisted\n{}",
+                rewrite_metric_diagnostics(repo, db_path)
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -143,4 +202,50 @@ fn committed_metric_includes_git_author_commit_timestamps_and_patch_id() {
 
     let mut file = repo.filename("generated.txt");
     file.assert_committed_lines(lines!["base".unattributed_human(), "ai line".ai()]);
+}
+
+#[test]
+fn deletion_only_git_revert_emits_rewrite_metric_without_authorship_note() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo = TestRepo::new_with_daemon_env(&[
+        ("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str()),
+        ("GIT_AI_REWRITE_METRICS_EVENTS", "true"),
+        ("GIT_AI_DEBUG_DAEMON_TRACE", "1"),
+    ]);
+
+    let file_path = repo.path().join("revert-delete-only.txt");
+    fs::write(&file_path, "base\n").unwrap();
+    repo.stage_all_and_commit("base commit")
+        .expect("base commit should succeed");
+
+    fs::write(&file_path, "base\nai line removed by revert\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "revert-delete-only.txt"])
+        .expect("AI checkpoint should succeed");
+    let source = repo
+        .stage_all_and_commit("add AI line")
+        .expect("AI source commit should succeed")
+        .commit_sha;
+
+    repo.git(&["revert", "--no-edit", &source])
+        .expect("deletion-only revert should succeed");
+    repo.sync_daemon_force();
+    let revert = repo
+        .git(&["rev-parse", "HEAD"])
+        .expect("revert HEAD should resolve")
+        .trim()
+        .to_string();
+
+    let event = rewrite_metric_for_commit(&repo, &metrics_db_path, &revert);
+    assert_eq!(
+        sparse_str(&event.values, rewrite_committed_pos::OPERATION_KIND),
+        Some("revert")
+    );
+    assert_eq!(
+        sparse_u64(&event.values, rewrite_committed_pos::GIT_DIFF_ADDED_LINES),
+        Some(0)
+    );
+    assert_eq!(
+        sparse_u64(&event.values, rewrite_committed_pos::GIT_DIFF_DELETED_LINES),
+        Some(1)
+    );
 }

@@ -149,7 +149,7 @@ pub(super) fn parse_vscode_native_hooks(
     let cwd = parse::optional_str_multi(data, &["cwd", "workspace_folder", "workspaceFolder"])
         .ok_or_else(|| GitAiError::PresetError("cwd not found in hook_input".to_string()))?;
 
-    let dirty_files = super::dirty_files_from_hook_data(data, cwd);
+    let mut dirty_files = super::dirty_files_from_hook_data(data, cwd);
 
     let session_id = super::extract_session_id(data);
 
@@ -314,6 +314,18 @@ pub(super) fn parse_vscode_native_hooks(
         )));
     }
 
+    // Copilot's inline-edit UI can emit PostToolUse before the proposed text is
+    // durable on disk and before the user clicks Keep/Discard. Reconstruct
+    // replace-style proposals from the tool payload so the checkpoint captures
+    // gross generation immediately. Retained/accepted attribution is still
+    // determined later from the actual working tree and commit, so discarded
+    // proposals do not become committed AI code.
+    for (path, content) in proposed_content_overrides(tool_name, tool_input, cwd) {
+        dirty_files
+            .get_or_insert_with(HashMap::new)
+            .insert(path, content);
+    }
+
     // Workaround: VS Code Copilot fires PostToolUse before the file is written to disk.
     // https://github.com/microsoft/vscode/issues/315926
     tracing::debug!(
@@ -328,6 +340,81 @@ pub(super) fn parse_vscode_native_hooks(
         stream_source,
         tool_use_id: Some(tool_use_id),
     })])
+}
+
+fn proposed_content_overrides(
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    cwd: &str,
+) -> HashMap<PathBuf, String> {
+    let Some(input) = tool_input.and_then(|value| value.as_object()) else {
+        return HashMap::new();
+    };
+    let lower = tool_name.to_ascii_lowercase();
+    let mut edits: Vec<(PathBuf, String, String)> = Vec::new();
+
+    let read_string = |object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(|value| value.as_str()))
+            .map(str::to_string)
+    };
+    let push_replacement = |object: &serde_json::Map<String, serde_json::Value>,
+                            edits: &mut Vec<(PathBuf, String, String)>| {
+        let Some(raw_path) = read_string(object, &["filePath", "file_path", "path"]) else {
+            return;
+        };
+        let Some(old) = read_string(object, &["oldString", "old_string", "oldText", "old_text"])
+        else {
+            return;
+        };
+        let Some(new) = read_string(object, &["newString", "new_string", "newText", "new_text"])
+        else {
+            return;
+        };
+        edits.push((parse::resolve_absolute(&raw_path, cwd), old, new));
+    };
+
+    if lower == "create_file" {
+        let Some(raw_path) = read_string(input, &["filePath", "file_path", "path"]) else {
+            return HashMap::new();
+        };
+        let Some(content) = read_string(input, &["content", "fileContent", "file_content"]) else {
+            return HashMap::new();
+        };
+        return HashMap::from([(parse::resolve_absolute(&raw_path, cwd), content)]);
+    }
+
+    if lower == "multi_replace_string_in_file" || lower == "multiedit" {
+        if let Some(replacements) = input.get("replacements").and_then(|value| value.as_array()) {
+            for replacement in replacements.iter().filter_map(|value| value.as_object()) {
+                push_replacement(replacement, &mut edits);
+            }
+        }
+    } else if lower.contains("replace") || lower.contains("edit") {
+        push_replacement(input, &mut edits);
+    }
+
+    let mut proposed = HashMap::new();
+    for (path, old, new) in edits {
+        let content = proposed
+            .remove(&path)
+            .or_else(|| std::fs::read_to_string(&path).ok());
+        let Some(content) = content else {
+            continue;
+        };
+        if let Some(index) = content.find(&old) {
+            let mut updated = String::with_capacity(content.len() - old.len() + new.len());
+            updated.push_str(&content[..index]);
+            updated.push_str(&new);
+            updated.push_str(&content[index + old.len()..]);
+            proposed.insert(path, updated);
+        } else {
+            // The edit may already be present on disk. Leaving it to the normal
+            // file reader is safer than synthesizing a second replacement.
+            proposed.insert(path, content);
+        }
+    }
+    proposed
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +690,73 @@ mod tests {
             }
             _ => panic!("Expected PostFileEdit"),
         }
+    }
+
+    #[test]
+    fn test_copilot_multi_replace_reconstructs_proposal_before_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.py");
+        let tests = dir.path().join("test_source.py");
+        std::fs::write(&source, "value = 1\n").unwrap();
+        std::fs::write(&tests, "assert value == 1\n").unwrap();
+
+        let tool_input = json!({
+            "replacements": [
+                {
+                    "filePath": source,
+                    "oldString": "value = 1",
+                    "newString": "value = 2"
+                },
+                {
+                    "filePath": tests,
+                    "oldString": "assert value == 1",
+                    "newString": "assert value == 2"
+                }
+            ]
+        });
+
+        let proposed = proposed_content_overrides(
+            "multi_replace_string_in_file",
+            Some(&tool_input),
+            dir.path().to_str().unwrap(),
+        );
+
+        assert_eq!(
+            proposed.get(&source).map(String::as_str),
+            Some("value = 2\n")
+        );
+        assert_eq!(
+            proposed.get(&tests).map(String::as_str),
+            Some("assert value == 2\n")
+        );
+        // The proposal is captured without pretending the user has accepted it.
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "value = 1\n");
+        assert_eq!(
+            std::fs::read_to_string(tests).unwrap(),
+            "assert value == 1\n"
+        );
+    }
+
+    #[test]
+    fn test_copilot_create_file_reconstructs_proposal_before_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("new.md");
+        let tool_input = json!({
+            "filePath": created,
+            "content": "# Proposed file\n\nGenerated before Keep.\n"
+        });
+
+        let proposed = proposed_content_overrides(
+            "create_file",
+            Some(&tool_input),
+            dir.path().to_str().unwrap(),
+        );
+
+        assert_eq!(
+            proposed.get(&created).map(String::as_str),
+            Some("# Proposed file\n\nGenerated before Keep.\n")
+        );
+        assert!(!created.exists());
     }
 
     #[test]

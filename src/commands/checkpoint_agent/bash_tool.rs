@@ -222,6 +222,11 @@ pub struct StatSnapshot {
     /// File metadata for files that passed the ignore filter and are not
     /// covered by any watermark at snapshot time.
     pub entries: HashMap<PathBuf, StatEntry>,
+    /// Every non-ignored file path observed during the walk. This is kept
+    /// separately from watermark-filtered metadata so deletion-only commands
+    /// can still be detected without retaining a full StatEntry for every file.
+    #[serde(default)]
+    pub observed_paths: Vec<PathBuf>,
     /// When this snapshot was taken.
     #[serde(skip)]
     pub taken_at: Option<Instant>,
@@ -245,6 +250,7 @@ pub struct StatSnapshot {
 pub struct StatDiffResult {
     pub created: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
+    pub deleted: Vec<PathBuf>,
 }
 
 impl StatDiffResult {
@@ -253,12 +259,13 @@ impl StatDiffResult {
         self.created
             .iter()
             .chain(self.modified.iter())
+            .chain(self.deleted.iter())
             .map(|p| normalize_to_posix(&p.to_string_lossy()))
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.created.is_empty() && self.modified.is_empty()
+        self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
     }
 }
 
@@ -571,6 +578,7 @@ pub fn snapshot(
     let gitignore_filter = Arc::new(build_gitignore(repo_root)?);
 
     let mut entries = HashMap::new();
+    let mut observed_paths = Vec::new();
 
     // Pass the git-ai ignore ruleset directly into the walker via filter_entry.
     // This prunes entire ignored directories (node_modules/, target/, etc.)
@@ -655,6 +663,17 @@ pub fn snapshot(
         // so no secondary check is needed here.
 
         let normalized = normalize_path(rel_path);
+        observed_paths.push(normalized.clone());
+        if observed_paths.len() > MAX_TRACKED_FILES {
+            tracing::debug!(
+                "Snapshot: exceeded MAX_TRACKED_FILES ({}), skipping stat-diff",
+                MAX_TRACKED_FILES
+            );
+            return Err(GitAiError::Generic(format!(
+                "repo has more than {} tracked files; skipping stat-diff",
+                MAX_TRACKED_FILES
+            )));
+        }
 
         match fs::symlink_metadata(abs_path) {
             Ok(meta) => {
@@ -663,16 +682,6 @@ pub fn snapshot(
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
                 if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
                     entries.insert(normalized, stat);
-                    if entries.len() > MAX_TRACKED_FILES {
-                        tracing::debug!(
-                            "Snapshot: exceeded MAX_TRACKED_FILES ({}), skipping stat-diff",
-                            MAX_TRACKED_FILES
-                        );
-                        return Err(GitAiError::Generic(format!(
-                            "repo has more than {} recently-modified files; skipping stat-diff",
-                            MAX_TRACKED_FILES
-                        )));
-                    }
                 }
             }
             Err(e) => {
@@ -689,6 +698,7 @@ pub fn snapshot(
 
     Ok(StatSnapshot {
         entries,
+        observed_paths,
         taken_at: Some(Instant::now()),
         invocation_key,
         repo_root: repo_root.to_path_buf(),
@@ -701,11 +711,12 @@ pub fn snapshot(
 // Diff
 // ---------------------------------------------------------------------------
 
-/// Diff two snapshots to find created and modified files.
+/// Diff two snapshots to find created, modified, and deleted files.
 ///
 /// Both snapshots apply the same git-ai ignore filter at snapshot time, so
 /// any file in `post.entries` already passed that filter. No secondary
-/// filtering is needed here.
+/// filtering is needed here. `observed_paths` contains all non-ignored paths,
+/// including watermark-covered files whose metadata is omitted from `entries`.
 ///
 /// Files in post but not pre are reported as **created** (either genuinely
 /// new, or previously wm-covered and now modified by bash — both are changed
@@ -732,8 +743,16 @@ pub fn diff(pre: &StatSnapshot, post: &StatSnapshot) -> StatDiffResult {
         }
     }
 
+    let post_paths: std::collections::HashSet<&PathBuf> = post.observed_paths.iter().collect();
+    for path in &pre.observed_paths {
+        if !post_paths.contains(path) {
+            result.deleted.push(path.clone());
+        }
+    }
+
     result.created.sort();
     result.modified.sort();
+    result.deleted.sort();
 
     result
 }
@@ -1354,6 +1373,7 @@ mod tests {
     fn test_diff_empty_snapshots() {
         let pre = StatSnapshot {
             entries: HashMap::new(),
+            observed_paths: vec![],
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1362,6 +1382,7 @@ mod tests {
         };
         let post = StatSnapshot {
             entries: HashMap::new(),
+            observed_paths: vec![],
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1377,6 +1398,7 @@ mod tests {
     fn test_diff_detects_creation() {
         let pre = StatSnapshot {
             entries: HashMap::new(),
+            observed_paths: vec![],
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1399,6 +1421,7 @@ mod tests {
 
         let post = StatSnapshot {
             entries: post_entries,
+            observed_paths: vec![normalize_path(Path::new("new_file.txt"))],
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1445,6 +1468,7 @@ mod tests {
 
         let pre = StatSnapshot {
             entries: pre_entries,
+            observed_paths: vec![path.clone()],
             taken_at: None,
             invocation_key: "test:1".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1454,6 +1478,7 @@ mod tests {
 
         let post = StatSnapshot {
             entries: post_entries,
+            observed_paths: vec![path.clone()],
             taken_at: None,
             invocation_key: "test:2".to_string(),
             repo_root: PathBuf::from("/tmp"),
@@ -1464,6 +1489,33 @@ mod tests {
         let result = diff(&pre, &post);
         assert!(result.created.is_empty());
         assert_eq!(result.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_detects_watermark_covered_deletion() {
+        let path = normalize_path(Path::new("deleted.txt"));
+        let pre = StatSnapshot {
+            entries: HashMap::new(),
+            observed_paths: vec![path.clone()],
+            taken_at: None,
+            invocation_key: "test:delete-pre".to_string(),
+            repo_root: PathBuf::from("/tmp"),
+            effective_worktree_wm: Some(1),
+            per_file_wm: HashMap::new(),
+        };
+        let post = StatSnapshot {
+            entries: HashMap::new(),
+            observed_paths: vec![],
+            taken_at: None,
+            invocation_key: "test:delete-post".to_string(),
+            repo_root: PathBuf::from("/tmp"),
+            effective_worktree_wm: Some(1),
+            per_file_wm: HashMap::new(),
+        };
+
+        let result = diff(&pre, &post);
+        assert_eq!(result.deleted, vec![path]);
+        assert_eq!(result.all_changed_paths(), vec!["deleted.txt".to_string()]);
     }
 
     #[test]
@@ -1581,11 +1633,13 @@ mod tests {
         let result = StatDiffResult {
             created: vec![PathBuf::from("new.txt")],
             modified: vec![PathBuf::from("changed.txt")],
+            deleted: vec![PathBuf::from("gone.txt")],
         };
         let paths = result.all_changed_paths();
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 3);
         assert!(paths.contains(&"new.txt".to_string()));
         assert!(paths.contains(&"changed.txt".to_string()));
+        assert!(paths.contains(&"gone.txt".to_string()));
     }
 
     // -----------------------------------------------------------------------

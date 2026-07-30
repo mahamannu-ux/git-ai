@@ -791,6 +791,9 @@ pub mod checkpoint_pos {
     pub const EDIT_KIND: usize = 8; // String - nullable ("file_edit" | "bash")
     pub const CHECKPOINT_TYPE: usize = 9; // String - nullable ("recovered_bash", etc.)
     pub const ATTRIBUTION_RECOVERY_METADATA: usize = 10; // String - nullable JSON
+    pub const AI_AUTHORED_LINES_DELETED: usize = 11; // u32 - deleted lines previously attributed to AI
+    pub const HUMAN_AUTHORED_LINES_DELETED: usize = 12; // u32 - deleted lines previously attributed to human
+    pub const UNKNOWN_AUTHORED_LINES_DELETED: usize = 13; // u32 - deleted lines without prior attribution
 }
 
 /// Values for Event ID 4: checkpoint
@@ -825,6 +828,9 @@ pub struct CheckpointValues {
     pub edit_kind: PosField<String>,
     pub checkpoint_type: PosField<String>,
     pub attribution_recovery_metadata: PosField<String>,
+    pub ai_authored_lines_deleted: PosField<u32>,
+    pub human_authored_lines_deleted: PosField<u32>,
+    pub unknown_authored_lines_deleted: PosField<u32>,
 }
 
 impl CheckpointValues {
@@ -952,6 +958,13 @@ impl CheckpointValues {
         self.attribution_recovery_metadata = Some(None);
         self
     }
+
+    pub fn deleted_line_provenance(mut self, ai: u32, human: u32, unknown: u32) -> Self {
+        self.ai_authored_lines_deleted = Some(Some(ai));
+        self.human_authored_lines_deleted = Some(Some(human));
+        self.unknown_authored_lines_deleted = Some(Some(unknown));
+        self
+    }
 }
 
 impl PosEncoded for CheckpointValues {
@@ -1009,6 +1022,21 @@ impl PosEncoded for CheckpointValues {
             checkpoint_pos::ATTRIBUTION_RECOVERY_METADATA,
             string_to_json(&self.attribution_recovery_metadata),
         );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::AI_AUTHORED_LINES_DELETED,
+            u32_to_json(&self.ai_authored_lines_deleted),
+        );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::HUMAN_AUTHORED_LINES_DELETED,
+            u32_to_json(&self.human_authored_lines_deleted),
+        );
+        sparse_set(
+            &mut map,
+            checkpoint_pos::UNKNOWN_AUTHORED_LINES_DELETED,
+            u32_to_json(&self.unknown_authored_lines_deleted),
+        );
 
         map
     }
@@ -1028,6 +1056,18 @@ impl PosEncoded for CheckpointValues {
             attribution_recovery_metadata: sparse_get_string(
                 arr,
                 checkpoint_pos::ATTRIBUTION_RECOVERY_METADATA,
+            ),
+            ai_authored_lines_deleted: sparse_get_u32(
+                arr,
+                checkpoint_pos::AI_AUTHORED_LINES_DELETED,
+            ),
+            human_authored_lines_deleted: sparse_get_u32(
+                arr,
+                checkpoint_pos::HUMAN_AUTHORED_LINES_DELETED,
+            ),
+            unknown_authored_lines_deleted: sparse_get_u32(
+                arr,
+                checkpoint_pos::UNKNOWN_AUTHORED_LINES_DELETED,
             ),
         }
     }
