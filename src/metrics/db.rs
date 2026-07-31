@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 6;
+const SCHEMA_VERSION: usize = 9;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -28,10 +28,12 @@ const NS_PER_SECOND: u128 = 1_000_000_000;
 
 const RETRYABLE_METRIC_IDS_SQL: &str = "SELECT id FROM metrics \
      WHERE delivered_ts IS NULL \
+       AND quarantined_at IS NULL \
        AND processing_started_at IS NULL \
        AND next_retry_at <= ?1 \
        AND attempts < 6 \
-     ORDER BY next_retry_at ASC, id DESC \
+     ORDER BY CASE WHEN event_kind IN (1, 7) THEN 0 ELSE 1 END ASC, \
+              next_retry_at ASC, id DESC \
      LIMIT ?2";
 
 /// Database migrations - each migration upgrades the schema by one version
@@ -101,6 +103,65 @@ const MIGRATIONS: &[&str] = &[
             id
         )
         WHERE delivered_ts IS NULL;
+    "#,
+    // Migration 6 -> 7: Represent terminal poison events explicitly instead
+    // of inferring quarantine from a saturated retry counter.
+    r#"
+    UPDATE metrics
+       SET quarantined_at = COALESCE(last_sync_at, 0),
+           quarantine_class = 'legacy_terminal_state',
+           quarantine_reason = COALESCE(last_sync_error, 'legacy terminal state')
+     WHERE delivered_ts IS NULL
+       AND attempts >= 6
+       AND quarantined_at IS NULL;
+
+    DROP INDEX IF EXISTS metrics_retryable;
+
+    CREATE INDEX IF NOT EXISTS metrics_retryable
+        ON metrics (next_retry_at ASC, id DESC)
+        WHERE delivered_ts IS NULL
+            AND quarantined_at IS NULL
+            AND processing_started_at IS NULL
+            AND attempts < 6;
+
+    CREATE INDEX IF NOT EXISTS metrics_quarantined
+        ON metrics (quarantined_at DESC, id DESC)
+        WHERE quarantined_at IS NOT NULL;
+    "#,
+    // Migration 7 -> 8: Audit explicitly approved local quarantine replay.
+    r#"
+    CREATE TABLE IF NOT EXISTS metric_quarantine_replays (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        replay_id TEXT NOT NULL,
+        metric_id INTEGER NOT NULL,
+        replayed_at INTEGER NOT NULL,
+        repository_url TEXT NOT NULL,
+        evidence_family TEXT NOT NULL,
+        occurred_from INTEGER NOT NULL,
+        occurred_until INTEGER NOT NULL,
+        prior_quarantine_class TEXT,
+        prior_quarantine_reason TEXT,
+        UNIQUE (replay_id, metric_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS metric_quarantine_replays_metric_id
+        ON metric_quarantine_replays (metric_id, replayed_at DESC);
+    "#,
+    // Migration 8 -> 9: Prefer due commit/rewrite evidence without bypassing
+    // retry timing or tenant-bound delivery context.
+    r#"
+    DROP INDEX IF EXISTS metrics_retryable;
+
+    CREATE INDEX IF NOT EXISTS metrics_retryable
+        ON metrics (
+            CASE WHEN event_kind IN (1, 7) THEN 0 ELSE 1 END ASC,
+            next_retry_at ASC,
+            id DESC
+        )
+        WHERE delivered_ts IS NULL
+            AND quarantined_at IS NULL
+            AND processing_started_at IS NULL
+            AND attempts < 6;
     "#,
 ];
 
@@ -235,6 +296,45 @@ pub struct MetricsStatus {
     pub stopped_after_errors: usize,
     pub rows_with_errors: usize,
     pub latest_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricEvidenceFamily {
+    GenerationSession,
+    CommitNote,
+}
+
+impl MetricEvidenceFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerationSession => "generation_session",
+            Self::CommitNote => "commit_note",
+        }
+    }
+
+    fn event_kinds(self) -> &'static [u16] {
+        match self {
+            Self::GenerationSession => &[2, 4, 5, 6],
+            Self::CommitNote => &[1, 7],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineBackfillRequest {
+    pub repository_url: String,
+    pub evidence_family: MetricEvidenceFamily,
+    pub occurred_from: u64,
+    pub occurred_until: u64,
+    pub max_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineBackfillPreview {
+    pub matching_rows: usize,
+    pub selected_rows: usize,
+    pub oldest_occurred_at: Option<u64>,
+    pub newest_occurred_at: Option<u64>,
 }
 
 /// Summary returned by event metadata backfill work.
@@ -499,6 +599,9 @@ impl MetricsDatabase {
         if from_version == 5 {
             self.add_delivery_binding_columns()?;
         }
+        if from_version == 6 {
+            self.add_quarantine_columns()?;
+        }
 
         let migration_sql = MIGRATIONS[from_version];
         let tx = self.conn.transaction()?;
@@ -613,6 +716,26 @@ impl MetricsDatabase {
             (
                 "delivery_credential_key_id",
                 "ALTER TABLE metrics ADD COLUMN delivery_credential_key_id TEXT DEFAULT NULL",
+            ),
+        ] {
+            self.add_column_if_missing("metrics", name, sql)?;
+        }
+        Ok(())
+    }
+
+    fn add_quarantine_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "quarantined_at",
+                "ALTER TABLE metrics ADD COLUMN quarantined_at INTEGER DEFAULT NULL",
+            ),
+            (
+                "quarantine_class",
+                "ALTER TABLE metrics ADD COLUMN quarantine_class TEXT DEFAULT NULL",
+            ),
+            (
+                "quarantine_reason",
+                "ALTER TABLE metrics ADD COLUMN quarantine_reason TEXT DEFAULT NULL",
             ),
         ] {
             self.add_column_if_missing("metrics", name, sql)?;
@@ -791,12 +914,15 @@ impl MetricsDatabase {
                     attempts,
                     last_sync_error,
                     last_sync_at,
-                    next_retry_at
+                    next_retry_at,
+                    quarantined_at,
+                    quarantine_class,
+                    quarantine_reason
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                    ?19, ?20, ?21, ?22
+                    ?19, ?20, ?21, ?22, ?23, ?24, ?25
                 )
                 "#,
             )?;
@@ -847,6 +973,9 @@ impl MetricsDatabase {
                     last_sync_error,
                     terminal_at,
                     terminal_at.unwrap_or(0),
+                    terminal_at,
+                    terminal_error.map(|_| "delivery_policy_rejected"),
+                    last_sync_error,
                 ])?;
                 ids.push(tx.last_insert_rowid());
             }
@@ -891,6 +1020,7 @@ impl MetricsDatabase {
                  SET processing_started_at = ?1 \
                  WHERE id = ?2 \
                    AND delivered_ts IS NULL \
+                   AND quarantined_at IS NULL \
                    AND processing_started_at IS NULL",
             )?;
             for id in ids {
@@ -1005,6 +1135,12 @@ impl MetricsDatabase {
                     attempts = attempts + 1,
                     last_sync_error = ?1,
                     last_sync_at = ?2,
+                    quarantined_at = CASE
+                        WHEN attempts + 1 >= 6 THEN ?2 ELSE quarantined_at END,
+                    quarantine_class = CASE
+                        WHEN attempts + 1 >= 6 THEN 'retry_exhausted' ELSE quarantine_class END,
+                    quarantine_reason = CASE
+                        WHEN attempts + 1 >= 6 THEN ?1 ELSE quarantine_reason END,
                     next_retry_at = ?2 + CASE
                         WHEN attempts + 1 <= 1 THEN 300
                         WHEN attempts + 1 = 2 THEN 1800
@@ -1025,11 +1161,31 @@ impl MetricsDatabase {
         Ok(())
     }
 
-    /// Mark records as permanently undeliverable while retaining them in history.
+    /// Quarantine terminal records while retaining their immutable raw evidence.
     pub fn mark_records_undeliverable(
         &mut self,
         records: &[(i64, String)],
         failed_at: u64,
+    ) -> Result<(), GitAiError> {
+        let records = records
+            .iter()
+            .map(|(id, reason)| {
+                let class = match reason.as_str() {
+                    "local_event_json_invalid" => "local_event_json_invalid",
+                    "permanent_metrics_upload_failure" => "permanent_upload_failure",
+                    _ => "server_rejected_event",
+                };
+                (*id, class.to_string(), reason.clone())
+            })
+            .collect::<Vec<_>>();
+        self.mark_records_quarantined(&records, failed_at)
+    }
+
+    /// Quarantine records with an operator-safe class and reason.
+    pub fn mark_records_quarantined(
+        &mut self,
+        records: &[(i64, String, String)],
+        quarantined_at: u64,
     ) -> Result<(), GitAiError> {
         if records.is_empty() {
             return Ok(());
@@ -1041,17 +1197,21 @@ impl MetricsDatabase {
                 "UPDATE metrics \
                  SET processing_started_at = NULL, \
                      attempts = ?1, \
-                     last_sync_error = ?2, \
-                     last_sync_at = ?3, \
-                     next_retry_at = ?3 \
-                 WHERE id = ?4 AND delivered_ts IS NULL",
+                     last_sync_error = ?3, \
+                     last_sync_at = ?4, \
+                     next_retry_at = ?4, \
+                     quarantined_at = ?4, \
+                     quarantine_class = ?2, \
+                     quarantine_reason = ?3 \
+                 WHERE id = ?5 AND delivered_ts IS NULL",
             )?;
 
-            for (id, error) in records {
+            for (id, class, reason) in records {
                 stmt.execute(params![
                     MAX_METRIC_UPLOAD_ATTEMPTS as i64,
-                    error,
-                    failed_at as i64,
+                    class,
+                    reason,
+                    quarantined_at as i64,
                     id
                 ])?;
             }
@@ -1060,12 +1220,159 @@ impl MetricsDatabase {
         Ok(())
     }
 
+    fn validate_quarantine_backfill_request(
+        request: &QuarantineBackfillRequest,
+    ) -> Result<(), GitAiError> {
+        if request.repository_url.trim().is_empty() {
+            return Err(GitAiError::Generic(
+                "Backfill repository URL is required".to_string(),
+            ));
+        }
+        if request.occurred_until < request.occurred_from {
+            return Err(GitAiError::Generic(
+                "Backfill end must not precede start".to_string(),
+            ));
+        }
+        if request.occurred_until - request.occurred_from > 31 * 24 * 60 * 60 {
+            return Err(GitAiError::Generic(
+                "Backfill window cannot exceed 31 days".to_string(),
+            ));
+        }
+        if request.max_rows == 0 || request.max_rows > 1000 {
+            return Err(GitAiError::Generic(
+                "Backfill max_rows must be between 1 and 1000".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn quarantine_backfill_predicate(request: &QuarantineBackfillRequest) -> String {
+        let event_kinds = request
+            .evidence_family
+            .event_kinds()
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "delivered_ts IS NULL AND quarantined_at IS NOT NULL \
+             AND delivery_repository_url = ?1 \
+             AND event_ts BETWEEN ?2 AND ?3 \
+             AND event_kind IN ({event_kinds})"
+        )
+    }
+
+    /// Preview a bounded quarantine replay without changing queue state.
+    pub fn preview_quarantine_backfill(
+        &self,
+        request: &QuarantineBackfillRequest,
+    ) -> Result<QuarantineBackfillPreview, GitAiError> {
+        Self::validate_quarantine_backfill_request(request)?;
+        let predicate = Self::quarantine_backfill_predicate(request);
+        let sql =
+            format!("SELECT COUNT(*), MIN(event_ts), MAX(event_ts) FROM metrics WHERE {predicate}");
+        let (matching, oldest, newest): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
+            &sql,
+            params![
+                request.repository_url,
+                request.occurred_from as i64,
+                request.occurred_until as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(QuarantineBackfillPreview {
+            matching_rows: matching.max(0) as usize,
+            selected_rows: (matching.max(0) as usize).min(request.max_rows),
+            oldest_occurred_at: oldest.map(|value| value.max(0) as u64),
+            newest_occurred_at: newest.map(|value| value.max(0) as u64),
+        })
+    }
+
+    /// Requeue only an explicitly approved, previewable quarantine selection.
+    pub fn apply_quarantine_backfill(
+        &mut self,
+        request: &QuarantineBackfillRequest,
+        approved: bool,
+        replayed_at: u64,
+    ) -> Result<QuarantineBackfillPreview, GitAiError> {
+        if !approved {
+            return Err(GitAiError::Generic(
+                "Backfill apply requires explicit approval".to_string(),
+            ));
+        }
+        let preview = self.preview_quarantine_backfill(request)?;
+        let predicate = Self::quarantine_backfill_predicate(request);
+        let sql = format!(
+            "SELECT id, quarantine_class, quarantine_reason FROM metrics \
+             WHERE {predicate} ORDER BY event_ts ASC, id ASC LIMIT ?4"
+        );
+        let tx = self.conn.transaction()?;
+        let selected = {
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    request.repository_url,
+                    request.occurred_from as i64,
+                    request.occurred_until as i64,
+                    request.max_rows as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let replay_id = crate::uuid::generate_v4();
+        for (id, prior_class, prior_reason) in &selected {
+            let changed = tx.execute(
+                "UPDATE metrics SET processing_started_at = NULL, attempts = 0, \
+                 last_sync_error = NULL, last_sync_at = ?1, next_retry_at = ?1, \
+                 quarantined_at = NULL, quarantine_class = NULL, quarantine_reason = NULL \
+                 WHERE id = ?2 AND delivered_ts IS NULL AND quarantined_at IS NOT NULL",
+                params![replayed_at as i64, id],
+            )?;
+            if changed != 1 {
+                return Err(GitAiError::Generic(
+                    "Backfill selection changed before apply".to_string(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO metric_quarantine_replays (
+                    replay_id, metric_id, replayed_at, repository_url, evidence_family,
+                    occurred_from, occurred_until, prior_quarantine_class,
+                    prior_quarantine_reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    replay_id,
+                    id,
+                    replayed_at as i64,
+                    request.repository_url,
+                    request.evidence_family.as_str(),
+                    request.occurred_from as i64,
+                    request.occurred_until as i64,
+                    prior_class,
+                    prior_reason,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(QuarantineBackfillPreview {
+            selected_rows: selected.len(),
+            ..preview
+        })
+    }
+
     /// Get count of pending metrics that are currently eligible for upload.
     pub fn count_retryable(&self) -> Result<usize, GitAiError> {
         let now = current_unix_ts();
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM metrics \
              WHERE delivered_ts IS NULL \
+               AND quarantined_at IS NULL \
                AND processing_started_at IS NULL \
                AND next_retry_at <= ?1 \
                AND attempts < 6",
@@ -1095,20 +1402,23 @@ impl MetricsDatabase {
                 COALESCE(SUM(CASE WHEN delivered_ts IS NULL THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
                     WHEN delivered_ts IS NULL
+                     AND quarantined_at IS NULL
                      AND processing_started_at IS NULL
                      AND next_retry_at <= ?1
                      AND attempts < ?2 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
                     WHEN delivered_ts IS NULL
+                     AND quarantined_at IS NULL
                      AND processing_started_at IS NULL
                      AND next_retry_at > ?1
                      AND attempts < ?2 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
                     WHEN delivered_ts IS NULL
+                     AND quarantined_at IS NULL
                      AND processing_started_at IS NOT NULL THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
                     WHEN delivered_ts IS NULL
-                     AND attempts >= ?2 THEN 1 ELSE 0 END), 0),
+                     AND quarantined_at IS NOT NULL THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE
                     WHEN delivered_ts IS NULL
                      AND last_sync_error IS NOT NULL
@@ -2010,7 +2320,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
 
         for column in [
             "delivered_ts",
@@ -2035,6 +2345,9 @@ mod tests {
             "delivery_branch",
             "delivery_api_base_url",
             "delivery_credential_key_id",
+            "quarantined_at",
+            "quarantine_class",
+            "quarantine_reason",
         ] {
             let column_count: i64 = db
                 .conn
@@ -2112,7 +2425,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
     }
 
     #[test]
@@ -2151,7 +2464,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.count_retryable().unwrap(), 1);
     }
@@ -2194,7 +2507,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
 
         for column in [
             "delivered_ts",
@@ -2263,7 +2576,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
         assert!(db.column_exists("metrics", "event_ts").unwrap());
         assert!(db.column_exists("metrics", "event_kind").unwrap());
         for index in [
@@ -2322,7 +2635,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
         assert_metric_index_exists(&db, "metrics_retryable");
         assert_metric_index_missing(&db, "metrics_pending_retry");
         assert_eq!(db.count().unwrap(), 1);
@@ -2507,7 +2820,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "9");
         let batch = db.dequeue_pending_batch(1).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].delivery_binding, None);
@@ -3011,6 +3324,29 @@ mod tests {
     }
 
     #[test]
+    fn test_dequeue_prioritizes_due_commit_and_rewrite_evidence() {
+        let (mut db, _temp_dir) = create_test_db();
+        let repository = "https://github.com/example/repo";
+        let checkpoint = event_json_with_repo(days_ago(1), 4, repository);
+        let commit = event_json_with_repo(days_ago(3), 1, repository);
+        let session = event_json_with_repo(days_ago(1), 5, repository);
+        let rewrite = event_json_with_repo(days_ago(2), 7, repository);
+        db.insert_events(&[
+            checkpoint.clone(),
+            commit.clone(),
+            session.clone(),
+            rewrite.clone(),
+        ])
+        .unwrap();
+
+        let batch = db.dequeue_pending_batch(3).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].event_json, rewrite);
+        assert_eq!(batch[1].event_json, commit);
+        assert_eq!(batch[2].event_json, session);
+    }
+
+    #[test]
     fn test_retryable_query_work_is_independent_of_exhausted_history() {
         let (db, _temp_dir) = create_test_db();
         let now = unix_now() as i64;
@@ -3122,6 +3458,122 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_exhaustion_creates_explicit_quarantine() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ids = db.insert_events(&[event_json(days_ago(1))]).unwrap();
+        let failed_at = unix_now();
+
+        for attempt in 0..MAX_METRIC_UPLOAD_ATTEMPTS {
+            db.mark_records_failed(
+                &ids,
+                "temporary transport failure",
+                failed_at + u64::from(attempt),
+            )
+            .unwrap();
+        }
+
+        let (attempts, quarantined_at, class, reason): (
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .conn
+            .query_row(
+                "SELECT attempts, quarantined_at, quarantine_class, quarantine_reason \
+                 FROM metrics WHERE id = ?1",
+                params![ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, MAX_METRIC_UPLOAD_ATTEMPTS as i64);
+        assert!(quarantined_at.is_some());
+        assert_eq!(class.as_deref(), Some("retry_exhausted"));
+        assert_eq!(reason.as_deref(), Some("temporary transport failure"));
+        assert!(db.dequeue_pending_batch(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_controlled_quarantine_backfill_is_bounded_audited_and_preserves_binding() {
+        let (mut db, _temp_dir) = create_test_db();
+        let repository_url = "https://github.com/example/company-a";
+        let binding = MetricDeliveryBinding {
+            tenant_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            repository_url: repository_url.to_string(),
+            branch: Some("main".to_string()),
+            api_base_url: "https://trackai.example.test".to_string(),
+            credential_key_id: "company-a-key-id".to_string(),
+        };
+        let generation_ts = days_ago(2);
+        let commit_ts = days_ago(1);
+        let generation_json = event_json_with_repo(generation_ts, 5, repository_url);
+        let commit_json = event_json_with_repo(commit_ts, 1, repository_url);
+        let ids = db
+            .insert_bound_events(&[generation_json.clone(), commit_json], &binding)
+            .unwrap();
+        db.mark_records_quarantined(
+            &[
+                (
+                    ids[0],
+                    "server_rejected_event".to_string(),
+                    "predates watermark".to_string(),
+                ),
+                (
+                    ids[1],
+                    "server_rejected_event".to_string(),
+                    "predates watermark".to_string(),
+                ),
+            ],
+            unix_now(),
+        )
+        .unwrap();
+        let request = QuarantineBackfillRequest {
+            repository_url: repository_url.to_string(),
+            evidence_family: MetricEvidenceFamily::GenerationSession,
+            occurred_from: generation_ts as u64,
+            occurred_until: commit_ts as u64,
+            max_rows: 1,
+        };
+
+        let preview = db.preview_quarantine_backfill(&request).unwrap();
+        assert_eq!(preview.matching_rows, 1);
+        assert_eq!(preview.selected_rows, 1);
+        assert!(
+            db.apply_quarantine_backfill(&request, false, unix_now())
+                .is_err()
+        );
+        assert!(db.dequeue_pending_batch(10).unwrap().is_empty());
+
+        let applied = db
+            .apply_quarantine_backfill(&request, true, unix_now())
+            .unwrap();
+        assert_eq!(applied.selected_rows, 1);
+        let batch = db.dequeue_pending_batch(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, ids[0]);
+        assert_eq!(batch[0].event_json, generation_json);
+        assert_eq!(batch[0].delivery_binding.as_ref(), Some(&binding));
+        let audit_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM metric_quarantine_replays",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_rows, 1);
+        let commit_quarantined: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM metrics WHERE id = ?1 AND quarantined_at IS NOT NULL",
+                params![ids[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commit_quarantined, 1);
+    }
+
+    #[test]
     fn test_status_counts_delivery_buckets() {
         let (mut db, _temp_dir) = create_test_db();
         let now = unix_now();
@@ -3177,7 +3629,9 @@ mod tests {
         db.conn
             .execute(
                 "UPDATE metrics \
-                 SET attempts = ?1, last_sync_error = ?2, last_sync_at = ?3, next_retry_at = ?3 \
+                 SET attempts = ?1, last_sync_error = ?2, last_sync_at = ?3, next_retry_at = ?3, \
+                     quarantined_at = ?3, quarantine_class = 'server_rejected_event', \
+                     quarantine_reason = ?2 \
                  WHERE id = ?4",
                 params![
                     MAX_METRIC_UPLOAD_ATTEMPTS as i64,
@@ -3217,17 +3671,34 @@ mod tests {
         assert!(db.dequeue_pending_batch(1).unwrap().is_empty());
         assert_eq!(db.get_metric_history(0, None, &[1]).unwrap().len(), 1);
 
-        let (delivered_ts, attempts, last_sync_error): (Option<i64>, i64, Option<String>) = db
+        let (delivered_ts, attempts, last_sync_error, quarantine_class, quarantine_reason): (
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db
             .conn
             .query_row(
-                "SELECT delivered_ts, attempts, last_sync_error FROM metrics WHERE id = ?1",
+                "SELECT delivered_ts, attempts, last_sync_error, quarantine_class, \
+                        quarantine_reason FROM metrics WHERE id = ?1",
                 params![ids[0]],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert!(delivered_ts.is_none());
         assert_eq!(attempts, MAX_METRIC_UPLOAD_ATTEMPTS as i64);
         assert_eq!(last_sync_error.as_deref(), Some("validation failed"));
+        assert_eq!(quarantine_class.as_deref(), Some("server_rejected_event"));
+        assert_eq!(quarantine_reason.as_deref(), Some("validation failed"));
     }
 
     #[test]
@@ -3510,6 +3981,10 @@ mod tests {
     #[test]
     fn test_database_path() {
         let path = MetricsDatabase::database_path().unwrap();
+        if let Ok(overridden_path) = std::env::var("GIT_AI_TEST_METRICS_DB_PATH") {
+            assert_eq!(path, PathBuf::from(overridden_path));
+            return;
+        }
         assert!(path.to_string_lossy().contains(".git-ai"));
         assert!(path.to_string_lossy().contains("internal"));
         assert!(path.to_string_lossy().ends_with("metrics-db"));

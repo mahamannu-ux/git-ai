@@ -4,7 +4,10 @@
 //! and CAS payloads, then flushes them to their destinations every 3 seconds.
 
 use crate::api::logs::daemon_logs_upload_allowed;
-use crate::api::metrics::{MetricsUploadError, MetricsUploadResponse, metrics_upload_allowed};
+use crate::api::metrics::{
+    MetricsUploadError, MetricsUploadResponse, metrics_upload_allowed,
+    metrics_upload_error_is_retryable,
+};
 use crate::api::types::{
     DAEMON_LOGS_UPLOAD_VERSION, DaemonLogEvent, DaemonLogFieldValue, DaemonLogKind, DaemonLogLevel,
     DaemonLogsUploadRequest,
@@ -1044,7 +1047,11 @@ where
 
         if !invalid_ids.is_empty() {
             result.invalid_records += invalid_ids.len();
-            mark_delivered(&invalid_ids)?;
+            let quarantined = invalid_ids
+                .iter()
+                .map(|id| (*id, "local_event_json_invalid".to_string()))
+                .collect::<Vec<_>>();
+            mark_undeliverable(&quarantined)?;
         }
 
         if events.is_empty() {
@@ -1069,8 +1076,17 @@ where
                     error = %e,
                     "metrics upload batch failed"
                 );
-                mark_failed(&record_ids, &e)?;
-                return Err(e);
+                if metrics_upload_error_is_retryable(&e) {
+                    mark_failed(&record_ids, &e)?;
+                    return Err(e);
+                }
+                let quarantined = record_ids
+                    .iter()
+                    .map(|id| (*id, "permanent_metrics_upload_failure".to_string()))
+                    .collect::<Vec<_>>();
+                mark_undeliverable(&quarantined)?;
+                result.invalid_records += quarantined.len();
+                continue;
             }
         };
 
@@ -2248,7 +2264,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_metric_records_marks_invalid_rows_delivered() {
+    fn flush_pending_metric_records_quarantines_invalid_rows() {
         let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
         let db = Rc::new(RefCell::new(metrics_db));
         let ts = now_ts();
@@ -2304,7 +2320,8 @@ mod tests {
             }
         );
         assert_eq!(*uploaded.borrow(), vec![ts]);
-        assert_eq!(db.borrow().count().unwrap(), 0);
+        assert_eq!(db.borrow().count().unwrap(), 1);
+        assert_eq!(db.borrow().status().unwrap().stopped_after_errors, 1);
         assert_eq!(
             db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
             1
@@ -2556,6 +2573,54 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(db.borrow().count().unwrap(), 1);
         assert_eq!(db.borrow().count_retryable().unwrap(), 0);
+    }
+
+    #[test]
+    fn flush_pending_metric_records_quarantines_permanent_http_failure() {
+        let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+        let db = Rc::new(RefCell::new(metrics_db));
+        db.borrow_mut()
+            .insert_events(&[event_json(now_ts())])
+            .unwrap();
+
+        let result = flush_pending_metric_records_with(
+            {
+                let db = Rc::clone(&db);
+                move |limit| db.borrow_mut().dequeue_pending_batch(limit)
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids| db.borrow_mut().mark_records_delivered(ids, unix_now())
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids, err| {
+                    db.borrow_mut()
+                        .mark_records_failed(ids, &err.to_string(), unix_now())
+                }
+            },
+            {
+                let db = Rc::clone(&db);
+                move |records| {
+                    db.borrow_mut()
+                        .mark_records_undeliverable(records, unix_now())
+                }
+            },
+            |_records, _batch| {
+                Err(GitAiError::MetricsUploadError {
+                    status_code: Some(401),
+                    retryable: false,
+                    message: "unauthorized".to_string(),
+                })
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(result.invalid_records, 1);
+        assert_eq!(db.borrow().count_retryable().unwrap(), 0);
+        assert_eq!(db.borrow().status().unwrap().stopped_after_errors, 1);
     }
 
     #[test]

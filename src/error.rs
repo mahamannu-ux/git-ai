@@ -16,6 +16,11 @@ pub enum GitAiError {
     FromUtf8Error(std::string::FromUtf8Error),
     PresetError(String),
     SqliteError(rusqlite::Error),
+    MetricsUploadError {
+        status_code: Option<u16>,
+        retryable: bool,
+        message: String,
+    },
     Generic(String),
 }
 
@@ -38,6 +43,14 @@ impl fmt::Display for GitAiError {
             GitAiError::FromUtf8Error(e) => write!(f, "From UTF-8 error: {}", e),
             GitAiError::PresetError(e) => write!(f, "{}", e),
             GitAiError::SqliteError(e) => write!(f, "SQLite error: {}", e),
+            GitAiError::MetricsUploadError {
+                status_code,
+                message,
+                ..
+            } => match status_code {
+                Some(code) => write!(f, "Metrics upload HTTP {}: {}", code, message),
+                None => write!(f, "Metrics upload transport error: {}", message),
+            },
             GitAiError::Generic(e) => write!(f, "Generic error: {}", e),
             GitAiError::GixError(e) => write!(f, "Gix error: {}", e),
         }
@@ -92,6 +105,15 @@ impl Clone for GitAiError {
             GitAiError::FromUtf8Error(e) => GitAiError::FromUtf8Error(e.clone()),
             GitAiError::PresetError(s) => GitAiError::PresetError(s.clone()),
             GitAiError::SqliteError(e) => GitAiError::Generic(format!("SQLite error: {}", e)),
+            GitAiError::MetricsUploadError {
+                status_code,
+                retryable,
+                message,
+            } => GitAiError::MetricsUploadError {
+                status_code: *status_code,
+                retryable: *retryable,
+                message: message.clone(),
+            },
             GitAiError::Generic(s) => GitAiError::Generic(s.clone()),
             GitAiError::GixError(e) => GitAiError::Generic(format!("Gix error: {}", e)),
         }

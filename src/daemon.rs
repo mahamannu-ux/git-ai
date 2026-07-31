@@ -6160,7 +6160,29 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Phase 3: flush telemetry and wait for the worker to finish.
+        // Phase 3: fence asynchronous metric producers before asking the
+        // telemetry worker to flush. Producers register before they spawn, so
+        // accepted rewrite work cannot appear after await reports success.
+        if !result.timed_out {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = deadline - now;
+                maybe_log("metric producers");
+                if timeout(
+                    remaining,
+                    crate::daemon::rewrite_metrics::wait_for_rewrite_metric_producers(),
+                )
+                .await
+                .is_err()
+                {
+                    result.timed_out = true;
+                }
+            } else {
+                result.timed_out = true;
+            }
+        }
+
+        // Phase 4: flush telemetry and wait for the worker to finish.
         if !result.timed_out
             && let Some(worker) = &self.telemetry_worker
         {
@@ -6215,6 +6237,9 @@ impl ActorDaemonCoordinator {
                     return true;
                 }
             }
+        }
+        if crate::daemon::rewrite_metrics::has_active_rewrite_metric_producers() {
+            return true;
         }
         false
     }
@@ -9238,6 +9263,28 @@ mod tests {
             coord.queued_trace_payloads.load(Ordering::Relaxed),
             0,
             "worktree list flood must not fill the ingest queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_completion_waits_for_late_rewrite_metric_producer() {
+        let coord = ActorDaemonCoordinator::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        crate::daemon::rewrite_metrics::spawn_test_rewrite_metric_producer(
+            Duration::from_millis(50),
+            completed.clone(),
+        );
+
+        let result = coord.await_completion(1).await;
+
+        assert!(
+            result.done,
+            "await should finish after tracked work completes"
+        );
+        assert!(!result.timed_out);
+        assert!(
+            completed.load(Ordering::Acquire),
+            "await must not report success before the producer completes"
         );
     }
 

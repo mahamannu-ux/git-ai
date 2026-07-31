@@ -17,6 +17,7 @@ pub mod install_hooks;
 pub mod log;
 pub mod login;
 pub mod logout;
+pub mod metrics_backfill;
 pub mod notes_migrate;
 pub mod personal_dashboard;
 pub mod show;

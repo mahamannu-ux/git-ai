@@ -8,5 +8,7 @@ pub mod types;
 
 pub use client::{ApiClient, ApiContext};
 pub use logs::daemon_logs_upload_allowed;
-pub use metrics::{metrics_upload_allowed, upload_metrics_with_retry};
+pub use metrics::{
+    metrics_upload_allowed, metrics_upload_error_is_retryable, upload_metrics_with_retry,
+};
 pub use types::*;

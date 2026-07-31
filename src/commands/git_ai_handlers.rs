@@ -191,6 +191,9 @@ pub fn handle_git_ai(args: &[String]) {
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
         }
+        "metrics-backfill" => {
+            commands::metrics_backfill::handle_metrics_backfill(&args[1..]);
+        }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
         }

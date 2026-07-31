@@ -92,6 +92,23 @@ impl MetricsUploadResponse {
     }
 }
 
+pub fn metrics_upload_error_is_retryable(error: &GitAiError) -> bool {
+    match error {
+        GitAiError::MetricsUploadError { retryable, .. } => *retryable,
+        _ => true,
+    }
+}
+
+fn metrics_http_error(status_code: u16, message: impl Into<String>) -> GitAiError {
+    let retryable =
+        matches!(status_code, 408 | 425 | 429 | 500 | 502 | 503 | 504) || status_code >= 500;
+    GitAiError::MetricsUploadError {
+        status_code: Some(status_code),
+        retryable,
+        message: message.into(),
+    }
+}
+
 /// Upload metrics batch with retry logic.
 ///
 /// Returns Ok(response) on success (200 response, even with partial errors).
@@ -137,7 +154,10 @@ pub fn upload_metrics_with_retry(
                 return Ok(response);
             }
             Err(e) => {
-                // Non-200 - will retry if attempts remain
+                if !metrics_upload_error_is_retryable(&e) {
+                    return Err(e);
+                }
+                // Retryable non-200 - will retry if attempts remain
                 if attempt == RETRY_DELAYS_SECS.len() {
                     eprintln!("[metrics] All retries exhausted, giving up");
                     return Err(e);
@@ -167,7 +187,14 @@ impl ApiClient {
         batch: &MetricsBatch,
     ) -> Result<MetricsUploadResponse, GitAiError> {
         wait_for_metrics_upload_rate_limit()?;
-        let response = self.context().post_json("/worker/metrics/upload", batch)?;
+        let response = self
+            .context()
+            .post_json("/worker/metrics/upload", batch)
+            .map_err(|error| GitAiError::MetricsUploadError {
+                status_code: None,
+                retryable: true,
+                message: error.to_string(),
+            })?;
         let status_code = response.status_code;
 
         let body = response
@@ -186,27 +213,23 @@ impl ApiClient {
                         error: "Invalid request body".to_string(),
                         details: Some(serde_json::Value::String(body.to_string())),
                     });
-                Err(GitAiError::Generic(format!(
-                    "Bad Request: {}",
-                    error_response.error
-                )))
+                let _ = error_response;
+                Err(metrics_http_error(400, "request rejected"))
             }
-            401 => Err(GitAiError::Generic("Unauthorized".to_string())),
+            401 => Err(metrics_http_error(401, "Unauthorized")),
             500 => {
                 let error_response: ApiErrorResponse =
                     serde_json::from_str(body).unwrap_or_else(|_| ApiErrorResponse {
                         error: "Internal server error".to_string(),
                         details: None,
                     });
-                Err(GitAiError::Generic(format!(
-                    "Internal Server Error: {}",
-                    error_response.error
-                )))
+                let _ = error_response;
+                Err(metrics_http_error(500, "server temporarily unavailable"))
             }
-            _ => Err(GitAiError::Generic(format!(
-                "Unexpected status code {}: {}",
-                status_code, body
-            ))),
+            _ => Err(metrics_http_error(
+                status_code,
+                "unexpected metrics upload response",
+            )),
         }
     }
 }
@@ -258,6 +281,22 @@ mod tests {
         };
         let successful = response.successful_indices(2);
         assert!(successful.is_empty());
+    }
+
+    #[test]
+    fn test_metrics_http_retry_classification() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(metrics_upload_error_is_retryable(&metrics_http_error(
+                status,
+                "temporary"
+            )));
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(!metrics_upload_error_is_retryable(&metrics_http_error(
+                status,
+                "permanent"
+            )));
+        }
     }
 
     #[test]

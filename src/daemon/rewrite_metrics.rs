@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::sync::Notify;
 
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::effective_ignore_patterns;
@@ -8,6 +11,53 @@ use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::repository::Repository;
 use crate::metrics::{EventAttributes, MetricEvent, PosEncoded, RewriteCommittedValues};
+
+static ACTIVE_REWRITE_METRIC_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
+static REWRITE_METRIC_PRODUCERS_IDLE: Notify = Notify::const_new();
+
+struct RewriteMetricProducerGuard;
+
+impl RewriteMetricProducerGuard {
+    fn start() -> Self {
+        ACTIVE_REWRITE_METRIC_PRODUCERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RewriteMetricProducerGuard {
+    fn drop(&mut self) {
+        if ACTIVE_REWRITE_METRIC_PRODUCERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            REWRITE_METRIC_PRODUCERS_IDLE.notify_waiters();
+        }
+    }
+}
+
+pub(crate) fn has_active_rewrite_metric_producers() -> bool {
+    ACTIVE_REWRITE_METRIC_PRODUCERS.load(Ordering::Acquire) > 0
+}
+
+pub(crate) async fn wait_for_rewrite_metric_producers() {
+    loop {
+        let notified = REWRITE_METRIC_PRODUCERS_IDLE.notified();
+        if !has_active_rewrite_metric_producers() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_test_rewrite_metric_producer(
+    delay: std::time::Duration,
+    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let producer_guard = RewriteMetricProducerGuard::start();
+    tokio::spawn(async move {
+        let _producer_guard = producer_guard;
+        tokio::time::sleep(delay).await;
+        completed.store(true, Ordering::Release);
+    });
+}
 
 pub(crate) fn spawn_rewrite_commit_metrics(
     repo: &Repository,
@@ -21,8 +71,10 @@ pub(crate) fn spawn_rewrite_commit_metrics(
     }
 
     let repo = repo.clone();
+    let producer_guard = RewriteMetricProducerGuard::start();
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
+            let _producer_guard = producer_guard;
             let result = tokio::task::spawn_blocking(move || {
                 build_rewrite_metric_events(&repo, &metric_commits)
             })
@@ -34,6 +86,7 @@ pub(crate) fn spawn_rewrite_commit_metrics(
         });
     } else {
         std::thread::spawn(move || {
+            let _producer_guard = producer_guard;
             submit_events(build_rewrite_metric_events(&repo, &metric_commits));
         });
     }
@@ -418,6 +471,38 @@ mod tests {
     use crate::metrics::EventValues;
     use crate::metrics::events::rewrite_committed_pos;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn rewrite_metric_producer_barrier_waits_for_tracked_work() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_task = completed.clone();
+        let producer_guard = RewriteMetricProducerGuard::start();
+
+        tokio::spawn(async move {
+            let _producer_guard = producer_guard;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed_for_task.store(true, Ordering::Release);
+        });
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                wait_for_rewrite_metric_producers(),
+            )
+            .await
+            .is_err(),
+            "the barrier must not complete while a producer is active"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_rewrite_metric_producers(),
+        )
+        .await
+        .expect("the barrier should complete after the producer exits");
+        assert!(completed.load(Ordering::Acquire));
+    }
 
     fn metric_commit(
         new_sha: &str,

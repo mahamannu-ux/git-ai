@@ -2,7 +2,10 @@
 //!
 //! Uploads pending metrics database rows to the API.
 
-use crate::api::{ApiClient, ApiContext, metrics_upload_allowed, upload_metrics_with_retry};
+use crate::api::{
+    ApiClient, ApiContext, metrics_upload_allowed, metrics_upload_error_is_retryable,
+    upload_metrics_with_retry,
+};
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
 
@@ -68,10 +71,13 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                 record_ids.push(record.id);
             } else {
                 total_invalid += 1;
-                // Invalid JSON cannot upload successfully. Mark it delivered so
-                // future flushes can continue past the malformed historical row.
+                // Invalid JSON cannot upload successfully. Quarantine it so
+                // future flushes continue without inventing successful delivery.
                 if let Ok(mut db_lock) = db.lock() {
-                    let _ = db_lock.mark_records_delivered(&[record.id], current_unix_ts());
+                    let _ = db_lock.mark_records_undeliverable(
+                        &[(record.id, "local_event_json_invalid".to_string())],
+                        current_unix_ts(),
+                    );
                 }
             }
         }
@@ -132,15 +138,29 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
                 }
             }
             Err(e) => {
-                // All retries failed - keep records in DB for a later queued retry.
+                let retryable = metrics_upload_error_is_retryable(&e);
                 eprintln!(
-                    "  ✗ batch upload failed ({} events kept for retry): {}",
-                    event_count, e
+                    "  ✗ batch upload failed ({} events {}): {}",
+                    event_count,
+                    if retryable {
+                        "kept for retry"
+                    } else {
+                        "quarantined"
+                    },
+                    e
                 );
                 if let Ok(mut db_lock) = db.lock() {
                     let now = current_unix_ts();
-                    let error = e.to_string();
-                    let _ = db_lock.mark_records_failed(&record_ids, &error, now);
+                    if retryable {
+                        let error = e.to_string();
+                        let _ = db_lock.mark_records_failed(&record_ids, &error, now);
+                    } else {
+                        let records = record_ids
+                            .iter()
+                            .map(|id| (*id, "permanent_metrics_upload_failure".to_string()))
+                            .collect::<Vec<_>>();
+                        let _ = db_lock.mark_records_undeliverable(&records, now);
+                    }
                 }
                 break;
             }
@@ -149,7 +169,7 @@ pub fn handle_flush_metrics_db(_args: &[String]) {
 
     if total_invalid > 0 {
         eprintln!(
-            "flush-metrics-db: marked {} invalid record(s) delivered",
+            "flush-metrics-db: quarantined {} invalid record(s)",
             total_invalid
         );
     }
