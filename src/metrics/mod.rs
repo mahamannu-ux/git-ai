@@ -7,6 +7,7 @@
 
 pub mod attrs;
 pub mod db;
+pub mod delivery;
 pub mod events;
 pub mod local_stats;
 pub mod pos_encoded;

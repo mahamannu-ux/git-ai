@@ -4,7 +4,7 @@
 //! and CAS payloads, then flushes them to their destinations every 3 seconds.
 
 use crate::api::logs::daemon_logs_upload_allowed;
-use crate::api::metrics::{MetricsUploadResponse, metrics_upload_allowed};
+use crate::api::metrics::{MetricsUploadError, MetricsUploadResponse, metrics_upload_allowed};
 use crate::api::types::{
     DAEMON_LOGS_UPLOAD_VERSION, DaemonLogEvent, DaemonLogFieldValue, DaemonLogKind, DaemonLogLevel,
     DaemonLogsUploadRequest,
@@ -14,7 +14,11 @@ use crate::authorship::authorship_log_serialization::GIT_AI_VERSION;
 use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
-use crate::metrics::db::{METADATA_BACKFILL_BATCH_SIZE, MetricRecord, MetricsDatabase};
+use crate::metrics::db::{
+    METADATA_BACKFILL_BATCH_SIZE, MetricDeliveryBinding, MetricQueueDisposition, MetricQueueEntry,
+    MetricRecord, MetricsDatabase,
+};
+use crate::metrics::delivery::{MetricDeliveryRuntime, MetricDeliveryRuntimeError};
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
@@ -663,13 +667,6 @@ fn count_pending_metrics_for_await() -> usize {
 }
 
 fn flush_metrics(events: &[MetricEvent]) {
-    let context = ApiContext::new(None);
-    let api_base_url = context.base_url.clone();
-    let client = ApiClient::new(context);
-
-    let should_upload = metrics_upload_allowed(&api_base_url, &client);
-    METRICS_UPLOAD_AVAILABLE.store(should_upload, Ordering::Relaxed);
-
     let mut upload_failed = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
@@ -679,8 +676,8 @@ fn flush_metrics(events: &[MetricEvent]) {
             continue;
         }
 
-        if should_upload && !upload_failed && std::time::Instant::now() < deadline {
-            match flush_pending_metrics_from_db(&client, deadline) {
+        if !upload_failed && std::time::Instant::now() < deadline {
+            match flush_pending_metrics_for_current_config(deadline) {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(%e, "telemetry: failed to upload pending metrics");
@@ -692,19 +689,38 @@ fn flush_metrics(events: &[MetricEvent]) {
 }
 
 fn flush_pending_metrics() {
-    let context = ApiContext::new(None);
-    let api_base_url = context.base_url.clone();
-    let client = ApiClient::new(context);
-
-    let should_upload = metrics_upload_allowed(&api_base_url, &client);
-    METRICS_UPLOAD_AVAILABLE.store(should_upload, Ordering::Relaxed);
-    if !should_upload {
-        return;
-    }
-
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    if let Err(e) = flush_pending_metrics_from_db(&client, deadline) {
+    if let Err(e) = flush_pending_metrics_for_current_config(deadline) {
         tracing::warn!(%e, "telemetry: failed to upload pending metrics");
+    }
+}
+
+fn flush_pending_metrics_for_current_config(
+    deadline: std::time::Instant,
+) -> Result<PendingMetricsFlushResult, GitAiError> {
+    match MetricDeliveryRuntime::load_optional_default() {
+        Ok(Some(runtime)) => {
+            METRICS_UPLOAD_AVAILABLE.store(true, Ordering::Relaxed);
+            flush_pending_bound_metrics_from_db(&runtime, deadline)
+        }
+        Ok(None) => {
+            let context = ApiContext::new(None);
+            let api_base_url = context.base_url.clone();
+            let client = ApiClient::new(context);
+            let should_upload = metrics_upload_allowed(&api_base_url, &client);
+            METRICS_UPLOAD_AVAILABLE.store(should_upload, Ordering::Relaxed);
+            if should_upload {
+                flush_pending_metrics_from_db(&client, deadline)
+            } else {
+                Ok(PendingMetricsFlushResult::default())
+            }
+        }
+        Err(error) => {
+            METRICS_UPLOAD_AVAILABLE.store(false, Ordering::Relaxed);
+            Err(GitAiError::Generic(format!(
+                "TrackAI delivery configuration is unavailable: {error}"
+            )))
+        }
     }
 }
 
@@ -713,20 +729,192 @@ fn store_metrics_in_db(events: &[MetricEvent]) -> Result<Vec<i64>, GitAiError> {
         return Ok(Vec::new());
     }
 
-    let event_jsons: Vec<String> = events
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<_, _>>()?;
-
-    if event_jsons.is_empty() {
-        return Ok(Vec::new());
-    }
-
+    let runtime_result = MetricDeliveryRuntime::load_optional_default();
     let db = MetricsDatabase::global()?;
     let mut db_lock = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    db_lock.insert_events(&event_jsons)
+    store_metrics_in_database_with_runtime_result(&mut db_lock, events, runtime_result)
+}
+
+fn store_metrics_in_database_with_runtime_result(
+    db: &mut MetricsDatabase,
+    events: &[MetricEvent],
+    runtime_result: Result<Option<MetricDeliveryRuntime>, MetricDeliveryRuntimeError>,
+) -> Result<Vec<i64>, GitAiError> {
+    match runtime_result {
+        Ok(runtime) => store_metrics_in_database(db, events, runtime.as_ref()),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "telemetry: TrackAI delivery configuration failed closed"
+            );
+            let rejected = events
+                .iter()
+                .map(|event| {
+                    serde_json::to_string(event)
+                        .map(|json| (json, "delivery_runtime_unavailable".to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            db.insert_policy_rejected_events(&rejected, current_unix_ts())
+        }
+    }
+}
+
+fn store_metrics_in_database(
+    db: &mut MetricsDatabase,
+    events: &[MetricEvent],
+    runtime: Option<&MetricDeliveryRuntime>,
+) -> Result<Vec<i64>, GitAiError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let event_jsons = events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    store_serialized_metrics_in_database(db, events, event_jsons, runtime)
+}
+
+fn store_serialized_metrics_in_database(
+    db: &mut MetricsDatabase,
+    events: &[MetricEvent],
+    event_jsons: Vec<String>,
+    runtime: Option<&MetricDeliveryRuntime>,
+) -> Result<Vec<i64>, GitAiError> {
+    let Some(runtime) = runtime else {
+        return db.insert_events(&event_jsons);
+    };
+    let entries = events
+        .iter()
+        .zip(event_jsons)
+        .map(|(event, event_json)| MetricQueueEntry {
+            event_json,
+            disposition: match runtime.bind_event(event) {
+                Ok(binding) => MetricQueueDisposition::Bound(binding),
+                Err(_) => MetricQueueDisposition::PolicyRejected("delivery_policy_rejected"),
+            },
+        })
+        .collect::<Vec<_>>();
+    db.insert_classified_events(&entries, current_unix_ts())
+}
+
+fn build_bound_metric_api_context(
+    runtime: &MetricDeliveryRuntime,
+    binding: &MetricDeliveryBinding,
+) -> Result<ApiContext, MetricDeliveryRuntimeError> {
+    let credential = runtime.credential_for_binding(binding)?.to_string();
+    Ok(ApiContext {
+        base_url: binding.api_base_url.clone(),
+        auth_token: None,
+        api_key: Some(credential),
+        author_identity: None,
+        timeout_secs: Some(30),
+    })
+}
+
+#[derive(Debug)]
+struct BoundMetricRoute {
+    context: ApiContext,
+    record_ids: Vec<i64>,
+}
+
+#[derive(Debug, Default)]
+struct BoundMetricRoutes {
+    routes: Vec<BoundMetricRoute>,
+    rejected_records: Vec<(i64, String)>,
+}
+
+fn build_bound_metric_routes(
+    runtime: &MetricDeliveryRuntime,
+    records: &[MetricRecord],
+) -> Result<BoundMetricRoutes, MetricDeliveryRuntimeError> {
+    let mut routes = BTreeMap::<(String, String), BoundMetricRoute>::new();
+    let mut rejected_records = Vec::new();
+    for record in records {
+        let Some(binding) = record.delivery_binding.as_ref() else {
+            rejected_records.push((record.id, "delivery_binding_missing".to_string()));
+            continue;
+        };
+        let context = build_bound_metric_api_context(runtime, binding)?;
+        let route_key = (
+            binding.api_base_url.clone(),
+            binding.credential_key_id.clone(),
+        );
+        routes
+            .entry(route_key)
+            .or_insert_with(|| BoundMetricRoute {
+                context,
+                record_ids: Vec::new(),
+            })
+            .record_ids
+            .push(record.id);
+    }
+    Ok(BoundMetricRoutes {
+        routes: routes.into_values().collect(),
+        rejected_records,
+    })
+}
+
+fn upload_bound_metric_batch_with<Upload>(
+    runtime: &MetricDeliveryRuntime,
+    records: &[MetricRecord],
+    batch: &MetricsBatch,
+    mut upload: Upload,
+) -> Result<MetricsUploadResponse, GitAiError>
+where
+    Upload: FnMut(&ApiContext, &MetricsBatch) -> Result<MetricsUploadResponse, GitAiError>,
+{
+    if records.len() != batch.events.len() {
+        return Err(GitAiError::Generic(
+            "Bound metric records and events are misaligned".to_string(),
+        ));
+    }
+    let index_by_id = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.id, index))
+        .collect::<std::collections::HashMap<_, _>>();
+    if index_by_id.len() != records.len() {
+        return Err(GitAiError::Generic(
+            "Bound metric record IDs are not unique".to_string(),
+        ));
+    }
+
+    let routed = build_bound_metric_routes(runtime, records)
+        .map_err(|error| GitAiError::Generic(error.to_string()))?;
+    let mut errors = Vec::new();
+    for route in routed.routes {
+        let original_indices = route
+            .record_ids
+            .iter()
+            .map(|id| {
+                index_by_id.get(id).copied().ok_or_else(|| {
+                    GitAiError::Generic("Bound metric route contains an unknown row".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let routed_batch = MetricsBatch::new(
+            original_indices
+                .iter()
+                .map(|index| batch.events[*index].clone())
+                .collect(),
+        );
+        let response = upload(&route.context, &routed_batch)?;
+        response.validate_error_indices(routed_batch.events.len())?;
+        errors.extend(response.errors.into_iter().map(|error| MetricsUploadError {
+            index: original_indices[error.index],
+            error: error.error,
+        }));
+    }
+    for (id, error) in routed.rejected_records {
+        let index = index_by_id.get(&id).copied().ok_or_else(|| {
+            GitAiError::Generic("Rejected metric route contains an unknown row".to_string())
+        })?;
+        errors.push(MetricsUploadError { index, error });
+    }
+    errors.sort_by_key(|error| error.index);
+    Ok(MetricsUploadResponse { errors })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -745,7 +933,26 @@ fn flush_pending_metrics_from_db(
         mark_metric_records_delivered,
         mark_metric_records_failed,
         mark_metric_records_undeliverable,
-        |batch| client.upload_metrics(batch),
+        |_records, batch| client.upload_metrics(batch),
+        deadline,
+        MAX_METRICS_PER_ENVELOPE,
+    )
+}
+
+fn flush_pending_bound_metrics_from_db(
+    runtime: &MetricDeliveryRuntime,
+    deadline: std::time::Instant,
+) -> Result<PendingMetricsFlushResult, GitAiError> {
+    flush_pending_metric_records_with(
+        read_pending_metrics_batch,
+        mark_metric_records_delivered,
+        mark_metric_records_failed,
+        mark_metric_records_undeliverable,
+        |records, batch| {
+            upload_bound_metric_batch_with(runtime, records, batch, |context, routed_batch| {
+                ApiClient::new(context.clone()).upload_metrics(routed_batch)
+            })
+        },
         deadline,
         MAX_METRICS_PER_ENVELOPE,
     )
@@ -804,7 +1011,7 @@ where
     MarkDelivered: FnMut(&[i64]) -> Result<(), GitAiError>,
     MarkFailed: FnMut(&[i64], &GitAiError) -> Result<(), GitAiError>,
     MarkUndeliverable: FnMut(&[(i64, String)]) -> Result<(), GitAiError>,
-    UploadBatch: FnMut(&MetricsBatch) -> Result<MetricsUploadResponse, GitAiError>,
+    UploadBatch: FnMut(&[MetricRecord], &MetricsBatch) -> Result<MetricsUploadResponse, GitAiError>,
 {
     let mut result = PendingMetricsFlushResult::default();
 
@@ -815,6 +1022,7 @@ where
         }
 
         let mut events = Vec::new();
+        let mut valid_records = Vec::new();
         let mut record_ids = Vec::new();
         let mut invalid_ids = Vec::new();
 
@@ -822,6 +1030,7 @@ where
             match serde_json::from_str::<MetricEvent>(&record.event_json) {
                 Ok(event) => {
                     events.push(event);
+                    valid_records.push(record.clone());
                     record_ids.push(record.id);
                 }
                 Err(_) => {
@@ -850,7 +1059,7 @@ where
             invalid_records = invalid_ids.len(),
             "metrics upload batch sending"
         );
-        let response = match upload_batch(&metrics_batch) {
+        let response = match upload_batch(&valid_records, &metrics_batch) {
             Ok(response) => response,
             Err(e) => {
                 tracing::info!(
@@ -1515,13 +1724,31 @@ impl SentryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::metrics::MetricsUploadError;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
 
     fn event_json(ts: u32) -> String {
         format!(r#"{{"t":{ts},"e":1,"v":{{}},"a":{{}}}}"#)
+    }
+
+    fn repository_event(repo_url: &str, branch: &str) -> MetricEvent {
+        use crate::metrics::EventAttributes;
+        use crate::metrics::pos_encoded::PosEncoded;
+
+        MetricEvent {
+            timestamp: now_ts(),
+            event_id: 1,
+            values: Default::default(),
+            attrs: EventAttributes::with_version("test")
+                .repo_url(repo_url)
+                .branch(branch)
+                .to_sparse(),
+        }
+    }
+
+    fn machine_token(key_id: &str, secret_byte: char) -> String {
+        format!("trk_v1.{key_id}.{}", secret_byte.to_string().repeat(43))
     }
 
     fn unix_now() -> u64 {
@@ -1576,6 +1803,331 @@ mod tests {
                 metrics_remaining: 11,
                 notes_remaining: 7,
             })
+        );
+    }
+
+    #[test]
+    fn store_metrics_in_database_binds_two_tenants_and_quarantines_unknown() {
+        use crate::metrics::delivery::{
+            DeliveryPolicyCache, MachineCredentialKeyring, MetricDeliveryRuntime,
+        };
+
+        let policy = DeliveryPolicyCache::from_json(
+            r#"{
+                "version": 1,
+                "repositories": [
+                    {
+                        "repository_url": "https://github.com/example/company-a",
+                        "tenant_id": "11111111-1111-4111-8111-111111111111",
+                        "api_base_url": "https://trackai.example.test",
+                        "credential_key_id": "company-a-key-id"
+                    },
+                    {
+                        "repository_url": "https://github.com/example/company-b",
+                        "tenant_id": "22222222-2222-4222-8222-222222222222",
+                        "api_base_url": "https://trackai.example.test",
+                        "credential_key_id": "company-b-key-id"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let keyring = MachineCredentialKeyring::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "credentials": [
+                    machine_token("company-a-key-id", 'A'),
+                    machine_token("company-b-key-id", 'B')
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = MetricDeliveryRuntime::new(policy, keyring);
+        let events = vec![
+            repository_event("https://github.com/example/company-a", "main"),
+            repository_event("git@github.com:example/company-b.git", "release"),
+            repository_event("https://github.com/example/not-enrolled", "main"),
+        ];
+        let (mut db, _temp_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+
+        let ids = store_metrics_in_database(&mut db, &events, Some(&runtime)).unwrap();
+
+        assert_eq!(ids.len(), 3);
+        let status = db.status().unwrap();
+        assert_eq!(status.total, 3);
+        assert_eq!(status.pending_retryable, 2);
+        assert_eq!(status.stopped_after_errors, 1);
+        let batch = db.dequeue_pending_batch(3).unwrap();
+        assert_eq!(batch.len(), 2);
+        let tenants = batch
+            .into_iter()
+            .map(|record| record.delivery_binding.unwrap().tenant_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            tenants,
+            std::collections::HashSet::from([
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                "22222222-2222-4222-8222-222222222222".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn store_metrics_in_database_quarantines_when_runtime_configuration_fails() {
+        let events = vec![repository_event(
+            "https://github.com/example/company-a",
+            "main",
+        )];
+        let (mut db, _temp_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+
+        let ids = store_metrics_in_database_with_runtime_result(
+            &mut db,
+            &events,
+            Err(MetricDeliveryRuntimeError::IncompleteConfiguration),
+        )
+        .unwrap();
+
+        assert_eq!(ids.len(), 1);
+        let status = db.status().unwrap();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.pending_retryable, 0);
+        assert_eq!(status.stopped_after_errors, 1);
+        assert!(db.dequeue_pending_batch(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bound_metric_api_context_uses_exact_queued_credential_and_no_oauth() {
+        use crate::metrics::delivery::{
+            DeliveryPolicyCache, MachineCredentialKeyring, MetricDeliveryRuntime,
+        };
+
+        let token = machine_token("company-a-key-id", 'A');
+        let policy = DeliveryPolicyCache::from_json(
+            r#"{
+                "version": 1,
+                "repositories": [{
+                    "repository_url": "https://github.com/example/company-a",
+                    "tenant_id": "11111111-1111-4111-8111-111111111111",
+                    "api_base_url": "https://trackai.example.test/api/ingest",
+                    "credential_key_id": "company-a-key-id"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let keyring = MachineCredentialKeyring::from_json(
+            &serde_json::json!({"version": 1, "credentials": [token]}).to_string(),
+        )
+        .unwrap();
+        let runtime = MetricDeliveryRuntime::new(policy, keyring);
+        let binding = runtime
+            .bind_event(&repository_event(
+                "https://github.com/example/company-a",
+                "main",
+            ))
+            .unwrap();
+
+        let context = build_bound_metric_api_context(&runtime, &binding).unwrap();
+
+        assert_eq!(context.base_url, "https://trackai.example.test/api/ingest");
+        assert_eq!(context.api_key.as_deref(), Some(token.as_str()));
+        assert_eq!(context.auth_token, None);
+        assert_eq!(context.author_identity, None);
+        assert!(!format!("{context:?}").contains(&token));
+    }
+
+    #[test]
+    fn bound_metric_routes_split_tenants_and_reject_unbound_rows() {
+        use crate::metrics::delivery::{
+            DeliveryPolicyCache, MachineCredentialKeyring, MetricDeliveryRuntime,
+        };
+
+        let token_a = machine_token("company-a-key-id", 'A');
+        let token_b = machine_token("company-b-key-id", 'B');
+        let policy = DeliveryPolicyCache::from_json(
+            r#"{
+                "version": 1,
+                "repositories": [
+                    {
+                        "repository_url": "https://github.com/example/company-a",
+                        "tenant_id": "11111111-1111-4111-8111-111111111111",
+                        "api_base_url": "https://a.trackai.example.test",
+                        "credential_key_id": "company-a-key-id"
+                    },
+                    {
+                        "repository_url": "https://github.com/example/company-b",
+                        "tenant_id": "22222222-2222-4222-8222-222222222222",
+                        "api_base_url": "https://b.trackai.example.test",
+                        "credential_key_id": "company-b-key-id"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let keyring = MachineCredentialKeyring::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "credentials": [token_a, token_b]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = MetricDeliveryRuntime::new(policy, keyring);
+        let event_a = repository_event("https://github.com/example/company-a", "main");
+        let event_b = repository_event("https://github.com/example/company-b", "release");
+        let records = vec![
+            MetricRecord {
+                id: 10,
+                event_json: serde_json::to_string(&event_a).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: Some(runtime.bind_event(&event_a).unwrap()),
+            },
+            MetricRecord {
+                id: 20,
+                event_json: serde_json::to_string(&event_b).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: Some(runtime.bind_event(&event_b).unwrap()),
+            },
+            MetricRecord {
+                id: 30,
+                event_json: serde_json::to_string(&event_a).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: None,
+            },
+        ];
+
+        let routed = build_bound_metric_routes(&runtime, &records).unwrap();
+
+        assert_eq!(routed.routes.len(), 2);
+        let route_ids = routed
+            .routes
+            .iter()
+            .map(|route| {
+                (
+                    route.context.base_url.clone(),
+                    route.context.api_key.clone().unwrap(),
+                    route.record_ids.clone(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            route_ids,
+            std::collections::HashSet::from([
+                (
+                    "https://a.trackai.example.test".to_string(),
+                    token_a,
+                    vec![10],
+                ),
+                (
+                    "https://b.trackai.example.test".to_string(),
+                    token_b,
+                    vec![20],
+                ),
+            ])
+        );
+        assert_eq!(
+            routed.rejected_records,
+            vec![(30, "delivery_binding_missing".to_string())]
+        );
+    }
+
+    #[test]
+    fn bound_metric_batch_upload_remaps_partial_errors_and_unbound_rejection() {
+        use crate::metrics::delivery::{
+            DeliveryPolicyCache, MachineCredentialKeyring, MetricDeliveryRuntime,
+        };
+
+        let policy = DeliveryPolicyCache::from_json(
+            r#"{
+                "version": 1,
+                "repositories": [
+                    {
+                        "repository_url": "https://github.com/example/company-a",
+                        "tenant_id": "11111111-1111-4111-8111-111111111111",
+                        "api_base_url": "https://a.trackai.example.test",
+                        "credential_key_id": "company-a-key-id"
+                    },
+                    {
+                        "repository_url": "https://github.com/example/company-b",
+                        "tenant_id": "22222222-2222-4222-8222-222222222222",
+                        "api_base_url": "https://b.trackai.example.test",
+                        "credential_key_id": "company-b-key-id"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let keyring = MachineCredentialKeyring::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "credentials": [
+                    machine_token("company-a-key-id", 'A'),
+                    machine_token("company-b-key-id", 'B')
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = MetricDeliveryRuntime::new(policy, keyring);
+        let event_a = repository_event("https://github.com/example/company-a", "main");
+        let event_b = repository_event("https://github.com/example/company-b", "release");
+        let records = vec![
+            MetricRecord {
+                id: 10,
+                event_json: serde_json::to_string(&event_a).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: Some(runtime.bind_event(&event_a).unwrap()),
+            },
+            MetricRecord {
+                id: 20,
+                event_json: serde_json::to_string(&event_b).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: Some(runtime.bind_event(&event_b).unwrap()),
+            },
+            MetricRecord {
+                id: 30,
+                event_json: serde_json::to_string(&event_a).unwrap(),
+                attempts: 0,
+                next_retry_at: 0,
+                delivery_binding: None,
+            },
+        ];
+        let batch = MetricsBatch::new(vec![event_a, event_b.clone(), event_b]);
+        let calls = Rc::new(RefCell::new(Vec::<(String, usize)>::new()));
+
+        let response = upload_bound_metric_batch_with(&runtime, &records, &batch, {
+            let calls = Rc::clone(&calls);
+            move |context, routed_batch| {
+                calls
+                    .borrow_mut()
+                    .push((context.base_url.clone(), routed_batch.events.len()));
+                if context.base_url.starts_with("https://b.") {
+                    Ok(MetricsUploadResponse {
+                        errors: vec![MetricsUploadError {
+                            index: 0,
+                            error: "branch denied".to_string(),
+                        }],
+                    })
+                } else {
+                    Ok(MetricsUploadResponse { errors: vec![] })
+                }
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls.borrow().len(), 2);
+        assert_eq!(
+            response
+                .errors
+                .iter()
+                .map(|error| (error.index, error.error.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "branch denied"), (2, "delivery_binding_missing")]
         );
     }
 
@@ -1667,7 +2219,7 @@ mod tests {
             },
             {
                 let uploaded = Rc::clone(&uploaded);
-                move |batch| {
+                move |_records, batch| {
                     uploaded
                         .borrow_mut()
                         .push(batch.events.iter().map(|event| event.timestamp).collect());
@@ -1731,7 +2283,7 @@ mod tests {
             },
             {
                 let uploaded = Rc::clone(&uploaded);
-                move |batch| {
+                move |_records, batch| {
                     uploaded
                         .borrow_mut()
                         .extend(batch.events.iter().map(|event| event.timestamp));
@@ -1797,7 +2349,7 @@ mod tests {
             },
             {
                 let uploaded = Rc::clone(&uploaded);
-                move |batch| {
+                move |_records, batch| {
                     uploaded
                         .borrow_mut()
                         .extend(batch.events.iter().map(|event| event.timestamp));
@@ -1871,7 +2423,7 @@ mod tests {
                         .mark_records_undeliverable(records, unix_now())
                 }
             },
-            |_batch| {
+            |_records, _batch| {
                 Ok(MetricsUploadResponse {
                     errors: vec![
                         MetricsUploadError {
@@ -1944,7 +2496,7 @@ mod tests {
                         .mark_records_undeliverable(records, unix_now())
                 }
             },
-            |_batch| {
+            |_records, _batch| {
                 Ok(MetricsUploadResponse {
                     errors: vec![MetricsUploadError {
                         index: 1,
@@ -1996,7 +2548,7 @@ mod tests {
                         .mark_records_undeliverable(records, unix_now())
                 }
             },
-            |_batch| Err(GitAiError::Generic("upload failed".to_string())),
+            |_records, _batch| Err(GitAiError::Generic("upload failed".to_string())),
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             10,
         );
@@ -2039,7 +2591,7 @@ mod tests {
                         .mark_records_undeliverable(records, unix_now())
                 }
             },
-            |_batch| Err(GitAiError::Generic("upload failed".to_string())),
+            |_records, _batch| Err(GitAiError::Generic("upload failed".to_string())),
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             1,
         );
@@ -2079,7 +2631,7 @@ mod tests {
             },
             {
                 let uploaded = Rc::clone(&uploaded);
-                move |batch| {
+                move |_records, batch| {
                     uploaded
                         .borrow_mut()
                         .push(batch.events.iter().map(|event| event.timestamp).collect());

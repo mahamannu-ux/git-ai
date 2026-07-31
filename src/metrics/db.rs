@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 5;
+const SCHEMA_VERSION: usize = 6;
 
 // This value is part of the metrics retry index schema. Changing it requires a
 // migration that rebuilds `metrics_retryable` with the same literal used by
@@ -89,6 +89,19 @@ const MIGRATIONS: &[&str] = &[
 
     DROP INDEX IF EXISTS metrics_pending_retry;
     "#,
+    // Migration 5 -> 6: Bind delivery identity and repository policy at
+    // enqueue time without storing a reusable machine credential in SQLite.
+    r#"
+    CREATE INDEX IF NOT EXISTS metrics_pending_delivery_binding
+        ON metrics (
+            delivery_tenant_id,
+            delivery_repository_url,
+            delivery_credential_key_id,
+            next_retry_at,
+            id
+        )
+        WHERE delivered_ts IS NULL;
+    "#,
 ];
 
 /// Global database singleton
@@ -101,6 +114,91 @@ pub struct MetricRecord {
     pub event_json: String,
     pub attempts: u32,
     pub next_retry_at: u64,
+    pub delivery_binding: Option<MetricDeliveryBinding>,
+}
+
+type MetricInsertRow<'a> = (
+    &'a str,
+    Option<&'a MetricDeliveryBinding>,
+    Option<(&'a str, u64)>,
+);
+
+#[derive(Debug, Clone)]
+pub(crate) enum MetricQueueDisposition {
+    Bound(MetricDeliveryBinding),
+    PolicyRejected(&'static str),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetricQueueEntry {
+    pub event_json: String,
+    pub disposition: MetricQueueDisposition,
+}
+
+/// Non-secret delivery context fixed when a metric enters the durable queue.
+///
+/// `credential_key_id` selects an exact credential from the local keyring at
+/// delivery time. The reusable `trk_v1` token is never persisted in SQLite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricDeliveryBinding {
+    pub tenant_id: String,
+    pub repository_url: String,
+    pub branch: Option<String>,
+    pub api_base_url: String,
+    pub credential_key_id: String,
+}
+
+impl MetricDeliveryBinding {
+    pub(crate) fn validate(&self) -> Result<(), GitAiError> {
+        for (name, value) in [
+            ("tenant_id", self.tenant_id.as_str()),
+            ("repository_url", self.repository_url.as_str()),
+            ("api_base_url", self.api_base_url.as_str()),
+            ("credential_key_id", self.credential_key_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(GitAiError::Generic(format!(
+                    "Metric delivery binding {name} is required"
+                )));
+            }
+        }
+        if self
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.trim().is_empty())
+        {
+            return Err(GitAiError::Generic(
+                "Metric delivery binding branch cannot be empty".to_string(),
+            ));
+        }
+        if self.credential_key_id.len() != 16
+            || !self
+                .credential_key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(GitAiError::Generic(
+                "Metric delivery credential key ID is invalid".to_string(),
+            ));
+        }
+        for (name, raw) in [
+            ("repository_url", self.repository_url.as_str()),
+            ("api_base_url", self.api_base_url.as_str()),
+        ] {
+            let parsed = url::Url::parse(raw).map_err(|_| {
+                GitAiError::Generic(format!("Metric delivery binding {name} is invalid"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                return Err(GitAiError::Generic(format!(
+                    "Metric delivery binding {name} must be an HTTP(S) URL without credentials"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Record returned for local usage aggregation from the metrics table.
@@ -172,6 +270,25 @@ impl MetricsDatabase {
     /// Minimum interval between prune passes (24 hours).
     const METRICS_PRUNE_INTERVAL_SECS: u64 = 24 * 3600;
 
+    fn harden_database_permissions(path: &std::path::Path) -> Result<(), GitAiError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let sidecar = std::path::PathBuf::from(sidecar);
+                if sidecar.exists() {
+                    std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get or initialize the global database
     pub fn global() -> Result<&'static Mutex<MetricsDatabase>, GitAiError> {
         let db_mutex = METRICS_DB.get_or_init(|| match Self::new() {
@@ -198,6 +315,7 @@ impl MetricsDatabase {
 
         // Open with WAL mode and performance optimizations
         let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
+        Self::harden_database_permissions(&db_path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -208,6 +326,7 @@ impl MetricsDatabase {
 
         let mut db = Self { conn };
         db.initialize_schema()?;
+        Self::harden_database_permissions(&db_path)?;
 
         Ok(db)
     }
@@ -219,6 +338,7 @@ impl MetricsDatabase {
 
     fn new_fallback_at_path(path: &std::path::Path) -> Result<Self, GitAiError> {
         let conn = crate::sqlite::open_with_memory_limits(path)?;
+        Self::harden_database_permissions(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -229,6 +349,7 @@ impl MetricsDatabase {
 
         let mut db = Self { conn };
         db.initialize_schema()?;
+        Self::harden_database_permissions(path)?;
         Ok(db)
     }
 
@@ -237,6 +358,7 @@ impl MetricsDatabase {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("metrics.db");
         let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
+        Self::harden_database_permissions(&db_path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -246,6 +368,7 @@ impl MetricsDatabase {
 
         let mut db = Self { conn };
         db.initialize_schema()?;
+        Self::harden_database_permissions(&db_path)?;
 
         Ok((db, temp_dir))
     }
@@ -256,6 +379,7 @@ impl MetricsDatabase {
             std::fs::create_dir_all(parent)?;
         }
         let conn = crate::sqlite::open_with_memory_limits(path)?;
+        Self::harden_database_permissions(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -266,6 +390,7 @@ impl MetricsDatabase {
 
         let mut db = Self { conn };
         db.initialize_schema()?;
+        Self::harden_database_permissions(path)?;
 
         Ok(db)
     }
@@ -371,6 +496,9 @@ impl MetricsDatabase {
         if from_version == 3 {
             self.add_event_metadata_columns()?;
         }
+        if from_version == 5 {
+            self.add_delivery_binding_columns()?;
+        }
 
         let migration_sql = MIGRATIONS[from_version];
         let tx = self.conn.transaction()?;
@@ -464,6 +592,34 @@ impl MetricsDatabase {
         Ok(())
     }
 
+    fn add_delivery_binding_columns(&mut self) -> Result<(), GitAiError> {
+        for (name, sql) in [
+            (
+                "delivery_tenant_id",
+                "ALTER TABLE metrics ADD COLUMN delivery_tenant_id TEXT DEFAULT NULL",
+            ),
+            (
+                "delivery_repository_url",
+                "ALTER TABLE metrics ADD COLUMN delivery_repository_url TEXT DEFAULT NULL",
+            ),
+            (
+                "delivery_branch",
+                "ALTER TABLE metrics ADD COLUMN delivery_branch TEXT DEFAULT NULL",
+            ),
+            (
+                "delivery_api_base_url",
+                "ALTER TABLE metrics ADD COLUMN delivery_api_base_url TEXT DEFAULT NULL",
+            ),
+            (
+                "delivery_credential_key_id",
+                "ALTER TABLE metrics ADD COLUMN delivery_credential_key_id TEXT DEFAULT NULL",
+            ),
+        ] {
+            self.add_column_if_missing("metrics", name, sql)?;
+        }
+        Ok(())
+    }
+
     fn add_column_if_missing(
         &mut self,
         table: &str,
@@ -505,12 +661,110 @@ impl MetricsDatabase {
         events: &[String],
         delivered_ts: Option<u64>,
     ) -> Result<Vec<i64>, GitAiError> {
-        if events.is_empty() {
+        self.insert_events_with_delivery_binding(events, delivered_ts, None)
+    }
+
+    /// Insert pending events with a non-secret delivery binding captured now.
+    pub fn insert_bound_events(
+        &mut self,
+        events: &[String],
+        binding: &MetricDeliveryBinding,
+    ) -> Result<Vec<i64>, GitAiError> {
+        binding.validate()?;
+        self.insert_events_with_delivery_binding(events, None, Some(binding))
+    }
+
+    /// Atomically insert events whose delivery context may differ per row.
+    ///
+    /// Validation finishes before the transaction starts, so one malformed
+    /// binding cannot leave a partially persisted mixed-tenant batch.
+    pub fn insert_events_with_bindings(
+        &mut self,
+        events: &[(String, MetricDeliveryBinding)],
+    ) -> Result<Vec<i64>, GitAiError> {
+        for (_, binding) in events {
+            binding.validate()?;
+        }
+        let rows = events
+            .iter()
+            .map(|(event, binding)| (event.as_str(), Some(binding), None))
+            .collect::<Vec<_>>();
+        self.insert_event_rows(&rows, None)
+    }
+
+    /// Atomically retain policy-rejected evidence in a terminal local state.
+    pub fn insert_policy_rejected_events(
+        &mut self,
+        events: &[(String, String)],
+        rejected_at: u64,
+    ) -> Result<Vec<i64>, GitAiError> {
+        if events.iter().any(|(_, error)| error.trim().is_empty()) {
+            return Err(GitAiError::Generic(
+                "Policy rejection reason is required".to_string(),
+            ));
+        }
+        let rows = events
+            .iter()
+            .map(|(event, error)| (event.as_str(), None, Some((error.as_str(), rejected_at))))
+            .collect::<Vec<_>>();
+        self.insert_event_rows(&rows, None)
+    }
+
+    /// Atomically persist a mixed batch of bound and policy-rejected events.
+    pub(crate) fn insert_classified_events(
+        &mut self,
+        events: &[MetricQueueEntry],
+        queued_at: u64,
+    ) -> Result<Vec<i64>, GitAiError> {
+        for event in events {
+            match &event.disposition {
+                MetricQueueDisposition::Bound(binding) => binding.validate()?,
+                MetricQueueDisposition::PolicyRejected(reason) if reason.trim().is_empty() => {
+                    return Err(GitAiError::Generic(
+                        "Policy rejection reason is required".to_string(),
+                    ));
+                }
+                MetricQueueDisposition::PolicyRejected(_) => {}
+            }
+        }
+        let rows = events
+            .iter()
+            .map(|event| match &event.disposition {
+                MetricQueueDisposition::Bound(binding) => {
+                    (event.event_json.as_str(), Some(binding), None)
+                }
+                MetricQueueDisposition::PolicyRejected(reason) => {
+                    (event.event_json.as_str(), None, Some((*reason, queued_at)))
+                }
+            })
+            .collect::<Vec<_>>();
+        self.insert_event_rows(&rows, None)
+    }
+
+    fn insert_events_with_delivery_binding(
+        &mut self,
+        events: &[String],
+        delivered_ts: Option<u64>,
+        binding: Option<&MetricDeliveryBinding>,
+    ) -> Result<Vec<i64>, GitAiError> {
+        let rows = events
+            .iter()
+            .map(|event| (event.as_str(), binding, None))
+            .collect::<Vec<_>>();
+        self.insert_event_rows(&rows, delivered_ts)
+    }
+
+    fn insert_event_rows(
+        &mut self,
+        rows: &[MetricInsertRow<'_>],
+        delivered_ts: Option<u64>,
+    ) -> Result<Vec<i64>, GitAiError> {
+        if rows.is_empty() {
             return Ok(Vec::new());
         }
 
         let tx = self.conn.transaction()?;
-        let mut ids = Vec::with_capacity(events.len());
+        let mut ids = Vec::with_capacity(rows.len());
 
         {
             let mut stmt = tx.prepare_cached(
@@ -528,17 +782,35 @@ impl MetricsDatabase {
                     external_parent_session_id,
                     external_event_id,
                     external_parent_event_id,
-                    external_tool_use_id
+                    external_tool_use_id,
+                    delivery_tenant_id,
+                    delivery_repository_url,
+                    delivery_branch,
+                    delivery_api_base_url,
+                    delivery_credential_key_id,
+                    attempts,
+                    last_sync_error,
+                    last_sync_at,
+                    next_retry_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                    ?19, ?20, ?21, ?22
+                )
                 "#,
             )?;
 
-            for event_json in events {
+            for (event_json, binding, terminal_error) in rows {
                 let metadata = extract_metric_event_metadata(event_json);
                 let event_ts = metadata.as_ref().map(|m| i64::from(m.event_ts));
                 let event_kind = metadata.as_ref().map(|m| i64::from(m.event_kind));
                 let delivered_ts = delivered_ts.map(|ts| ts as i64);
+                let attempts = terminal_error
+                    .map(|_| MAX_METRIC_UPLOAD_ATTEMPTS as i64)
+                    .unwrap_or(0);
+                let last_sync_error = terminal_error.map(|(error, _)| error);
+                let terminal_at = terminal_error.map(|(_, timestamp)| timestamp as i64);
 
                 stmt.execute(params![
                     event_json,
@@ -566,6 +838,15 @@ impl MetricsDatabase {
                     metadata
                         .as_ref()
                         .and_then(|m| m.external_tool_use_id.as_deref()),
+                    binding.map(|value| value.tenant_id.as_str()),
+                    binding.map(|value| value.repository_url.as_str()),
+                    binding.and_then(|value| value.branch.as_deref()),
+                    binding.map(|value| value.api_base_url.as_str()),
+                    binding.map(|value| value.credential_key_id.as_str()),
+                    attempts,
+                    last_sync_error,
+                    terminal_at,
+                    terminal_at.unwrap_or(0),
                 ])?;
                 ids.push(tx.last_insert_rowid());
             }
@@ -622,15 +903,50 @@ impl MetricsDatabase {
         let mut records = Vec::with_capacity(locked_ids.len());
         {
             let mut stmt = tx.prepare_cached(
-                "SELECT id, event_json, attempts, next_retry_at FROM metrics WHERE id = ?1",
+                "SELECT id, event_json, attempts, next_retry_at, \
+                        delivery_tenant_id, delivery_repository_url, delivery_branch, \
+                        delivery_api_base_url, delivery_credential_key_id \
+                 FROM metrics WHERE id = ?1",
             )?;
             for id in locked_ids {
                 records.push(stmt.query_row(params![id], |row| {
+                    let tenant_id: Option<String> = row.get(4)?;
+                    let repository_url: Option<String> = row.get(5)?;
+                    let branch: Option<String> = row.get(6)?;
+                    let api_base_url: Option<String> = row.get(7)?;
+                    let credential_key_id: Option<String> = row.get(8)?;
+                    let delivery_binding =
+                        match (tenant_id, repository_url, api_base_url, credential_key_id) {
+                            (None, None, None, None) if branch.is_none() => None,
+                            (
+                                Some(tenant_id),
+                                Some(repository_url),
+                                Some(api_base_url),
+                                Some(credential_key_id),
+                            ) => Some(MetricDeliveryBinding {
+                                tenant_id,
+                                repository_url,
+                                branch,
+                                api_base_url,
+                                credential_key_id,
+                            }),
+                            _ => {
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "metric row has a partial delivery binding",
+                                    )),
+                                ));
+                            }
+                        };
                     Ok(MetricRecord {
                         id: row.get(0)?,
                         event_json: row.get(1)?,
                         attempts: row.get::<_, i64>(2)?.max(0) as u32,
                         next_retry_at: row.get::<_, i64>(3)?.max(0) as u64,
+                        delivery_binding,
                     })
                 })?);
             }
@@ -1522,6 +1838,28 @@ mod tests {
         (db, temp_dir)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_metrics_database_enforces_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("metrics.db");
+        let _db = MetricsDatabase::open_at_path(&db_path).unwrap();
+        let wal_path = temp_dir.path().join("metrics.db-wal");
+        let shm_path = temp_dir.path().join("metrics.db-shm");
+        for artifact in [&db_path, &wal_path, &shm_path] {
+            std::fs::set_permissions(artifact, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        MetricsDatabase::harden_database_permissions(&db_path).unwrap();
+
+        for artifact in [&db_path, &wal_path, &shm_path] {
+            let mode = std::fs::metadata(artifact).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} was not owner-only", artifact.display());
+        }
+    }
+
     fn unix_now() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1672,7 +2010,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
 
         for column in [
             "delivered_ts",
@@ -1692,6 +2030,11 @@ mod tests {
             "external_event_id",
             "external_parent_event_id",
             "external_tool_use_id",
+            "delivery_tenant_id",
+            "delivery_repository_url",
+            "delivery_branch",
+            "delivery_api_base_url",
+            "delivery_credential_key_id",
         ] {
             let column_count: i64 = db
                 .conn
@@ -1709,6 +2052,7 @@ mod tests {
             "metrics_event_ts_kind",
             "metrics_session_kind_ts",
             "metrics_parent_session_kind_ts",
+            "metrics_pending_delivery_binding",
         ] {
             assert_metric_index_exists(&db, index);
         }
@@ -1768,7 +2112,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
     }
 
     #[test]
@@ -1807,7 +2151,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.count_retryable().unwrap(), 1);
     }
@@ -1850,7 +2194,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
 
         for column in [
             "delivered_ts",
@@ -1919,7 +2263,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         assert!(db.column_exists("metrics", "event_ts").unwrap());
         assert!(db.column_exists("metrics", "event_kind").unwrap());
         for index in [
@@ -1978,7 +2322,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         assert_metric_index_exists(&db, "metrics_retryable");
         assert_metric_index_missing(&db, "metrics_pending_retry");
         assert_eq!(db.count().unwrap(), 1);
@@ -2006,6 +2350,167 @@ mod tests {
             metric_metadata_rows(&db),
             vec![(Some(ts1 as i64), Some(1)), (Some(ts2 as i64), Some(1))]
         );
+    }
+
+    #[test]
+    fn test_bound_event_round_trips_immutable_delivery_context() {
+        let (mut db, _temp_dir) = create_test_db();
+        let binding = MetricDeliveryBinding {
+            tenant_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            repository_url: "https://github.com/example/company-a".to_string(),
+            branch: Some("feature/task4".to_string()),
+            api_base_url: "https://trackai.example.test".to_string(),
+            credential_key_id: "company-a-key-id".to_string(),
+        };
+
+        db.insert_bound_events(&[event_json(days_ago(1))], &binding)
+            .unwrap();
+
+        let batch = db.dequeue_pending_batch(1).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].delivery_binding.as_ref(), Some(&binding));
+    }
+
+    #[test]
+    fn test_mixed_tenant_events_keep_distinct_delivery_bindings() {
+        let (mut db, _temp_dir) = create_test_db();
+        let company_a = MetricDeliveryBinding {
+            tenant_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            repository_url: "https://github.com/example/company-a".to_string(),
+            branch: Some("main".to_string()),
+            api_base_url: "https://trackai.example.test".to_string(),
+            credential_key_id: "company-a-key-id".to_string(),
+        };
+        let company_b = MetricDeliveryBinding {
+            tenant_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            repository_url: "https://github.com/example/company-b".to_string(),
+            branch: Some("release".to_string()),
+            api_base_url: "https://trackai.example.test".to_string(),
+            credential_key_id: "company-b-key-id".to_string(),
+        };
+        let company_a_event = event_json(days_ago(2));
+        let company_b_event = event_json(days_ago(1));
+
+        db.insert_events_with_bindings(&[
+            (company_a_event.clone(), company_a.clone()),
+            (company_b_event.clone(), company_b.clone()),
+        ])
+        .unwrap();
+
+        let batch = db.dequeue_pending_batch(2).unwrap();
+        assert_eq!(batch.len(), 2);
+        let by_event = batch
+            .into_iter()
+            .map(|record| (record.event_json, record.delivery_binding.unwrap()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(by_event.get(&company_a_event), Some(&company_a));
+        assert_eq!(by_event.get(&company_b_event), Some(&company_b));
+    }
+
+    #[test]
+    fn test_policy_rejected_event_is_atomically_retained_without_retry() {
+        let (mut db, _temp_dir) = create_test_db();
+        let event = event_json(days_ago(1));
+
+        let ids = db
+            .insert_policy_rejected_events(
+                &[(event.clone(), "repository is not enrolled".to_string())],
+                unix_now(),
+            )
+            .unwrap();
+
+        assert_eq!(ids.len(), 1);
+        assert_eq!(db.count_retryable().unwrap(), 0);
+        assert!(db.dequeue_pending_batch(1).unwrap().is_empty());
+        let status = db.status().unwrap();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.stopped_after_errors, 1);
+        assert_eq!(status.rows_with_errors, 1);
+        let row: (String, i64, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT event_json, attempts, last_sync_error, delivery_tenant_id \
+                 FROM metrics WHERE id = ?1",
+                params![ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, event);
+        assert_eq!(row.1, MAX_METRIC_UPLOAD_ATTEMPTS as i64);
+        assert_eq!(row.2.as_deref(), Some("repository is not enrolled"));
+        assert_eq!(row.3, None);
+    }
+
+    #[test]
+    fn test_delivery_binding_schema_contains_no_plaintext_credential_column() {
+        let (db, _temp_dir) = create_test_db();
+        let mut stmt = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('metrics')")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for forbidden in ["api_key", "credential", "secret", "token"] {
+            assert!(
+                columns
+                    .iter()
+                    .all(|column| !column.contains(forbidden)
+                        || column == "delivery_credential_key_id"),
+                "plaintext credential-shaped column found for {forbidden}: {columns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_migrates_version_5_rows_without_inventing_delivery_binding() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("v5-delivery-binding.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            INSERT INTO schema_metadata (key, value) VALUES ('version', '0');
+            "#,
+        )
+        .unwrap();
+        let mut db = MetricsDatabase { conn };
+        for version in 0..5 {
+            db.apply_migration(version).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE schema_metadata SET value = ?1 WHERE key = 'version'",
+                    params![(version + 1).to_string()],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json) VALUES (?1)",
+                params![event_json(days_ago(1))],
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "6");
+        let batch = db.dequeue_pending_batch(1).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].delivery_binding, None);
     }
 
     #[test]

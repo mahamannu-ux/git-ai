@@ -312,6 +312,8 @@ static TEST_FEATURE_FLAGS_OVERRIDE: RwLock<Option<FeatureFlags>> = RwLock::new(N
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_prompts_in_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_oss_disabled: Option<bool>,
@@ -1649,6 +1651,21 @@ fn apply_test_config_patch(config: &mut Config) {
     if let Ok(patch_json) = env::var("GIT_AI_TEST_CONFIG_PATCH")
         && let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json)
     {
+        if let Some(patterns) = patch.allow_repositories {
+            config.allow_repositories = patterns
+                .into_iter()
+                .filter_map(|pattern_str| {
+                    Pattern::new(&pattern_str)
+                        .map_err(|e| {
+                            eprintln!(
+                                "Warning: Invalid test pattern in allow_repositories '{}': {}",
+                                pattern_str, e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+        }
         if let Some(patterns) = patch.exclude_prompts_in_repositories {
             config.exclude_prompts_in_repositories = patterns
                     .into_iter()
