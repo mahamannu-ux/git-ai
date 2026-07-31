@@ -1,0 +1,23 @@
+src/api/metrics.rs
+  s_def3a9c90a44ac::t_2c6db4aee98b54 95-111,157-160,190-197,216-217,219,226-227,229-232,286-301
+src/commands/flush_metrics_db.rs
+  s_def3a9c90a44ac::t_3f4123bce5d454 5-8,74-75,77-80,141,143-150,154-163,172
+src/commands/metrics_backfill.rs
+  s_def3a9c90a44ac::t_78fa8c123c451f 1-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "a5eb5b8ee267f2b4eef94764b6053007403ab29f",
+  "prompts": {},
+  "sessions": {
+    "s_def3a9c90a44ac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fb2d1-9774-7400-98d3-3c092a3f60bb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu <mahamannu@gmail.com>"
+    }
+  }
+}
