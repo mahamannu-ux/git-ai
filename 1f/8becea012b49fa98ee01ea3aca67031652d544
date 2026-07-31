@@ -1,0 +1,21 @@
+src/daemon/telemetry_worker.rs
+  s_def3a9c90a44ac::t_f4396d1d938069 7,17-21,679-680,693,698-726,732-772,775-777,779-851,853-857,859-917,936-955,1014,1025,1033,1062,1735-1753,1809-2133,2222,2286,2352,2426,2499,2551,2594,2634
+src/metrics/delivery.rs
+  s_def3a9c90a44ac::t_a3684591fbe4c5 1-696
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "1f8becea012b49fa98ee01ea3aca67031652d544",
+  "prompts": {},
+  "sessions": {
+    "s_def3a9c90a44ac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fb2d1-9774-7400-98d3-3c092a3f60bb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu <mahamannu@gmail.com>"
+    }
+  }
+}
