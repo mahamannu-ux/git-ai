@@ -35,6 +35,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 const DAEMON_LOG_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_DAEMON_LOG_EVENTS_PER_UPLOAD: usize = 1000;
 const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
+// Tenant-bound uploads perform server-side credential, repository, branch, and
+// idempotency checks for every event. Keep these envelopes small enough to
+// complete within the HTTP response window while preserving ordered retries.
+const MAX_BOUND_METRICS_PER_ENVELOPE: usize = 10;
 
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
@@ -957,7 +961,7 @@ fn flush_pending_bound_metrics_from_db(
             })
         },
         deadline,
-        MAX_METRICS_PER_ENVELOPE,
+        MAX_BOUND_METRICS_PER_ENVELOPE,
     )
 }
 
@@ -2261,6 +2265,61 @@ mod tests {
             db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn bound_metric_flush_splits_large_retry_queue_into_response_safe_batches() {
+        let (metrics_db, _metrics_db_dir) = MetricsDatabase::new_temp_for_tests().unwrap();
+        let db = Rc::new(RefCell::new(metrics_db));
+        let base_ts = now_ts().saturating_sub(MAX_BOUND_METRICS_PER_ENVELOPE as u32 + 1);
+        let events = (0..=MAX_BOUND_METRICS_PER_ENVELOPE)
+            .map(|offset| event_json(base_ts + offset as u32))
+            .collect::<Vec<_>>();
+        db.borrow_mut().insert_events(&events).unwrap();
+
+        let uploaded_batch_sizes = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let result = flush_pending_metric_records_with(
+            {
+                let db = Rc::clone(&db);
+                move |limit| db.borrow_mut().dequeue_pending_batch(limit)
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids| db.borrow_mut().mark_records_delivered(ids, unix_now())
+            },
+            {
+                let db = Rc::clone(&db);
+                move |ids, err| {
+                    db.borrow_mut()
+                        .mark_records_failed(ids, &err.to_string(), unix_now())
+                }
+            },
+            {
+                let db = Rc::clone(&db);
+                move |records| {
+                    db.borrow_mut()
+                        .mark_records_undeliverable(records, unix_now())
+                }
+            },
+            {
+                let uploaded_batch_sizes = Rc::clone(&uploaded_batch_sizes);
+                move |_records, batch| {
+                    uploaded_batch_sizes.borrow_mut().push(batch.events.len());
+                    Ok(MetricsUploadResponse { errors: vec![] })
+                }
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            MAX_BOUND_METRICS_PER_ENVELOPE,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *uploaded_batch_sizes.borrow(),
+            vec![MAX_BOUND_METRICS_PER_ENVELOPE, 1]
+        );
+        assert_eq!(result.uploaded_events, MAX_BOUND_METRICS_PER_ENVELOPE + 1);
+        assert_eq!(result.uploaded_batches, 2);
+        assert_eq!(db.borrow().count().unwrap(), 0);
     }
 
     #[test]
