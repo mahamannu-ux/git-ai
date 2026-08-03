@@ -70,6 +70,27 @@ pub struct MetricsUploadResponse {
     pub errors: Vec<MetricsUploadError>,
 }
 
+/// Counts-only local queue snapshot. Tenant and machine identity are never
+/// included because the server derives them from the machine credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientDeliveryHealthReport {
+    pub version: u8,
+    pub observed_at: String,
+    pub pending_retryable: usize,
+    pub waiting_retry: usize,
+    pub processing: usize,
+    pub quarantined: usize,
+    pub rows_with_errors: usize,
+    pub oldest_pending_at: Option<String>,
+    pub last_delivered_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientDeliveryHealthResponse {
+    accepted: bool,
+}
+
 impl MetricsUploadResponse {
     /// Validate that all failed-event indices refer to events in this batch.
     pub fn validate_error_indices(&self, batch_size: usize) -> Result<(), GitAiError> {
@@ -174,6 +195,29 @@ pub fn upload_metrics_with_retry(
 
 /// Metrics API endpoints
 impl ApiClient {
+    pub fn upload_client_delivery_health(
+        &self,
+        report: &ClientDeliveryHealthReport,
+    ) -> Result<bool, GitAiError> {
+        let response = self
+            .context()
+            .post_json("/worker/delivery-health", report)?;
+        if response.status_code != 202 {
+            return Err(GitAiError::Generic(format!(
+                "client delivery health upload returned HTTP {}",
+                response.status_code
+            )));
+        }
+        let body = response.as_str().map_err(|error| {
+            GitAiError::Generic(format!(
+                "failed to read client delivery health response: {error}"
+            ))
+        })?;
+        serde_json::from_str::<ClientDeliveryHealthResponse>(body)
+            .map(|parsed| parsed.accepted)
+            .map_err(GitAiError::JsonError)
+    }
+
     /// Upload metrics batch to the server (max 1000 events)
     ///
     /// # Arguments

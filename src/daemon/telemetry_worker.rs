@@ -5,7 +5,7 @@
 
 use crate::api::logs::daemon_logs_upload_allowed;
 use crate::api::metrics::{
-    MetricsUploadError, MetricsUploadResponse, metrics_upload_allowed,
+    ClientDeliveryHealthReport, MetricsUploadError, MetricsUploadResponse, metrics_upload_allowed,
     metrics_upload_error_is_retryable,
 };
 use crate::api::types::{
@@ -18,8 +18,8 @@ use crate::config::{Config, get_or_create_distinct_id};
 use crate::daemon::control_api::{CasSyncPayload, TelemetryEnvelope};
 use crate::error::GitAiError;
 use crate::metrics::db::{
-    METADATA_BACKFILL_BATCH_SIZE, MetricDeliveryBinding, MetricQueueDisposition, MetricQueueEntry,
-    MetricRecord, MetricsDatabase,
+    METADATA_BACKFILL_BATCH_SIZE, MetricDeliveryBinding, MetricDeliveryHealth,
+    MetricQueueDisposition, MetricQueueEntry, MetricRecord, MetricsDatabase,
 };
 use crate::metrics::delivery::{MetricDeliveryRuntime, MetricDeliveryRuntimeError};
 use crate::metrics::{MetricEvent, MetricsBatch};
@@ -27,7 +27,7 @@ use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep_until};
 
@@ -39,9 +39,11 @@ const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
 // idempotency checks for every event. Keep these envelopes small enough to
 // complete within the HTTP response window while preserving ordered retries.
 const MAX_BOUND_METRICS_PER_ENVELOPE: usize = 10;
+const CLIENT_DELIVERY_HEALTH_REPORT_INTERVAL_SECS: u64 = 60;
 
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
+static LAST_CLIENT_DELIVERY_HEALTH_REPORT_AT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_LOG_UPLOAD_IN_FLIGHT: std::sync::OnceLock<Arc<AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -708,7 +710,13 @@ fn flush_pending_metrics_for_current_config(
     match MetricDeliveryRuntime::load_optional_default() {
         Ok(Some(runtime)) => {
             METRICS_UPLOAD_AVAILABLE.store(true, Ordering::Relaxed);
-            flush_pending_bound_metrics_from_db(&runtime, deadline)
+            let result = flush_pending_bound_metrics_from_db(&runtime, deadline);
+            if client_delivery_health_report_is_due(current_unix_ts())
+                && let Err(error) = report_bound_client_delivery_health(&runtime)
+            {
+                tracing::warn!(%error, "telemetry: failed to report counts-only delivery health");
+            }
+            result
         }
         Ok(None) => {
             let context = ApiContext::new(None);
@@ -729,6 +737,74 @@ fn flush_pending_metrics_for_current_config(
             )))
         }
     }
+}
+
+fn client_delivery_health_report_is_due(now: u64) -> bool {
+    let previous = LAST_CLIENT_DELIVERY_HEALTH_REPORT_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < CLIENT_DELIVERY_HEALTH_REPORT_INTERVAL_SECS {
+        return false;
+    }
+    LAST_CLIENT_DELIVERY_HEALTH_REPORT_AT
+        .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn iso_timestamp(seconds: u64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(seconds as i64, 0)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+fn build_client_delivery_health_report(
+    health: MetricDeliveryHealth,
+    observed_at: u64,
+) -> Result<ClientDeliveryHealthReport, GitAiError> {
+    Ok(ClientDeliveryHealthReport {
+        version: 1,
+        observed_at: iso_timestamp(observed_at).ok_or_else(|| {
+            GitAiError::Generic("client delivery health observation time is invalid".to_string())
+        })?,
+        pending_retryable: health.pending_retryable,
+        waiting_retry: health.waiting_retry,
+        processing: health.processing,
+        quarantined: health.quarantined,
+        rows_with_errors: health.rows_with_errors,
+        oldest_pending_at: health.oldest_pending_at.and_then(iso_timestamp),
+        last_delivered_at: health.last_delivered_at.and_then(iso_timestamp),
+    })
+}
+
+fn report_bound_client_delivery_health(runtime: &MetricDeliveryRuntime) -> Result<(), GitAiError> {
+    let observed_at = current_unix_ts();
+    let db = MetricsDatabase::global()?;
+    let reports = {
+        let db_lock = db
+            .lock()
+            .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
+        runtime
+            .health_bindings()
+            .into_iter()
+            .map(|binding| {
+                let credential = runtime
+                    .credential_for_health_binding(&binding)
+                    .map_err(|error| GitAiError::Generic(error.to_string()))?
+                    .to_string();
+                let health = db_lock.delivery_health(&binding.tenant_id, &binding.api_base_url)?;
+                let report = build_client_delivery_health_report(health, observed_at)?;
+                let context = ApiContext {
+                    base_url: binding.api_base_url,
+                    auth_token: None,
+                    api_key: Some(credential),
+                    author_identity: None,
+                    timeout_secs: Some(5),
+                };
+                Ok((context, report))
+            })
+            .collect::<Result<Vec<_>, GitAiError>>()?
+    };
+    for (context, report) in reports {
+        ApiClient::new(context).upload_client_delivery_health(&report)?;
+    }
+    Ok(())
 }
 
 fn store_metrics_in_db(events: &[MetricEvent]) -> Result<Vec<i64>, GitAiError> {
@@ -1747,6 +1823,32 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn client_delivery_health_report_contains_counts_and_timestamps_only() {
+        let report = build_client_delivery_health_report(
+            MetricDeliveryHealth {
+                pending_retryable: 1,
+                waiting_retry: 2,
+                processing: 3,
+                quarantined: 4,
+                rows_with_errors: 5,
+                oldest_pending_at: Some(1_700_000_000),
+                last_delivered_at: Some(1_700_000_100),
+            },
+            1_700_000_200,
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(serialized["version"], 1);
+        assert_eq!(serialized["pendingRetryable"], 1);
+        assert_eq!(serialized["quarantined"], 4);
+        assert!(serialized.get("tenantId").is_none());
+        assert!(serialized.get("machineId").is_none());
+        assert!(serialized.get("credential").is_none());
+        assert!(serialized.get("rawEvent").is_none());
+        assert!(serialized.get("reason").is_none());
+    }
 
     fn event_json(ts: u32) -> String {
         format!(r#"{{"t":{ts},"e":1,"v":{{}},"a":{{}}}}"#)

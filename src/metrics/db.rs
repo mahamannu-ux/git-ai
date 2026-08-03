@@ -298,6 +298,20 @@ pub struct MetricsStatus {
     pub latest_error: Option<String>,
 }
 
+/// Counts-only queue state for one tenant/API delivery scope. Credential-key
+/// rotation rows are intentionally combined; no event or error content leaves
+/// the local database through this contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricDeliveryHealth {
+    pub pending_retryable: usize,
+    pub waiting_retry: usize,
+    pub processing: usize,
+    pub quarantined: usize,
+    pub rows_with_errors: usize,
+    pub oldest_pending_at: Option<u64>,
+    pub last_delivered_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricEvidenceFamily {
     GenerationSession,
@@ -1464,6 +1478,81 @@ impl MetricsDatabase {
             stopped_after_errors: stopped_after_errors as usize,
             rows_with_errors: rows_with_errors as usize,
             latest_error,
+        })
+    }
+
+    /// Summarize a tenant/API delivery scope without returning raw rows.
+    pub fn delivery_health(
+        &self,
+        tenant_id: &str,
+        api_base_url: &str,
+    ) -> Result<MetricDeliveryHealth, GitAiError> {
+        if tenant_id.trim().is_empty() || api_base_url.trim().is_empty() {
+            return Err(GitAiError::Generic(
+                "delivery health scope is required".to_string(),
+            ));
+        }
+        let now = current_unix_ts();
+        let (
+            pending_retryable,
+            waiting_retry,
+            processing,
+            quarantined,
+            rows_with_errors,
+            oldest_pending_at,
+            last_delivered_at,
+        ): (i64, i64, i64, i64, i64, Option<i64>, Option<i64>) = self.conn.query_row(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE
+                    WHEN delivered_ts IS NULL AND quarantined_at IS NULL
+                     AND processing_started_at IS NULL AND next_retry_at <= ?1
+                     AND attempts < ?2 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE
+                    WHEN delivered_ts IS NULL AND quarantined_at IS NULL
+                     AND processing_started_at IS NULL AND next_retry_at > ?1
+                     AND attempts < ?2 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE
+                    WHEN delivered_ts IS NULL AND quarantined_at IS NULL
+                     AND processing_started_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE
+                    WHEN delivered_ts IS NULL AND quarantined_at IS NOT NULL
+                    THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE
+                    WHEN delivered_ts IS NULL AND last_sync_error IS NOT NULL
+                     AND last_sync_error != '' THEN 1 ELSE 0 END), 0),
+                MIN(CASE WHEN delivered_ts IS NULL AND json_valid(event_json)
+                    THEN CAST(json_extract(event_json, '$.t') AS INTEGER) ELSE NULL END),
+                MAX(delivered_ts)
+            FROM metrics
+            WHERE delivery_tenant_id = ?3 AND delivery_api_base_url = ?4
+            "#,
+            params![
+                now as i64,
+                MAX_METRIC_UPLOAD_ATTEMPTS as i64,
+                tenant_id,
+                api_base_url,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        Ok(MetricDeliveryHealth {
+            pending_retryable: pending_retryable.max(0) as usize,
+            waiting_retry: waiting_retry.max(0) as usize,
+            processing: processing.max(0) as usize,
+            quarantined: quarantined.max(0) as usize,
+            rows_with_errors: rows_with_errors.max(0) as usize,
+            oldest_pending_at: oldest_pending_at.map(|value| value.max(0) as u64),
+            last_delivered_at: last_delivered_at.map(|value| value.max(0) as u64),
         })
     }
 
@@ -3653,6 +3742,79 @@ mod tests {
         assert_eq!(status.stopped_after_errors, 1);
         assert_eq!(status.rows_with_errors, 2);
         assert_eq!(status.latest_error.as_deref(), Some("validation failed"));
+    }
+
+    #[test]
+    fn test_delivery_health_combines_rotation_keys_and_isolates_tenants() {
+        let (mut db, _temp_dir) = create_test_db();
+        let now = unix_now();
+        let binding = |tenant: &str, key_id: &str| MetricDeliveryBinding {
+            tenant_id: tenant.to_string(),
+            repository_url: format!("https://github.com/example/{tenant}"),
+            branch: Some("main".to_string()),
+            api_base_url: "https://trackai.example.test".to_string(),
+            credential_key_id: key_id.to_string(),
+        };
+        let company_a_old = binding("11111111-1111-4111-8111-111111111111", "company-a-key-id");
+        let company_a_new = binding("11111111-1111-4111-8111-111111111111", "company-n-key-id");
+        let company_b = binding("22222222-2222-4222-8222-222222222222", "company-b-key-id");
+        let ids = db
+            .insert_events_with_bindings(&[
+                (event_json(days_ago(5)), company_a_old.clone()),
+                (event_json(days_ago(4)), company_a_old),
+                (event_json(days_ago(3)), company_a_new.clone()),
+                (event_json(days_ago(2)), company_a_new.clone()),
+                (event_json(days_ago(1)), company_a_new),
+                (event_json(days_ago(1)), company_b),
+            ])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE metrics SET attempts = 1, last_sync_error = 'temporary', \
+             next_retry_at = ?1 WHERE id = ?2",
+                params![now.saturating_add(600) as i64, ids[1]],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE metrics SET processing_started_at = ?1 WHERE id = ?2",
+                params![now as i64, ids[2]],
+            )
+            .unwrap();
+        db.mark_records_quarantined(
+            &[(
+                ids[3],
+                "server_rejected_event".to_string(),
+                "safe".to_string(),
+            )],
+            now,
+        )
+        .unwrap();
+        db.mark_records_delivered(&[ids[4]], now).unwrap();
+
+        let company_a = db
+            .delivery_health(
+                "11111111-1111-4111-8111-111111111111",
+                "https://trackai.example.test",
+            )
+            .unwrap();
+        assert_eq!(company_a.pending_retryable, 1);
+        assert_eq!(company_a.waiting_retry, 1);
+        assert_eq!(company_a.processing, 1);
+        assert_eq!(company_a.quarantined, 1);
+        assert_eq!(company_a.rows_with_errors, 2);
+        assert_eq!(company_a.oldest_pending_at, Some(days_ago(5) as u64));
+        assert_eq!(company_a.last_delivered_at, Some(now));
+
+        let company_b = db
+            .delivery_health(
+                "22222222-2222-4222-8222-222222222222",
+                "https://trackai.example.test",
+            )
+            .unwrap();
+        assert_eq!(company_b.pending_retryable, 1);
+        assert_eq!(company_b.waiting_retry, 0);
+        assert_eq!(company_b.quarantined, 0);
     }
 
     #[test]

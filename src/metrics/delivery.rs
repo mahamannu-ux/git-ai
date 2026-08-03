@@ -5,6 +5,7 @@ use crate::metrics::db::MetricDeliveryBinding;
 use crate::metrics::pos_encoded::sparse_get_string;
 use crate::metrics::types::MetricEvent;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 pub const TRACKAI_DELIVERY_POLICY_FILE: &str = "trackai-delivery-policy.json";
@@ -233,6 +234,13 @@ pub struct DeliveryPolicyCache {
     repositories: HashMap<String, DeliveryPolicyEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricDeliveryHealthBinding {
+    pub tenant_id: String,
+    pub api_base_url: String,
+    pub credential_key_id: String,
+}
+
 impl DeliveryPolicyCache {
     pub fn from_json(raw: &str) -> Result<Self, DeliveryPolicyError> {
         let document: DeliveryPolicyDocument = serde_json::from_str(raw)
@@ -299,6 +307,25 @@ impl DeliveryPolicyCache {
             .validate()
             .map_err(|error| DeliveryPolicyError::InvalidBinding(error.to_string()))?;
         Ok(binding)
+    }
+
+    fn health_bindings(&self) -> Vec<MetricDeliveryHealthBinding> {
+        let mut bindings = BTreeMap::new();
+        for entry in self.repositories.values() {
+            let key = (
+                entry.tenant_id.clone(),
+                entry.api_base_url.clone(),
+                entry.credential_key_id.clone(),
+            );
+            bindings
+                .entry(key.clone())
+                .or_insert(MetricDeliveryHealthBinding {
+                    tenant_id: key.0,
+                    api_base_url: key.1,
+                    credential_key_id: key.2,
+                });
+        }
+        bindings.into_values().collect()
     }
 }
 
@@ -389,6 +416,21 @@ impl MetricDeliveryRuntime {
         binding
             .validate()
             .map_err(|_| MetricDeliveryRuntimeError::InvalidBinding)?;
+        self.keyring
+            .resolve(&binding.credential_key_id)
+            .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
+                key_id: binding.credential_key_id.clone(),
+            })
+    }
+
+    pub fn health_bindings(&self) -> Vec<MetricDeliveryHealthBinding> {
+        self.policy.health_bindings()
+    }
+
+    pub fn credential_for_health_binding<'a>(
+        &'a self,
+        binding: &MetricDeliveryHealthBinding,
+    ) -> Result<&'a str, MetricDeliveryRuntimeError> {
         self.keyring
             .resolve(&binding.credential_key_id)
             .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
@@ -498,6 +540,35 @@ mod tests {
         assert_eq!(company_a.credential_key_id, "company-a-key-id");
         assert_eq!(company_b.tenant_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(company_b.credential_key_id, "company-b-key-id");
+    }
+
+    #[test]
+    fn test_delivery_health_bindings_are_deduplicated_without_crossing_tenants() {
+        let expanded = policy_json().replace(
+            r#"{
+                    "repository_url": "https://github.com/example/company-b","#,
+            r#"{
+                    "repository_url": "https://github.com/example/company-a-two",
+                    "tenant_id": "11111111-1111-4111-8111-111111111111",
+                    "api_base_url": "https://trackai.example.test",
+                    "credential_key_id": "company-a-key-id"
+                },
+                {
+                    "repository_url": "https://github.com/example/company-b","#,
+        );
+        let policy = DeliveryPolicyCache::from_json(&expanded).unwrap();
+        let bindings = policy.health_bindings();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(
+            bindings[0].tenant_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(bindings[0].credential_key_id, "company-a-key-id");
+        assert_eq!(
+            bindings[1].tenant_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(bindings[1].credential_key_id, "company-b-key-id");
     }
 
     #[test]
