@@ -224,6 +224,7 @@ struct DeliveryPolicyDocument {
 #[serde(deny_unknown_fields)]
 struct DeliveryPolicyEntry {
     repository_url: String,
+    repository_id: Option<String>,
     tenant_id: String,
     api_base_url: String,
     credential_key_id: String,
@@ -237,6 +238,15 @@ pub struct DeliveryPolicyCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricDeliveryHealthBinding {
     pub tenant_id: String,
+    pub api_base_url: String,
+    pub credential_key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceDeliveryBinding {
+    pub repository_id: String,
+    pub tenant_id: String,
+    pub repository_url: String,
     pub api_base_url: String,
     pub credential_key_id: String,
 }
@@ -258,6 +268,15 @@ impl DeliveryPolicyCache {
             entry.api_base_url = normalize_api_base_url(&entry.api_base_url)?;
             if !valid_uuid(&entry.tenant_id) {
                 return Err(DeliveryPolicyError::InvalidTenantId(entry.tenant_id));
+            }
+            if entry
+                .repository_id
+                .as_ref()
+                .is_some_and(|value| !valid_uuid(value))
+            {
+                return Err(DeliveryPolicyError::InvalidBinding(
+                    "repository ID must be a UUID".to_string(),
+                ));
             }
 
             MetricDeliveryBinding {
@@ -326,6 +345,34 @@ impl DeliveryPolicyCache {
                 });
         }
         bindings.into_values().collect()
+    }
+
+    pub fn resolve_evidence_repository(
+        &self,
+        raw_repository: &str,
+    ) -> Result<EvidenceDeliveryBinding, DeliveryPolicyError> {
+        let repository_url = crate::repo_url::normalize_repo_url(raw_repository).map_err(|_| {
+            DeliveryPolicyError::InvalidRepository {
+                repository_url: raw_repository.to_string(),
+            }
+        })?;
+        let entry = self.repositories.get(&repository_url).ok_or_else(|| {
+            DeliveryPolicyError::RepositoryNotEnrolled {
+                repository_url: repository_url.clone(),
+            }
+        })?;
+        let repository_id = entry.repository_id.clone().ok_or_else(|| {
+            DeliveryPolicyError::InvalidBinding(
+                "repository ID is required for evidence collection".to_string(),
+            )
+        })?;
+        Ok(EvidenceDeliveryBinding {
+            repository_id,
+            tenant_id: entry.tenant_id.clone(),
+            repository_url,
+            api_base_url: entry.api_base_url.clone(),
+            credential_key_id: entry.credential_key_id.clone(),
+        })
     }
 }
 
@@ -427,6 +474,26 @@ impl MetricDeliveryRuntime {
         self.policy.health_bindings()
     }
 
+    pub fn bind_evidence_repository(
+        &self,
+        repository_url: &str,
+    ) -> Result<EvidenceDeliveryBinding, MetricDeliveryRuntimeError> {
+        self.policy
+            .resolve_evidence_repository(repository_url)
+            .map_err(Into::into)
+    }
+
+    pub fn credential_for_evidence_binding<'a>(
+        &'a self,
+        binding: &EvidenceDeliveryBinding,
+    ) -> Result<&'a str, MetricDeliveryRuntimeError> {
+        self.keyring
+            .resolve(&binding.credential_key_id)
+            .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
+                key_id: binding.credential_key_id.clone(),
+            })
+    }
+
     pub fn credential_for_health_binding<'a>(
         &'a self,
         binding: &MetricDeliveryHealthBinding,
@@ -499,12 +566,14 @@ mod tests {
             "repositories": [
                 {
                     "repository_url": "git@github.com:example/company-a.git",
+                    "repository_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                     "tenant_id": "11111111-1111-4111-8111-111111111111",
                     "api_base_url": "https://trackai.example.test/",
                     "credential_key_id": "company-a-key-id"
                 },
                 {
                     "repository_url": "https://github.com/example/company-b",
+                    "repository_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                     "tenant_id": "22222222-2222-4222-8222-222222222222",
                     "api_base_url": "https://trackai.example.test",
                     "credential_key_id": "company-b-key-id"
@@ -540,6 +609,32 @@ mod tests {
         assert_eq!(company_a.credential_key_id, "company-a-key-id");
         assert_eq!(company_b.tenant_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(company_b.credential_key_id, "company-b-key-id");
+    }
+
+    #[test]
+    fn test_evidence_binding_requires_and_returns_server_repository_id() {
+        let policy = DeliveryPolicyCache::from_json(policy_json()).unwrap();
+        let binding = policy
+            .resolve_evidence_repository("git@github.com:example/company-a.git")
+            .unwrap();
+        assert_eq!(
+            binding.repository_id,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            binding.repository_url,
+            "https://github.com/example/company-a"
+        );
+
+        let without_id = policy_json().replace(
+            "\"repository_id\": \"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",",
+            "",
+        );
+        let policy = DeliveryPolicyCache::from_json(&without_id).unwrap();
+        assert!(matches!(
+            policy.resolve_evidence_repository("https://github.com/example/company-a"),
+            Err(DeliveryPolicyError::InvalidBinding(_))
+        ));
     }
 
     #[test]

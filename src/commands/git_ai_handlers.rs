@@ -53,6 +53,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "install"
             | "uninstall-hooks"
             | "usage"
+            | "evidence"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -192,6 +193,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "metrics-backfill" => {
             commands::metrics_backfill::handle_metrics_backfill(&args[1..]);
+        }
+        "evidence" => {
+            commands::evidence::handle_evidence(&args[1..]);
         }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
@@ -348,6 +352,8 @@ fn print_help() {
     eprintln!("  usage              Show local AI usage statistics");
     eprintln!("    --period <1d|3d|7d|30d>  Time window (default: 30d)");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!("  evidence           Consent-gated OpenCode evidence upload");
+    eprintln!("    sync-opencode --database <path> --session <id> --repository-url <url>");
     eprintln!("  analyze [beta]      Analyze agent sessions and effectiveness");
     eprintln!("  status             Show uncommitted AI authorship status (debug)");
     eprintln!("    --json                 Output in JSON format");
