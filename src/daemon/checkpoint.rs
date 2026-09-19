@@ -5,7 +5,7 @@ use crate::authorship::authorship_log_serialization::generate_model_session_id;
 #[cfg(not(any(test, feature = "test-support")))]
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::imara_diff_utils::{
-    LineChangeTag, compute_line_changes, normalize_line_endings,
+    LineChangeTag, compute_line_changes, content_eq_ignoring_line_endings,
 };
 use crate::authorship::working_log::CheckpointKind;
 use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
@@ -51,7 +51,7 @@ const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
 const KNOWN_HUMAN_MIN_SECS_AFTER_AI: u64 = 1;
 
 #[cfg(not(any(test, feature = "test-support")))]
-pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(agent_id: &AgentId) -> bool {
     let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -71,8 +71,19 @@ pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(_agent_id: &AgentId) -> bool {
     false
+}
+
+fn should_emit_agent_usage_with_throttle(
+    agent_id: &AgentId,
+    should_emit_real_agent_usage: impl FnOnce(&AgentId) -> bool,
+) -> bool {
+    agent_id.tool != "mock_ai" && should_emit_real_agent_usage(agent_id)
+}
+
+pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+    should_emit_agent_usage_with_throttle(agent_id, should_emit_real_agent_usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,14 +543,6 @@ fn get_previous_content_from_head(
     }
 }
 
-/// Compare file contents ignoring CRLF/LF differences.
-fn content_eq_normalized(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    normalize_line_endings(a) == normalize_line_endings(b)
-}
-
 #[doc(hidden)]
 pub fn is_ai_author_id(author_id: &str) -> bool {
     author_id != "human" && !author_id.starts_with("h_")
@@ -629,7 +632,7 @@ fn get_checkpoint_entry_for_file(
             get_previous_content_from_head(&repo, &file_path, head_tree_id.as_ref())
         };
 
-        if content_eq_normalized(&current_content, &previous_content) {
+        if content_eq_ignoring_line_endings(&current_content, &previous_content) {
             return Ok(None);
         }
 
@@ -659,7 +662,7 @@ fn get_checkpoint_entry_for_file(
 
         // Skip if no changes, UNLESS we have INITIAL attributions for this file
         // (in which case we need to create an entry to record those attributions)
-        if content_eq_normalized(&current_content, &previous_content)
+        if content_eq_ignoring_line_endings(&current_content, &previous_content)
             && initial_attrs_for_file.is_empty()
         {
             return Ok(None);
@@ -690,7 +693,7 @@ fn get_checkpoint_entry_for_file(
             let snapshot = initial_snapshot_content
                 .as_deref()
                 .unwrap_or(&previous_content);
-            if content_eq_normalized(snapshot, &current_content) {
+            if content_eq_ignoring_line_endings(snapshot, &current_content) {
                 &previous_content
             } else {
                 snapshot
@@ -751,7 +754,7 @@ fn get_checkpoint_entry_for_file(
 
     // Skip if no changes (but we already checked this earlier, accounting for INITIAL attributions)
     // For files from previous checkpoints, check if content has changed
-    if is_from_checkpoint && content_eq_normalized(&current_content, &previous_content) {
+    if is_from_checkpoint && content_eq_ignoring_line_endings(&current_content, &previous_content) {
         if current_content == previous_content {
             // Byte-identical — truly no change.
             return Ok(None);
@@ -865,16 +868,15 @@ async fn get_checkpoint_entries(
     };
 
     // Get HEAD commit info for git operations
-    let head_commit = head_commit_override
-        .map(str::trim)
-        .filter(|sha| !sha.is_empty() && *sha != "initial")
-        .and_then(|sha| repo.find_commit(sha.to_string()).ok())
-        .or_else(|| {
-            repo.head()
-                .ok()
-                .and_then(|h| h.target().ok())
-                .and_then(|oid| repo.find_commit(oid).ok())
-        });
+    let head_commit = match head_commit_override.map(str::trim) {
+        Some("" | "initial") => None,
+        Some(sha) => repo.find_commit(sha.to_string()).ok(),
+        None => repo
+            .head()
+            .ok()
+            .and_then(|h| h.target().ok())
+            .and_then(|oid| repo.find_commit(oid).ok()),
+    };
     let head_tree_id = head_commit
         .as_ref()
         .and_then(|c| c.tree().ok())
@@ -1193,5 +1195,26 @@ mod deleted_line_provenance_tests {
         assert_eq!(stats.ai_authored_deletions, 1);
         assert_eq!(stats.human_authored_deletions, 0);
         assert_eq!(stats.unknown_authored_deletions, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_ai_skips_agent_usage_throttle() {
+        let mut agent_id = AgentId {
+            tool: "mock_ai".to_string(),
+            id: "debug-self-check".to_string(),
+            model: "unknown".to_string(),
+        };
+
+        assert!(!should_emit_agent_usage_with_throttle(&agent_id, |_| {
+            panic!("mock checkpoints must not evaluate the real throttle")
+        }));
+
+        agent_id.tool = "claude".to_string();
+        assert!(should_emit_agent_usage_with_throttle(&agent_id, |_| true));
     }
 }
