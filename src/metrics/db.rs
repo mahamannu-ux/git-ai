@@ -385,6 +385,9 @@ impl MetricsDatabase {
     const METRICS_PRUNE_INTERVAL_SECS: u64 = 24 * 3600;
 
     fn harden_database_permissions(path: &std::path::Path) -> Result<(), GitAiError> {
+        #[cfg(not(unix))]
+        let _ = path;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
