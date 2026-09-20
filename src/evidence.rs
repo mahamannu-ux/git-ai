@@ -352,4 +352,98 @@ mod tests {
         assert!(!serialized.contains("sk_test_4eC39HqLyjWDarjtT1zdp7dc"));
         assert!(serialized.contains("********"));
     }
+
+    #[test]
+    fn opencode_batch_is_replay_stable_and_matches_trackai_contract() {
+        let input = vec![json!({
+            "message": {
+                "id": "message-contract", "time_created": 1750000000000_i64,
+                "data": { "role": "assistant", "modelID": "model-contract" }
+            },
+            "parts": [{
+                "id": "part-contract", "time_created": 1750000000000_i64,
+                "data": {
+                    "type": "tool", "tool": "shell",
+                    "state": {
+                        "status": "completed", "input": { "command": "task test" },
+                        "output": "passed",
+                        "time": { "start": 1750000000000_i64, "end": 1750000000042_i64 }
+                    }
+                }
+            }]
+        })];
+        let make = || {
+            OpenCodeEvidenceBatch::from_stream_events(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "session-contract",
+                "s_1234567890abcd",
+                input.clone(),
+            )
+        };
+        let first = serde_json::to_value(make()).unwrap();
+        let replay = serde_json::to_value(make()).unwrap();
+        assert_eq!(
+            first, replay,
+            "the same provider rows must create the same replay body"
+        );
+
+        let batch = &first[0];
+        assert_eq!(batch["provider"], "opencode");
+        assert_eq!(batch["sourceVersion"], SOURCE_VERSION);
+        assert_eq!(
+            batch["repositoryId"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(batch["externalSessionId"], "session-contract");
+        assert_eq!(batch["gitAiSessionId"], "s_1234567890abcd");
+        assert!(
+            batch.get("intention").is_none(),
+            "prompt and intention remain separate"
+        );
+        let events = batch["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["providerEventId"], "part-contract:call");
+        assert_eq!(events[1]["providerEventId"], "part-contract:result");
+        assert_eq!(
+            events[2]["providerEventId"],
+            "message-contract:reasoning-unavailable"
+        );
+        assert!(events[2]["content"].is_null());
+        assert!(
+            events[2]["traceId"].is_null(),
+            "missing trace evidence must stay unavailable"
+        );
+
+        let allowed_event_fields = [
+            "providerEventId",
+            "type",
+            "occurredAt",
+            "traceId",
+            "model",
+            "toolName",
+            "content",
+            "metadata",
+        ];
+        let allowed_metadata_fields = [
+            "status",
+            "durationMs",
+            "attempt",
+            "errorCode",
+            "exitCode",
+            "abandoned",
+        ];
+        for event in events {
+            let row = event.as_object().unwrap();
+            assert!(
+                row.keys()
+                    .all(|key| allowed_event_fields.contains(&key.as_str()))
+            );
+            let metadata = row["metadata"].as_object().unwrap();
+            assert!(
+                metadata
+                    .keys()
+                    .all(|key| allowed_metadata_fields.contains(&key.as_str()))
+            );
+        }
+    }
 }

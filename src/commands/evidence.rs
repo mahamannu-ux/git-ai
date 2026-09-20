@@ -294,7 +294,7 @@ mod tests {
                 .unwrap();
         }
         let runtime = MetricDeliveryRuntime::load_from_paths(&policy_path, &keyring_path).unwrap();
-        let mut uploaded = 0;
+        let mut uploaded = Vec::new();
         let result = sync_opencode_with_runtime_and_upload(
             SyncArguments {
                 database,
@@ -313,12 +313,28 @@ mod tests {
                 assert!(serialized.contains("part-one"));
                 assert!(serialized.contains("********"));
                 assert!(!serialized.contains("sk_test_4eC39HqLyjWDarjtT1zdp7dc"));
-                uploaded += 1;
+                uploaded.push(serialized);
                 Ok(202)
             },
         )
         .unwrap();
         assert_eq!(result, (1, 1));
-        assert_eq!(uploaded, 1);
+        assert_eq!(uploaded.len(), 1);
+
+        let replay = sync_opencode_with_runtime_and_upload(
+            SyncArguments {
+                database: temp.path().join("opencode.db"),
+                external_session_id: "session-one".to_string(),
+                repository_url: "https://github.com/example/repo".to_string(),
+            },
+            &runtime,
+            |_, batch| {
+                let serialized = serde_json::to_string(batch).unwrap();
+                assert_eq!(serialized, uploaded[0]);
+                Ok(202)
+            },
+        )
+        .unwrap();
+        assert_eq!(replay, result);
     }
 }
