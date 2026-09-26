@@ -5791,7 +5791,6 @@ fn await_waits_for_metrics_and_notes_flush() {
     let metrics_db_path =
         std::env::temp_dir().join(format!("git-ai-test-metrics-{}.db", std::process::id()));
     let mut repo = TestRepo::new_with_daemon_env(&[
-        ("RUST_LOG", "git_ai=debug"),
         ("GIT_AI_API_BASE_URL", mock_api.base_url()),
         ("GIT_AI_API_KEY", "test-api-key"),
         ("GIT_AI_NOTES_BACKEND_KIND", "http"),
