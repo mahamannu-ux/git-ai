@@ -7,6 +7,7 @@ pub mod config;
 pub mod daemon;
 pub mod debug;
 pub mod diff;
+pub mod evidence;
 pub mod exchange_nonce;
 pub mod fetch_notes;
 pub mod flush_metrics_db;

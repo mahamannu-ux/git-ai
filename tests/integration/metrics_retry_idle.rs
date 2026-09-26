@@ -81,12 +81,12 @@ fn wait_for_schema_migration(path: &Path) {
                 |row| row.get(0),
             )
             .unwrap();
-        if version == "5" {
+        if version.parse::<usize>().unwrap() >= 5 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "metrics database did not migrate to schema v5"
+            "metrics database did not migrate through schema v5"
         );
         std::thread::sleep(Duration::from_millis(25));
     }

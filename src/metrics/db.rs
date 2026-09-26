@@ -385,6 +385,9 @@ impl MetricsDatabase {
     const METRICS_PRUNE_INTERVAL_SECS: u64 = 24 * 3600;
 
     fn harden_database_permissions(path: &std::path::Path) -> Result<(), GitAiError> {
+        #[cfg(not(unix))]
+        let _ = path;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3748,6 +3751,7 @@ mod tests {
     fn test_delivery_health_combines_rotation_keys_and_isolates_tenants() {
         let (mut db, _temp_dir) = create_test_db();
         let now = unix_now();
+        let oldest_pending_at = days_ago(5);
         let binding = |tenant: &str, key_id: &str| MetricDeliveryBinding {
             tenant_id: tenant.to_string(),
             repository_url: format!("https://github.com/example/{tenant}"),
@@ -3760,7 +3764,7 @@ mod tests {
         let company_b = binding("22222222-2222-4222-8222-222222222222", "company-b-key-id");
         let ids = db
             .insert_events_with_bindings(&[
-                (event_json(days_ago(5)), company_a_old.clone()),
+                (event_json(oldest_pending_at), company_a_old.clone()),
                 (event_json(days_ago(4)), company_a_old),
                 (event_json(days_ago(3)), company_a_new.clone()),
                 (event_json(days_ago(2)), company_a_new.clone()),
@@ -3803,7 +3807,7 @@ mod tests {
         assert_eq!(company_a.processing, 1);
         assert_eq!(company_a.quarantined, 1);
         assert_eq!(company_a.rows_with_errors, 2);
-        assert_eq!(company_a.oldest_pending_at, Some(days_ago(5) as u64));
+        assert_eq!(company_a.oldest_pending_at, Some(oldest_pending_at as u64));
         assert_eq!(company_a.last_delivered_at, Some(now));
 
         let company_b = db
