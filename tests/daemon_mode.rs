@@ -5791,6 +5791,7 @@ fn await_waits_for_metrics_and_notes_flush() {
     let metrics_db_path =
         std::env::temp_dir().join(format!("git-ai-test-metrics-{}.db", std::process::id()));
     let mut repo = TestRepo::new_with_daemon_env(&[
+        ("RUST_LOG", "git_ai=debug"),
         ("GIT_AI_API_BASE_URL", mock_api.base_url()),
         ("GIT_AI_API_KEY", "test-api-key"),
         ("GIT_AI_NOTES_BACKEND_KIND", "http"),
@@ -5855,15 +5856,29 @@ fn await_waits_for_metrics_and_notes_flush() {
         .iter()
         .filter(|r| r["path"].as_str() == Some("/worker/notes/upload"))
         .count();
+    let request_paths = requests
+        .iter()
+        .filter_map(|request| request["path"].as_str())
+        .collect::<Vec<_>>();
+    let delivery_logs = repo
+        .daemon_stderr_contents()
+        .lines()
+        .filter(|line| line.contains("notes:") || line.contains("metrics upload"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         metrics_requests > 0,
-        "expected at least one metrics upload, got {}",
-        metrics_requests
+        "expected at least one metrics upload, got {}; request paths: {:?}; delivery logs:\n{}",
+        metrics_requests,
+        request_paths,
+        delivery_logs
     );
     assert!(
         notes_requests > 0,
-        "expected at least one notes upload, got {}",
-        notes_requests
+        "expected at least one notes upload, got {}; request paths: {:?}; delivery logs:\n{}",
+        notes_requests,
+        request_paths,
+        delivery_logs
     );
 }
 
