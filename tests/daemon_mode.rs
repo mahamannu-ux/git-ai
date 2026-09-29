@@ -327,8 +327,13 @@ fn handle_http_connection(mut stream: TcpStream, tx: &mpsc::Sender<Value>) {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    // The daemon_mode suite runs up to 12 daemon processes concurrently. A
+    // two-second read timeout can expire after accept but before a scheduled
+    // client finishes sending its request, which makes the mock drop a valid
+    // notes upload with `Peer disconnected`. Keep this bounded while matching
+    // the await windows used by the delivery tests.
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("failed to set mock API read timeout");
 
     let mut buffer = Vec::new();
