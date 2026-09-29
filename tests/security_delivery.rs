@@ -1,8 +1,9 @@
 use git_ai::error::GitAiError;
 use git_ai::metrics::delivery::EvidenceDeliveryBinding;
+use git_ai::metrics::delivery::MetricDeliveryRuntime;
 use git_ai::security::delivery::{
-    SecurityFindingUploadError, SecurityFindingUploadResponse, flush_security_findings_with,
-    upload_security_findings,
+    SecurityFindingUploadError, SecurityFindingUploadResponse, flush_security_findings,
+    flush_security_findings_with, upload_security_findings,
 };
 use git_ai::security::delivery_queue::SecurityFindingQueue;
 use git_ai::security::{
@@ -191,4 +192,67 @@ fn http_uploader_does_not_copy_server_body_into_error() {
     mock.assert();
     assert!(error.to_string().contains("HTTP 503"));
     assert!(!error.to_string().contains("raw-server-secret-must-not-be-retained"));
+}
+
+#[cfg(unix)]
+#[test]
+fn reopened_queue_flushes_through_exact_runtime_binding() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut server = mockito::Server::new();
+    let directory = tempfile::tempdir().unwrap();
+    let queue_path = directory.path().join("security-findings.db");
+    let policy_path = directory.path().join("trackai-delivery-policy.json");
+    let keyring_path = directory.path().join("trackai-machine-credentials.json");
+    let key_id = "abcdefghijklmnop";
+    let credential = format!("trk_v1.{key_id}.{}", "A".repeat(43));
+    let binding = EvidenceDeliveryBinding {
+        repository_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+        tenant_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        repository_url: "https://github.com/example/repository-a".to_string(),
+        api_base_url: server.url(),
+        credential_key_id: key_id.to_string(),
+    };
+    {
+        let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
+        queue.enqueue(&batch("restart"), &binding, 1_700_000_000).unwrap();
+    }
+    std::fs::write(
+        &policy_path,
+        serde_json::json!({
+            "version": 1,
+            "repositories": [{
+                "repository_url": binding.repository_url,
+                "repository_id": binding.repository_id,
+                "tenant_id": binding.tenant_id,
+                "api_base_url": binding.api_base_url,
+                "credential_key_id": key_id,
+            }],
+        }).to_string(),
+    ).unwrap();
+    std::fs::write(
+        &keyring_path,
+        serde_json::json!({ "version": 1, "credentials": [credential] }).to_string(),
+    ).unwrap();
+    std::fs::set_permissions(
+        &keyring_path,
+        std::fs::Permissions::from_mode(0o600),
+    ).unwrap();
+    let runtime = MetricDeliveryRuntime::load_from_paths(&policy_path, &keyring_path).unwrap();
+    let mock = server
+        .mock("POST", "/worker/security/findings")
+        .match_header("x-api-key", mockito::Matcher::Regex("^trk_v1\\.".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"errors":[]}"#)
+        .create();
+
+    let mut reopened = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
+    let result = flush_security_findings(&mut reopened, &runtime, 1_700_000_001, 10).unwrap();
+
+    mock.assert();
+    assert_eq!(result.delivered, 1);
+    assert_eq!(result.terminal, 0);
+    assert_eq!(result.retrying, 0);
+    assert!(reopened.dequeue_pending(10, 1_800_000_000).unwrap().is_empty());
 }
