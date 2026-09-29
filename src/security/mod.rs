@@ -5,6 +5,8 @@
 
 use serde::Serialize;
 
+pub mod delivery_queue;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorMode {
     Off,
@@ -392,6 +394,10 @@ impl SecurityFindingUploadBatch {
                 rule_pack_version: context.rule_pack_version,
             }],
         })
+    }
+
+    pub(crate) fn repository_id(&self) -> &str {
+        &self.findings[0].repository_id
     }
 }
 

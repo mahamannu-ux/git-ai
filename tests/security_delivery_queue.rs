@@ -1,5 +1,5 @@
 use git_ai::metrics::delivery::EvidenceDeliveryBinding;
-use git_ai::security::delivery_queue::SecurityFindingQueue;
+use git_ai::security::delivery_queue::{SecurityFindingFailureClass, SecurityFindingQueue};
 use git_ai::security::{
     DeleteInput, EvaluationInput, FindingOperatingSystem, FindingUploadContext, MonitorMode,
     SecurityFindingUploadBatch, ShellDialect, TargetClass, evaluate,
@@ -16,6 +16,10 @@ fn binding(tenant: &str, repository: &str, key: &str) -> EvidenceDeliveryBinding
 }
 
 fn batch(suffix: &str) -> SecurityFindingUploadBatch {
+    batch_for(suffix, &format!("repository-{suffix}"))
+}
+
+fn batch_for(suffix: &str, repository_id: &str) -> SecurityFindingUploadBatch {
     let finding = evaluate(
         MonitorMode::Monitor,
         &EvaluationInput::Delete(DeleteInput::new(
@@ -30,7 +34,7 @@ fn batch(suffix: &str) -> SecurityFindingUploadBatch {
         FindingUploadContext {
             finding_id: format!("finding-{suffix}"),
             delivery_id: format!("delivery-{suffix}"),
-            repository_id: format!("repository-{suffix}"),
+            repository_id: repository_id.to_string(),
             session_id: format!("session-{suffix}"),
             source_event_id: format!("event-{suffix}"),
             correlation_id: None,
@@ -58,9 +62,7 @@ fn queued_safe_finding_survives_restart_with_immutable_binding() {
     }
 
     let mut reopened = SecurityFindingQueue::open_at_path(&path).unwrap();
-    let records = reopened
-        .dequeue_pending(10, 1_700_000_001)
-        .unwrap();
+    let records = reopened.dequeue_pending(10, 1_700_000_001).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].delivery_binding, expected_binding);
     assert_eq!(
@@ -109,13 +111,33 @@ fn queued_findings_keep_two_tenant_routes_separate() {
 }
 
 #[test]
+fn queue_rejects_a_finding_bound_to_a_different_repository() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
+
+    let result = queue.enqueue(
+        &batch("company-a"),
+        &binding("tenant-b", "repository-b", "key-b"),
+        1_700_000_000,
+    );
+
+    assert!(result.is_err());
+    assert!(queue.dequeue_pending(10, 1_700_000_001).unwrap().is_empty());
+}
+
+#[test]
 fn partial_acknowledgement_delivers_success_and_retries_only_failure() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("security-findings.db");
     let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
     let route = binding("tenant-a", "repository-a", "key-a");
-    queue.enqueue(&batch("one"), &route, 1_700_000_000).unwrap();
-    queue.enqueue(&batch("two"), &route, 1_700_000_000).unwrap();
+    queue
+        .enqueue(&batch_for("one", "repository-a"), &route, 1_700_000_000)
+        .unwrap();
+    queue
+        .enqueue(&batch_for("two", "repository-a"), &route, 1_700_000_000)
+        .unwrap();
 
     let records = queue.dequeue_pending(10, 1_700_000_001).unwrap();
     assert_eq!(records.len(), 2);
@@ -123,7 +145,11 @@ fn partial_acknowledgement_delivers_success_and_retries_only_failure() {
         .mark_delivered(&[records[0].id], 1_700_000_002)
         .unwrap();
     queue
-        .mark_failed(&[records[1].id], "temporary_transport_error", 1_700_000_002)
+        .mark_failed(
+            &[records[1].id],
+            SecurityFindingFailureClass::TemporaryTransport,
+            1_700_000_002,
+        )
         .unwrap();
 
     assert!(queue.dequeue_pending(10, 1_700_000_003).unwrap().is_empty());
