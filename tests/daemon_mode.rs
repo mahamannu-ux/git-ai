@@ -289,6 +289,13 @@ impl Drop for MockApiServer {
 }
 
 fn handle_http_connection(mut stream: TcpStream, tx: &mpsc::Sender<Value>) {
+    // The listener itself is nonblocking so the accept loop can observe the
+    // stop flag. Accepted sockets must be returned to blocking mode before
+    // parsing: otherwise an early `WouldBlock` is treated as EOF and the mock
+    // closes a valid upload before its request bytes arrive.
+    stream
+        .set_nonblocking(false)
+        .expect("failed to set blocking mock API connection");
     let Some((path, body)) = read_http_request(&mut stream) else {
         return;
     };
