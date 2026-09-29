@@ -219,16 +219,40 @@ impl MockApiServer {
         let stop_thread = Arc::clone(&stop);
 
         let thread = thread::spawn(move || {
+            let mut connection_threads = Vec::new();
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_http_connection(stream, &tx);
+                        if stop_thread.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let connection_tx = tx.clone();
+                        connection_threads.push(thread::spawn(move || {
+                            handle_http_connection(stream, &connection_tx);
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("mock API accept failed: {}", error),
                 }
+
+                let mut index = 0;
+                while index < connection_threads.len() {
+                    if connection_threads[index].is_finished() {
+                        connection_threads.swap_remove(index).join().expect(
+                            "mock API connection handler should complete without panicking",
+                        );
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+
+            for connection_thread in connection_threads {
+                connection_thread
+                    .join()
+                    .expect("mock API connection handler should complete without panicking");
             }
         });
 
