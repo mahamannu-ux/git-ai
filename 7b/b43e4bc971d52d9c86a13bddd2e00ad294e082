@@ -1,0 +1,21 @@
+src/security/mod.rs
+  s_9b81eb38fb59c3::t_8969fadc38690a 382
+tests/security_monitor.rs
+  s_9b81eb38fb59c3::t_efdd4610097a4d 1,9,470-511
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "7bb43e4bc971d52d9c86a13bddd2e00ad294e082",
+  "prompts": {},
+  "sessions": {
+    "s_9b81eb38fb59c3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ded8-428c-75c2-8052-6f3210b3160f",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu <mahamannu@gmail.com>"
+    }
+  }
+}
