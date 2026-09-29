@@ -256,3 +256,96 @@ fn reopened_queue_flushes_through_exact_runtime_binding() {
     assert_eq!(result.retrying, 0);
     assert!(reopened.dequeue_pending(10, 1_800_000_000).unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn process_restart_helper() {
+    let Ok(action) = std::env::var("TASK6_PROCESS_RESTART_ACTION") else {
+        return;
+    };
+    let queue_path = std::path::PathBuf::from(std::env::var("TASK6_QUEUE_PATH").unwrap());
+    let binding = EvidenceDeliveryBinding {
+        repository_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+        tenant_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        repository_url: "https://github.com/example/repository-a".to_string(),
+        api_base_url: std::env::var("TASK6_HTTP_BASE_URL").unwrap(),
+        credential_key_id: "abcdefghijklmnop".to_string(),
+    };
+    match action.as_str() {
+        "enqueue" => {
+            let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
+            queue.enqueue(&batch("process-restart"), &binding, 1_700_000_000).unwrap();
+        }
+        "flush" => {
+            let runtime = MetricDeliveryRuntime::load_from_paths(
+                std::path::Path::new(&std::env::var("TASK6_POLICY_PATH").unwrap()),
+                std::path::Path::new(&std::env::var("TASK6_KEYRING_PATH").unwrap()),
+            ).unwrap();
+            let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
+            let result = flush_security_findings(&mut queue, &runtime, 1_700_000_001, 10).unwrap();
+            assert_eq!(result.delivered, 1);
+        }
+        _ => panic!("unsupported Task6 process restart action"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn separate_process_restart_delivers_queued_finding() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let mut server = mockito::Server::new();
+    let directory = tempfile::tempdir().unwrap();
+    let queue_path = directory.path().join("security-findings.db");
+    let policy_path = directory.path().join("trackai-delivery-policy.json");
+    let keyring_path = directory.path().join("trackai-machine-credentials.json");
+    let key_id = "abcdefghijklmnop";
+    let credential = format!("trk_v1.{key_id}.{}", "A".repeat(43));
+    std::fs::write(
+        &policy_path,
+        serde_json::json!({
+            "version": 1,
+            "repositories": [{
+                "repository_url": "https://github.com/example/repository-a",
+                "repository_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "tenant_id": "11111111-1111-4111-8111-111111111111",
+                "api_base_url": server.url(),
+                "credential_key_id": key_id,
+            }],
+        }).to_string(),
+    ).unwrap();
+    std::fs::write(
+        &keyring_path,
+        serde_json::json!({ "version": 1, "credentials": [credential] }).to_string(),
+    ).unwrap();
+    std::fs::set_permissions(
+        &keyring_path,
+        std::fs::Permissions::from_mode(0o600),
+    ).unwrap();
+    let mock = server
+        .mock("POST", "/worker/security/findings")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"errors":[]}"#)
+        .create();
+    let test_executable = std::env::current_exe().unwrap();
+    let common = |command: &mut Command| {
+        command
+            .arg("--exact")
+            .arg("process_restart_helper")
+            .arg("--nocapture")
+            .env("TASK6_QUEUE_PATH", &queue_path)
+            .env("TASK6_HTTP_BASE_URL", server.url())
+            .env("TASK6_POLICY_PATH", &policy_path)
+            .env("TASK6_KEYRING_PATH", &keyring_path);
+    };
+    let mut enqueue = Command::new(&test_executable);
+    common(&mut enqueue);
+    assert!(enqueue.env("TASK6_PROCESS_RESTART_ACTION", "enqueue").status().unwrap().success());
+    let mut flush = Command::new(&test_executable);
+    common(&mut flush);
+    assert!(flush.env("TASK6_PROCESS_RESTART_ACTION", "flush").status().unwrap().success());
+
+    mock.assert();
+}
