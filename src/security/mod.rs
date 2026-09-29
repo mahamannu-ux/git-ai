@@ -5,6 +5,7 @@
 
 use serde::Serialize;
 
+pub mod delivery;
 pub mod delivery_queue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

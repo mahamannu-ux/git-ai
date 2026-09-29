@@ -21,6 +21,23 @@ pub enum SecurityFindingFailureClass {
     RateLimited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityFindingTerminalClass {
+    CredentialUnavailable,
+    ServerRejected,
+    InvalidLocalRecord,
+}
+
+impl SecurityFindingTerminalClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::ServerRejected => "server_rejected",
+            Self::InvalidLocalRecord => "invalid_local_record",
+        }
+    }
+}
+
 impl SecurityFindingFailureClass {
     fn as_str(self) -> &'static str {
         match self {
@@ -57,6 +74,8 @@ impl SecurityFindingQueue {
                 next_retry_at INTEGER NOT NULL,
                 processing_started_at INTEGER,
                 delivered_at INTEGER,
+                terminal_at INTEGER,
+                terminal_class TEXT,
                 last_error_class TEXT,
                 delivery_tenant_id TEXT NOT NULL,
                 delivery_repository_id TEXT NOT NULL,
@@ -67,7 +86,9 @@ impl SecurityFindingQueue {
 
             CREATE INDEX IF NOT EXISTS security_finding_queue_pending
                 ON security_finding_queue (next_retry_at, id)
-                WHERE delivered_at IS NULL AND processing_started_at IS NULL;
+                WHERE delivered_at IS NULL
+                  AND terminal_at IS NULL
+                  AND processing_started_at IS NULL;
             "#,
         )?;
         Ok(Self { connection })
@@ -156,6 +177,7 @@ impl SecurityFindingQueue {
             "UPDATE security_finding_queue
                 SET processing_started_at = NULL
               WHERE delivered_at IS NULL
+                AND terminal_at IS NULL
                 AND processing_started_at IS NOT NULL
                 AND processing_started_at <= ?1",
             params![stale_before],
@@ -165,6 +187,7 @@ impl SecurityFindingQueue {
             let mut statement = transaction.prepare(
                 "SELECT id FROM security_finding_queue
                   WHERE delivered_at IS NULL
+                    AND terminal_at IS NULL
                     AND processing_started_at IS NULL
                     AND next_retry_at <= ?1
                     AND attempts < ?2
@@ -259,6 +282,29 @@ impl SecurityFindingQueue {
                     failure.as_str(),
                     id,
                 ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_terminal(
+        &mut self,
+        ids: &[i64],
+        class: SecurityFindingTerminalClass,
+        terminal_at: u64,
+    ) -> Result<(), GitAiError> {
+        let terminal_at = as_sql_timestamp(terminal_at)?;
+        let transaction = self.connection.transaction()?;
+        for id in ids {
+            transaction.execute(
+                "UPDATE security_finding_queue
+                    SET terminal_at = ?1,
+                        terminal_class = ?2,
+                        processing_started_at = NULL,
+                        last_error_class = NULL
+                  WHERE id = ?3 AND delivered_at IS NULL AND terminal_at IS NULL",
+                params![terminal_at, class.as_str(), id],
             )?;
         }
         transaction.commit()?;

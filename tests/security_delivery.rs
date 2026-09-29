@@ -51,8 +51,12 @@ fn batch(suffix: &str) -> SecurityFindingUploadBatch {
 fn delivery_batches_one_route_and_honors_partial_acknowledgement() {
     let directory = tempfile::tempdir().unwrap();
     let mut queue = SecurityFindingQueue::open_at_path(&directory.path().join("queue.db")).unwrap();
-    queue.enqueue(&batch("one"), &route(), 1_700_000_000).unwrap();
-    queue.enqueue(&batch("two"), &route(), 1_700_000_000).unwrap();
+    queue
+        .enqueue(&batch("one"), &route(), 1_700_000_000)
+        .unwrap();
+    queue
+        .enqueue(&batch("two"), &route(), 1_700_000_000)
+        .unwrap();
     let mut uploads = 0;
 
     let result = flush_security_findings_with(
@@ -66,7 +70,10 @@ fn delivery_batches_one_route_and_honors_partial_acknowledgement() {
         |context, body| {
             uploads += 1;
             assert_eq!(context.base_url, "https://trackai.example/api/gitai");
-            assert_eq!(context.api_key.as_deref(), Some("reusable-secret-never-stored"));
+            assert_eq!(
+                context.api_key.as_deref(),
+                Some("reusable-secret-never-stored")
+            );
             assert_eq!(body["findings"].as_array().unwrap().len(), 2);
             assert!(!body.to_string().contains("reusable-secret-never-stored"));
             Ok(SecurityFindingUploadResponse {
@@ -90,7 +97,9 @@ fn delivery_batches_one_route_and_honors_partial_acknowledgement() {
 fn unavailable_exact_credential_stops_without_upload_or_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let mut queue = SecurityFindingQueue::open_at_path(&directory.path().join("queue.db")).unwrap();
-    queue.enqueue(&batch("revoked"), &route(), 1_700_000_000).unwrap();
+    queue
+        .enqueue(&batch("revoked"), &route(), 1_700_000_000)
+        .unwrap();
     let mut uploads = 0;
 
     let result = flush_security_findings_with(
@@ -114,7 +123,9 @@ fn unavailable_exact_credential_stops_without_upload_or_fallback() {
 fn transport_failure_retries_without_storing_error_content() {
     let directory = tempfile::tempdir().unwrap();
     let mut queue = SecurityFindingQueue::open_at_path(&directory.path().join("queue.db")).unwrap();
-    queue.enqueue(&batch("retry"), &route(), 1_700_000_000).unwrap();
+    queue
+        .enqueue(&batch("retry"), &route(), 1_700_000_000)
+        .unwrap();
 
     let result = flush_security_findings_with(
         &mut queue,
