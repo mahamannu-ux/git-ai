@@ -50,6 +50,7 @@ impl SecurityFindingQueue {
             r#"
             CREATE TABLE IF NOT EXISTS security_finding_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id TEXT NOT NULL UNIQUE,
                 finding_json TEXT NOT NULL,
                 queued_at INTEGER NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -85,13 +86,15 @@ impl SecurityFindingQueue {
             ));
         }
         let finding_json = serde_json::to_string(batch)?;
-        self.connection.execute(
+        let inserted = self.connection.execute(
             "INSERT INTO security_finding_queue (
-                finding_json, queued_at, next_retry_at,
+                delivery_id, finding_json, queued_at, next_retry_at,
                 delivery_tenant_id, delivery_repository_id, delivery_repository_url,
                 delivery_api_base_url, delivery_credential_key_id
-             ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(delivery_id) DO NOTHING",
             params![
+                batch.delivery_id(),
                 finding_json,
                 as_sql_timestamp(queued_at)?,
                 binding.tenant_id,
@@ -101,7 +104,41 @@ impl SecurityFindingQueue {
                 binding.credential_key_id,
             ],
         )?;
-        Ok(self.connection.last_insert_rowid())
+        if inserted > 0 {
+            return Ok(self.connection.last_insert_rowid());
+        }
+
+        let existing = self.connection.query_row(
+            "SELECT id, finding_json,
+                    delivery_tenant_id, delivery_repository_id, delivery_repository_url,
+                    delivery_api_base_url, delivery_credential_key_id
+               FROM security_finding_queue WHERE delivery_id = ?1",
+            params![batch.delivery_id()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        if existing.1 == finding_json
+            && existing.2 == binding.tenant_id
+            && existing.3 == binding.repository_id
+            && existing.4 == binding.repository_url
+            && existing.5 == binding.api_base_url
+            && existing.6 == binding.credential_key_id
+        {
+            Ok(existing.0)
+        } else {
+            Err(GitAiError::Generic(
+                "security finding delivery ID collision".to_string(),
+            ))
+        }
     }
 
     pub fn dequeue_pending(

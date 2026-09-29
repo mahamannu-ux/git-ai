@@ -20,6 +20,14 @@ fn batch(suffix: &str) -> SecurityFindingUploadBatch {
 }
 
 fn batch_for(suffix: &str, repository_id: &str) -> SecurityFindingUploadBatch {
+    batch_with_delivery(suffix, repository_id, &format!("delivery-{suffix}"))
+}
+
+fn batch_with_delivery(
+    suffix: &str,
+    repository_id: &str,
+    delivery_id: &str,
+) -> SecurityFindingUploadBatch {
     let finding = evaluate(
         MonitorMode::Monitor,
         &EvaluationInput::Delete(DeleteInput::new(
@@ -33,7 +41,7 @@ fn batch_for(suffix: &str, repository_id: &str) -> SecurityFindingUploadBatch {
         finding,
         FindingUploadContext {
             finding_id: format!("finding-{suffix}"),
-            delivery_id: format!("delivery-{suffix}"),
+            delivery_id: delivery_id.to_string(),
             repository_id: repository_id.to_string(),
             session_id: format!("session-{suffix}"),
             source_event_id: format!("event-{suffix}"),
@@ -167,18 +175,35 @@ fn repeated_delivery_id_is_queued_once() {
     let safe_batch = batch("replay");
     let route = binding("tenant-replay", "repository-replay", "key-replay");
 
-    let first = queue
-        .enqueue(&safe_batch, &route, 1_700_000_000)
-        .unwrap();
-    let replay = queue
-        .enqueue(&safe_batch, &route, 1_700_000_001)
-        .unwrap();
+    let first = queue.enqueue(&safe_batch, &route, 1_700_000_000).unwrap();
+    let replay = queue.enqueue(&safe_batch, &route, 1_700_000_001).unwrap();
 
     assert_eq!(first, replay);
-    assert_eq!(
-        queue.dequeue_pending(10, 1_700_000_002).unwrap().len(),
-        1
+    assert_eq!(queue.dequeue_pending(10, 1_700_000_002).unwrap().len(), 1);
+}
+
+#[test]
+fn repeated_delivery_id_cannot_be_reused_for_different_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
+    let route = binding("tenant-a", "repository-a", "key-a");
+    queue
+        .enqueue(
+            &batch_with_delivery("original", "repository-a", "delivery-shared"),
+            &route,
+            1_700_000_000,
+        )
+        .unwrap();
+
+    let collision = queue.enqueue(
+        &batch_with_delivery("changed", "repository-a", "delivery-shared"),
+        &route,
+        1_700_000_001,
     );
+
+    assert!(collision.is_err());
+    assert_eq!(queue.dequeue_pending(10, 1_700_000_002).unwrap().len(), 1);
 }
 
 #[test]
@@ -193,12 +218,7 @@ fn abandoned_processing_lock_is_recovered_after_bounded_timeout() {
 
     let first = queue.dequeue_pending(1, 1_700_000_001).unwrap();
     assert_eq!(first.len(), 1);
-    assert!(
-        queue
-            .dequeue_pending(1, 1_700_000_600)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(queue.dequeue_pending(1, 1_700_000_600).unwrap().is_empty());
     let recovered = queue.dequeue_pending(1, 1_700_000_601).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].id, first[0].id);
@@ -211,7 +231,11 @@ fn retry_limit_stops_an_endless_delivery_loop() {
     let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
     let route = binding("tenant-a", "repository-a", "key-a");
     queue
-        .enqueue(&batch_for("retry-limit", "repository-a"), &route, 1_700_000_000)
+        .enqueue(
+            &batch_for("retry-limit", "repository-a"),
+            &route,
+            1_700_000_000,
+        )
         .unwrap();
 
     let mut now = 1_700_000_000;

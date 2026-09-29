@@ -399,6 +399,10 @@ impl SecurityFindingUploadBatch {
     pub(crate) fn repository_id(&self) -> &str {
         &self.findings[0].repository_id
     }
+
+    pub(crate) fn delivery_id(&self) -> &str {
+        &self.findings[0].delivery_id
+    }
 }
 
 fn validate_bounded(value: &str, maximum: usize) -> Result<(), FindingUploadProjectionError> {
