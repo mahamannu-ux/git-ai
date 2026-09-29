@@ -35,6 +35,25 @@ pub struct SecurityFindingFlushResult {
 
 type RouteKey = (String, String, String);
 
+pub fn upload_security_findings(
+    context: &ApiContext,
+    body: &Value,
+) -> Result<SecurityFindingUploadResponse, GitAiError> {
+    let response = context.post_json("/worker/security/findings", body)?;
+    if response.status_code != 200 {
+        return Err(GitAiError::Generic(format!(
+            "security finding upload returned HTTP {}",
+            response.status_code
+        )));
+    }
+    let response_body = response.as_str().map_err(|_| {
+        GitAiError::Generic("security finding upload response was not valid UTF-8".to_string())
+    })?;
+    serde_json::from_str(response_body).map_err(|_| {
+        GitAiError::Generic("security finding upload response was invalid".to_string())
+    })
+}
+
 pub fn flush_security_findings_with<ResolveCredential, Upload>(
     queue: &mut SecurityFindingQueue,
     now: u64,
