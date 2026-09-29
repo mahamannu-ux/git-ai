@@ -2,6 +2,7 @@ use git_ai::error::GitAiError;
 use git_ai::metrics::delivery::EvidenceDeliveryBinding;
 use git_ai::security::delivery::{
     SecurityFindingUploadError, SecurityFindingUploadResponse, flush_security_findings_with,
+    upload_security_findings,
 };
 use git_ai::security::delivery_queue::SecurityFindingQueue;
 use git_ai::security::{
@@ -139,4 +140,55 @@ fn transport_failure_retries_without_storing_error_content() {
     assert_eq!(result.retrying, 1);
     assert!(queue.dequeue_pending(10, 1_700_000_060).unwrap().is_empty());
     assert_eq!(queue.dequeue_pending(10, 1_700_000_061).unwrap().len(), 1);
+}
+
+#[test]
+fn http_uploader_uses_managed_credential_and_safe_endpoint() {
+    let mut server = mockito::Server::new();
+    let request = batch("http");
+    let body = serde_json::to_value(&request).unwrap();
+    let mock = server
+        .mock("POST", "/worker/security/findings")
+        .match_header("x-api-key", "managed-machine-secret")
+        .match_header("content-type", "application/json")
+        .match_body(mockito::Matcher::Json(body.clone()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"errors":[]}"#)
+        .create();
+    let context = git_ai::api::ApiContext {
+        base_url: server.url(),
+        auth_token: None,
+        api_key: Some("managed-machine-secret".to_string()),
+        author_identity: None,
+        timeout_secs: Some(5),
+    };
+
+    let response = upload_security_findings(&context, &body).unwrap();
+
+    mock.assert();
+    assert!(response.errors.is_empty());
+}
+
+#[test]
+fn http_uploader_does_not_copy_server_body_into_error() {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/worker/security/findings")
+        .with_status(503)
+        .with_body("raw-server-secret-must-not-be-retained")
+        .create();
+    let context = git_ai::api::ApiContext {
+        base_url: server.url(),
+        auth_token: None,
+        api_key: Some("managed-machine-secret".to_string()),
+        author_identity: None,
+        timeout_secs: Some(5),
+    };
+
+    let error = upload_security_findings(&context, &serde_json::json!({})).unwrap_err();
+
+    mock.assert();
+    assert!(error.to_string().contains("HTTP 503"));
+    assert!(!error.to_string().contains("raw-server-secret-must-not-be-retained"));
 }
