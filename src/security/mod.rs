@@ -3,6 +3,8 @@
 //! This module accepts normalized categorical evidence. It does not read files,
 //! access the network, upload findings, block actions, or retain raw commands.
 
+use serde::Serialize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorMode {
     Off,
@@ -245,6 +247,159 @@ pub struct SafeFinding {
     pub alert_title: &'static str,
     pub effect: &'static str,
     pub phase: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FindingOperatingSystem {
+    Macos,
+    Linux,
+    Windows,
+    Wsl,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingUploadContext {
+    pub finding_id: String,
+    pub delivery_id: String,
+    pub repository_id: String,
+    pub session_id: String,
+    pub source_event_id: String,
+    pub correlation_id: Option<String>,
+    pub operating_system: FindingOperatingSystem,
+    pub occurred_at: String,
+    pub client_version: String,
+    pub rule_pack_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityFindingUploadBatch {
+    schema_version: &'static str,
+    findings: Vec<SecurityFindingUpload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityFindingUpload {
+    finding_id: String,
+    delivery_id: String,
+    repository_id: String,
+    session_id: String,
+    source_event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
+    rule: FindingUploadRule,
+    capability: FindingUploadCapability,
+    effect: &'static str,
+    phase: &'static str,
+    availability: &'static str,
+    completeness: &'static str,
+    result_category: &'static str,
+    occurred_at: String,
+    client_version: String,
+    rule_pack_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FindingUploadRule {
+    id: &'static str,
+    version: &'static str,
+    category: &'static str,
+    severity: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FindingUploadCapability {
+    route_id: &'static str,
+    agent_family: &'static str,
+    host_surface: &'static str,
+    host_mode: &'static str,
+    capture_channel: &'static str,
+    operating_system: FindingOperatingSystem,
+    timing: &'static str,
+    native_effect: &'static str,
+    activation: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindingUploadProjectionError;
+
+impl std::fmt::Display for FindingUploadProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "security finding upload metadata is invalid")
+    }
+}
+
+impl std::error::Error for FindingUploadProjectionError {}
+
+impl SecurityFindingUploadBatch {
+    pub fn from_safe_finding(
+        finding: SafeFinding,
+        context: FindingUploadContext,
+    ) -> Result<Self, FindingUploadProjectionError> {
+        for value in [
+            context.finding_id.as_str(),
+            context.delivery_id.as_str(),
+            context.repository_id.as_str(),
+            context.session_id.as_str(),
+            context.source_event_id.as_str(),
+        ] {
+            validate_bounded(value, 128)?;
+        }
+        if let Some(value) = context.correlation_id.as_deref() {
+            validate_bounded(value, 128)?;
+        }
+        validate_bounded(&context.occurred_at, 64)?;
+        validate_bounded(&context.client_version, 64)?;
+        validate_bounded(&context.rule_pack_version, 64)?;
+
+        Ok(Self {
+            schema_version: "trackai.security-finding-upload/0.1",
+            findings: vec![SecurityFindingUpload {
+                finding_id: context.finding_id,
+                delivery_id: context.delivery_id,
+                repository_id: context.repository_id,
+                session_id: context.session_id,
+                source_event_id: context.source_event_id,
+                correlation_id: context.correlation_id,
+                rule: FindingUploadRule {
+                    id: finding.rule_id,
+                    version: finding.rule_version,
+                    category: "execution",
+                    severity: finding.severity,
+                },
+                capability: FindingUploadCapability {
+                    route_id: "AC-CLI-03",
+                    agent_family: "opencode",
+                    host_surface: "terminal",
+                    host_mode: "cli",
+                    capture_channel: "provider-plugin",
+                    operating_system: context.operating_system,
+                    timing: "pre_action",
+                    native_effect: "observe_only",
+                    activation: "observed",
+                },
+                effect: finding.effect,
+                phase: finding.phase,
+                availability: "available",
+                completeness: "complete",
+                result_category: "not_observed",
+                occurred_at: context.occurred_at,
+                client_version: context.client_version,
+                rule_pack_version: context.rule_pack_version,
+            }],
+        })
+    }
+}
+
+fn validate_bounded(value: &str, maximum: usize) -> Result<(), FindingUploadProjectionError> {
+    if value.is_empty() || value.len() > maximum {
+        return Err(FindingUploadProjectionError);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
