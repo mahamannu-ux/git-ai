@@ -1,0 +1,197 @@
+{
+  "schemaVersion": "trackai.security-rule-fixtures/0.1",
+  "cases": [
+    {
+      "caseId": "delete-root-posix",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "filesystem_root", "targetExpansion": "not_applicable" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Large deletion requested" }
+    },
+    {
+      "caseId": "delete-home-expanded",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "user_home", "targetExpansion": "confirmed" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Large deletion requested" }
+    },
+    {
+      "caseId": "delete-windows-root",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "cmd", "recursive": true, "forced": true, "targetClass": "filesystem_root", "targetExpansion": "not_applicable" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Large deletion requested" }
+    },
+    {
+      "caseId": "delete-repository-build-output",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "repository_build", "targetExpansion": "not_applicable" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "delete-temporary-folder",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "temporary_folder", "targetExpansion": "not_applicable" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "delete-quoted-example",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "printed_text", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "filesystem_root", "targetExpansion": "not_applicable" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "delete-literal-home-variable",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "complete", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "user_home", "targetExpansion": "literal" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "delete-expansion-unknown",
+      "ruleId": "trackai.exec.destructive_recursive_delete",
+      "input": { "kind": "delete", "executionContext": "parsed_command", "parserStatus": "partial", "dialect": "posix", "recursive": true, "forced": true, "targetClass": "unavailable", "targetExpansion": "unavailable" },
+      "expected": { "localDecision": "unavailable", "findingCount": 0, "phase": "partial", "resultCategory": "unavailable", "customerClaim": "unavailable", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-pipe-posix-shell",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "shell", "interpreterInput": "downloader_stdout" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Downloaded content requested for immediate execution" }
+    },
+    {
+      "caseId": "download-pipe-script-interpreter",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "script_interpreter", "interpreterInput": "downloader_stdout" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Downloaded content requested for immediate execution" }
+    },
+    {
+      "caseId": "download-save-only",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "saved_file", "interpreterClass": "none", "interpreterInput": "none" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-local-script-argument",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "script_interpreter", "interpreterInput": "local_file" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-shell-command-flag",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "shell", "interpreterInput": "command_string" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-stdin-overridden",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "shell", "interpreterInput": "redirected" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-quoted-example",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "documentation", "parserStatus": "complete", "downloadSource": "https", "outputDisposition": "pipeline", "interpreterClass": "shell", "interpreterInput": "downloader_stdout" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "download-pipeline-unknown",
+      "ruleId": "trackai.exec.download_pipe_shell",
+      "input": { "kind": "download_pipeline", "executionContext": "parsed_command", "parserStatus": "partial", "downloadSource": "https", "outputDisposition": "unavailable", "interpreterClass": "unavailable", "interpreterInput": "unavailable" },
+      "expected": { "localDecision": "unavailable", "findingCount": 0, "phase": "partial", "resultCategory": "unavailable", "customerClaim": "unavailable", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "reverse-shell-device-redirect",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "complete", "networkMode": "connect_back", "transportClass": "device_redirect", "executedProgramClass": "recognized_shell" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Remote command channel requested" }
+    },
+    {
+      "caseId": "reverse-shell-netcat-exec",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "complete", "networkMode": "bind", "transportClass": "netcat_family", "executedProgramClass": "recognized_shell" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Remote command channel requested" }
+    },
+    {
+      "caseId": "reverse-shell-socat",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "complete", "networkMode": "connect_back", "transportClass": "socat", "executedProgramClass": "recognized_shell" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable", "alertTitle": "Remote command channel requested" }
+    },
+    {
+      "caseId": "reverse-shell-generic-listener",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "complete", "networkMode": "listener", "transportClass": "generic_socket", "executedProgramClass": "none" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "reverse-shell-non-shell-exec",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "complete", "networkMode": "connect_back", "transportClass": "netcat_family", "executedProgramClass": "non_shell" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "reverse-shell-documentation",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "documentation", "parserStatus": "complete", "networkMode": "connect_back", "transportClass": "netcat_family", "executedProgramClass": "recognized_shell" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "reverse-shell-benign-socket-code",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "application_code", "parserStatus": "complete", "networkMode": "normal_socket", "transportClass": "generic_socket", "executedProgramClass": "none" },
+      "expected": { "localDecision": "no_match", "findingCount": 0, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "reverse-shell-redirection-unknown",
+      "ruleId": "trackai.exec.reverse_shell",
+      "input": { "kind": "reverse_shell", "executionContext": "parsed_command", "parserStatus": "partial", "networkMode": "unavailable", "transportClass": "unavailable", "executedProgramClass": "unavailable" },
+      "expected": { "localDecision": "unavailable", "findingCount": 0, "phase": "partial", "resultCategory": "unavailable", "customerClaim": "unavailable", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "matching-request-with-no-result",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "request_without_result" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "matching-request-with-failed-result",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "request_with_failed_result" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "observed_result", "resultCategory": "failure", "customerClaim": "requested_and_host_reported_failure", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "matching-request-with-successful-result",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "request_with_successful_result" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "observed_result", "resultCategory": "success", "customerClaim": "requested_and_host_reported_success", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "duplicate-delivery-same-finding",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "duplicate_delivery" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 1, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "same-command-two-tenants",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "two_tenants" },
+      "expected": { "localDecision": "monitor_match", "findingCount": 2, "phase": "requested", "resultCategory": "not_observed", "customerClaim": "requested", "privacyProjection": "safe_metadata_only", "tenantIsolation": "separate" }
+    },
+    {
+      "caseId": "unsafe-finding-projection",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "unsafe_projection" },
+      "expected": { "localDecision": "error", "findingCount": 0, "phase": "not_applicable", "resultCategory": "not_applicable", "customerClaim": "none", "privacyProjection": "reject", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "monitoring-off",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "monitoring_off" },
+      "expected": { "localDecision": "off", "findingCount": 0, "phase": "not_applicable", "resultCategory": "not_applicable", "customerClaim": "none", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    },
+    {
+      "caseId": "unsupported-host-route",
+      "ruleId": "all_approved_rules",
+      "input": { "kind": "shared_safety", "scenario": "unsupported_route" },
+      "expected": { "localDecision": "unavailable", "findingCount": 0, "phase": "unavailable", "resultCategory": "unavailable", "customerClaim": "unavailable", "privacyProjection": "safe_metadata_only", "tenantIsolation": "not_applicable" }
+    }
+  ]
+}
