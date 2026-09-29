@@ -7,6 +7,7 @@
 use crate::api::client::ApiContext;
 use crate::error::GitAiError;
 use crate::metrics::delivery::EvidenceDeliveryBinding;
+use crate::metrics::delivery::MetricDeliveryRuntime;
 use crate::security::delivery_queue::{
     QueuedSecurityFinding, SecurityFindingFailureClass, SecurityFindingQueue,
     SecurityFindingTerminalClass,
@@ -176,4 +177,24 @@ where
         result.terminal += terminal_ids.len();
     }
     Ok(result)
+}
+
+pub fn flush_security_findings(
+    queue: &mut SecurityFindingQueue,
+    runtime: &MetricDeliveryRuntime,
+    now: u64,
+    limit: usize,
+) -> Result<SecurityFindingFlushResult, GitAiError> {
+    flush_security_findings_with(
+        queue,
+        now,
+        limit,
+        |binding| {
+            runtime
+                .credential_for_evidence_binding(binding)
+                .ok()
+                .map(str::to_string)
+        },
+        upload_security_findings,
+    )
 }
