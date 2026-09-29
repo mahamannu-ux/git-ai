@@ -158,3 +158,76 @@ fn partial_acknowledgement_delivers_success_and_retries_only_failure() {
     assert_eq!(retry[0].id, records[1].id);
     assert_eq!(retry[0].attempts, 1);
 }
+
+#[test]
+fn repeated_delivery_id_is_queued_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
+    let safe_batch = batch("replay");
+    let route = binding("tenant-replay", "repository-replay", "key-replay");
+
+    let first = queue
+        .enqueue(&safe_batch, &route, 1_700_000_000)
+        .unwrap();
+    let replay = queue
+        .enqueue(&safe_batch, &route, 1_700_000_001)
+        .unwrap();
+
+    assert_eq!(first, replay);
+    assert_eq!(
+        queue.dequeue_pending(10, 1_700_000_002).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn abandoned_processing_lock_is_recovered_after_bounded_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
+    let route = binding("tenant-a", "repository-a", "key-a");
+    queue
+        .enqueue(&batch_for("lock", "repository-a"), &route, 1_700_000_000)
+        .unwrap();
+
+    let first = queue.dequeue_pending(1, 1_700_000_001).unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(
+        queue
+            .dequeue_pending(1, 1_700_000_600)
+            .unwrap()
+            .is_empty()
+    );
+    let recovered = queue.dequeue_pending(1, 1_700_000_601).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, first[0].id);
+}
+
+#[test]
+fn retry_limit_stops_an_endless_delivery_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&path).unwrap();
+    let route = binding("tenant-a", "repository-a", "key-a");
+    queue
+        .enqueue(&batch_for("retry-limit", "repository-a"), &route, 1_700_000_000)
+        .unwrap();
+
+    let mut now = 1_700_000_000;
+    for attempt in 0..6 {
+        let records = queue.dequeue_pending(1, now).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].attempts, attempt);
+        queue
+            .mark_failed(
+                &[records[0].id],
+                SecurityFindingFailureClass::ServerUnavailable,
+                now,
+            )
+            .unwrap();
+        now += 60 * (1_u64 << attempt.min(5));
+    }
+
+    assert!(queue.dequeue_pending(1, u64::MAX / 2).unwrap().is_empty());
+}
