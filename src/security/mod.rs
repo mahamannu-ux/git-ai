@@ -379,10 +379,7 @@ fn split_posix_pipeline(command: &str) -> Option<Vec<&str>> {
 }
 
 fn executable_name(token: &str) -> &str {
-    token
-        .rsplit(|character| matches!(character, '/' | '\\'))
-        .next()
-        .unwrap_or(token)
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
 fn evaluate_windows_delete(mode: MonitorMode, dialect: ShellDialect, command: &str) -> Evaluation {
