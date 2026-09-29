@@ -5893,7 +5893,11 @@ fn daemon_debug_logging_does_not_reupload_ureq_logs() {
     repo.git_ai(&["await", "--timeout", "10"])
         .expect("initial daemon log flush should succeed");
 
-    let first_upload_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Under the normal 12-thread daemon_mode suite, daemon startup and the
+    // asynchronous log worker can take longer than two seconds to reach the
+    // mock server. Poll for the same bounded interval used by `await` so this
+    // test measures log filtering rather than host scheduling latency.
+    let first_upload_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
     while std::time::Instant::now() < first_upload_deadline {
         requests.extend(mock_api.collect_requests());
@@ -5925,7 +5929,11 @@ fn daemon_debug_logging_does_not_reupload_ureq_logs() {
 
     assert!(
         !uploaded_targets.is_empty(),
-        "expected the daemon to upload its startup logs"
+        "expected the daemon to upload its startup logs; captured request paths: {:?}",
+        requests
+            .iter()
+            .filter_map(|request| request["path"].as_str())
+            .collect::<Vec<_>>()
     );
     assert!(
         uploaded_targets
