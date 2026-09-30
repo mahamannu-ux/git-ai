@@ -365,7 +365,7 @@ pub fn submit_activated_command_with<Send>(
 where
     Send: FnMut(ControlRequest) -> Result<ControlResponse, String>,
 {
-    let mode = query_daemon_security_monitor_mode_with(repository_url, |request| send(request));
+    let mode = query_daemon_security_monitor_mode_with(repository_url, &mut send);
     let Some(request) = evaluate_activated_command_with(
         repository_url,
         session_id,

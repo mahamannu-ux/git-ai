@@ -198,3 +198,21 @@ pub fn flush_security_findings(
         upload_security_findings,
     )
 }
+
+pub fn flush_configured_security_findings(
+    now: u64,
+    limit: usize,
+) -> Result<SecurityFindingFlushResult, GitAiError> {
+    let Some(runtime) = MetricDeliveryRuntime::load_optional_default()
+        .map_err(|error| GitAiError::Generic(error.to_string()))?
+    else {
+        return Ok(SecurityFindingFlushResult::default());
+    };
+    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths()?;
+    let queue_path = daemon_config.internal_dir.join("security-findings.db");
+    if !queue_path.try_exists()? {
+        return Ok(SecurityFindingFlushResult::default());
+    }
+    let mut queue = SecurityFindingQueue::open_at_path(&queue_path)?;
+    flush_security_findings(&mut queue, &runtime, now, limit)
+}

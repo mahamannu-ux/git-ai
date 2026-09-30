@@ -237,7 +237,7 @@ fn daemon_schedules_activation_refresh_outside_the_git_event_path() {
 
     let worker = std::fs::read_to_string("src/daemon/telemetry_worker.rs").unwrap();
     assert!(worker.contains("spawn_security_activation_refresh_worker();"));
-    assert!(worker.contains("spawn_blocking(refresh_configured_security_activations)"));
+    assert!(worker.contains("refresh_configured_security_activations();"));
     assert!(worker.contains("flush_configured_security_findings"));
 }
 

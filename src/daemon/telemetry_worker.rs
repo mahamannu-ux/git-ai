@@ -28,6 +28,7 @@ use crate::metrics::types::MetricEventId;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use crate::security::activation::refresh_configured_security_activations;
+use crate::security::delivery::flush_configured_security_findings;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -474,8 +475,15 @@ fn spawn_security_activation_refresh_worker() {
 
     tokio::spawn(async {
         loop {
-            if let Err(error) =
-                tokio::task::spawn_blocking(refresh_configured_security_activations).await
+            if let Err(error) = tokio::task::spawn_blocking(|| {
+                refresh_configured_security_activations();
+                if let Err(error) =
+                    flush_configured_security_findings(chrono::Utc::now().timestamp() as u64, 100)
+                {
+                    tracing::warn!(%error, "security finding delivery failed");
+                }
+            })
+            .await
             {
                 tracing::warn!(%error, "security activation refresh task failed");
             }
