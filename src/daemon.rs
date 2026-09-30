@@ -6979,7 +6979,19 @@ impl ActorDaemonCoordinator {
                     &candidate,
                     chrono::Utc::now().timestamp() as u64,
                 )
-                .map(|_| ControlResponse::ok(None, None))
+                .map(|_| {
+                    std::mem::drop(tokio::task::spawn_blocking(|| {
+                        if let Err(error) =
+                            crate::security::delivery::flush_configured_security_findings(
+                                chrono::Utc::now().timestamp() as u64,
+                                100,
+                            )
+                        {
+                            tracing::warn!(%error, "security finding delivery failed");
+                        }
+                    }));
+                    ControlResponse::ok(None, None)
+                })
             }
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
