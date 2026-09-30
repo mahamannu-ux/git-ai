@@ -17,7 +17,7 @@ fn context(base_url: String) -> ApiContext {
 #[test]
 fn activation_cache_starts_off_and_expires_without_persistence() {
     let mut cache = SecurityActivationCache::default();
-    assert_eq!(cache.mode_at(1_780_137_200), MonitorMode::Off);
+    assert_eq!(cache.mode_at(1_790_762_400), MonitorMode::Off);
 
     cache
         .replace_from_json(
@@ -29,18 +29,21 @@ fn activation_cache_starts_off_and_expires_without_persistence() {
                 "refreshAfter":"2026-09-30T10:01:00Z",
                 "expiresAt":"2026-09-30T10:05:00Z"
             }"#,
-            1_780_137_200,
+            1_790_762_400,
         )
         .unwrap();
 
-    assert_eq!(cache.mode_at(1_780_137_201), MonitorMode::Monitor);
-    assert_eq!(cache.mode_at(1_780_137_500), MonitorMode::Off);
-    assert_eq!(SecurityActivationCache::default().mode_at(1_780_137_201), MonitorMode::Off);
+    assert_eq!(cache.mode_at(1_790_762_401), MonitorMode::Monitor);
+    assert_eq!(cache.mode_at(1_790_762_700), MonitorMode::Off);
+    assert_eq!(
+        SecurityActivationCache::default().mode_at(1_790_762_401),
+        MonitorMode::Off
+    );
 }
 
 #[test]
 fn activation_cache_rejects_invalid_or_stale_server_values() {
-    let now = 1_780_137_200;
+    let now = 1_790_762_400;
     for raw in [
         r#"{"schemaVersion":"unknown","mode":"monitor","version":1,"issuedAt":"2026-09-30T10:00:00Z","refreshAfter":"2026-09-30T10:01:00Z","expiresAt":"2026-09-30T10:05:00Z"}"#,
         r#"{"schemaVersion":"trackai.security-activation/0.1","mode":"monitor","version":1,"issuedAt":"2026-09-30T10:00:00Z","refreshAfter":"2026-09-30T10:01:00Z","expiresAt":"2026-09-30T10:00:00Z"}"#,
@@ -72,7 +75,7 @@ fn activation_http_fetch_uses_managed_credential_and_safe_endpoint() {
 
 #[test]
 fn refresh_failure_clears_an_existing_monitor_value() {
-    let now = 1_780_137_200;
+    let now = 1_790_762_400;
     let mut cache = SecurityActivationCache::default();
     cache
         .replace_from_json(

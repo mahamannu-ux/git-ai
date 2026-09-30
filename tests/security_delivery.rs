@@ -191,7 +191,11 @@ fn http_uploader_does_not_copy_server_body_into_error() {
 
     mock.assert();
     assert!(error.to_string().contains("HTTP 503"));
-    assert!(!error.to_string().contains("raw-server-secret-must-not-be-retained"));
+    assert!(
+        !error
+            .to_string()
+            .contains("raw-server-secret-must-not-be-retained")
+    );
 }
 
 #[cfg(unix)]
@@ -215,7 +219,9 @@ fn reopened_queue_flushes_through_exact_runtime_binding() {
     };
     {
         let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
-        queue.enqueue(&batch("restart"), &binding, 1_700_000_000).unwrap();
+        queue
+            .enqueue(&batch("restart"), &binding, 1_700_000_000)
+            .unwrap();
     }
     std::fs::write(
         &policy_path,
@@ -228,20 +234,23 @@ fn reopened_queue_flushes_through_exact_runtime_binding() {
                 "api_base_url": binding.api_base_url,
                 "credential_key_id": key_id,
             }],
-        }).to_string(),
-    ).unwrap();
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(
         &keyring_path,
         serde_json::json!({ "version": 1, "credentials": [credential] }).to_string(),
-    ).unwrap();
-    std::fs::set_permissions(
-        &keyring_path,
-        std::fs::Permissions::from_mode(0o600),
-    ).unwrap();
+    )
+    .unwrap();
+    std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let runtime = MetricDeliveryRuntime::load_from_paths(&policy_path, &keyring_path).unwrap();
     let mock = server
         .mock("POST", "/worker/security/findings")
-        .match_header("x-api-key", mockito::Matcher::Regex("^trk_v1\\.".to_string()))
+        .match_header(
+            "x-api-key",
+            mockito::Matcher::Regex("^trk_v1\\.".to_string()),
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"errors":[]}"#)
@@ -254,7 +263,12 @@ fn reopened_queue_flushes_through_exact_runtime_binding() {
     assert_eq!(result.delivered, 1);
     assert_eq!(result.terminal, 0);
     assert_eq!(result.retrying, 0);
-    assert!(reopened.dequeue_pending(10, 1_800_000_000).unwrap().is_empty());
+    assert!(
+        reopened
+            .dequeue_pending(10, 1_800_000_000)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
@@ -274,13 +288,16 @@ fn process_restart_helper() {
     match action.as_str() {
         "enqueue" => {
             let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
-            queue.enqueue(&batch("process-restart"), &binding, 1_700_000_000).unwrap();
+            queue
+                .enqueue(&batch("process-restart"), &binding, 1_700_000_000)
+                .unwrap();
         }
         "flush" => {
             let runtime = MetricDeliveryRuntime::load_from_paths(
                 std::path::Path::new(&std::env::var("TASK6_POLICY_PATH").unwrap()),
                 std::path::Path::new(&std::env::var("TASK6_KEYRING_PATH").unwrap()),
-            ).unwrap();
+            )
+            .unwrap();
             let mut queue = SecurityFindingQueue::open_at_path(&queue_path).unwrap();
             let result = flush_security_findings(&mut queue, &runtime, 1_700_000_001, 10).unwrap();
             assert_eq!(result.delivered, 1);
@@ -313,16 +330,16 @@ fn separate_process_restart_delivers_queued_finding() {
                 "api_base_url": server.url(),
                 "credential_key_id": key_id,
             }],
-        }).to_string(),
-    ).unwrap();
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(
         &keyring_path,
         serde_json::json!({ "version": 1, "credentials": [credential] }).to_string(),
-    ).unwrap();
-    std::fs::set_permissions(
-        &keyring_path,
-        std::fs::Permissions::from_mode(0o600),
-    ).unwrap();
+    )
+    .unwrap();
+    std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let mock = server
         .mock("POST", "/worker/security/findings")
         .with_status(200)
@@ -342,10 +359,22 @@ fn separate_process_restart_delivers_queued_finding() {
     };
     let mut enqueue = Command::new(&test_executable);
     common(&mut enqueue);
-    assert!(enqueue.env("TASK6_PROCESS_RESTART_ACTION", "enqueue").status().unwrap().success());
+    assert!(
+        enqueue
+            .env("TASK6_PROCESS_RESTART_ACTION", "enqueue")
+            .status()
+            .unwrap()
+            .success()
+    );
     let mut flush = Command::new(&test_executable);
     common(&mut flush);
-    assert!(flush.env("TASK6_PROCESS_RESTART_ACTION", "flush").status().unwrap().success());
+    assert!(
+        flush
+            .env("TASK6_PROCESS_RESTART_ACTION", "flush")
+            .status()
+            .unwrap()
+            .success()
+    );
 
     mock.assert();
 }
