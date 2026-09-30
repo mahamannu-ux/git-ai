@@ -25,6 +25,17 @@ pub enum ControlRequest {
     FlushNotes,
     #[serde(rename = "security.activation.query")]
     SecurityActivationQuery { repository_url: String },
+    #[serde(rename = "security.finding.submit")]
+    SubmitSecurityFinding {
+        repository_url: String,
+        session_id: String,
+        source_event_id: String,
+        rule_id: String,
+        rule_version: String,
+        severity: String,
+        operating_system: String,
+        occurred_at: String,
+    },
     #[serde(rename = "snapshot.watermarks")]
     SnapshotWatermarks { repo_working_dir: String },
     #[serde(rename = "bash_session.start")]

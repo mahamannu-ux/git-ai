@@ -8,7 +8,7 @@ use crate::api::client::ApiContext;
 use crate::daemon::control_api::{ControlRequest, ControlResponse};
 use crate::error::GitAiError;
 use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
-use crate::security::MonitorMode;
+use crate::security::{ExecutionContext, MonitorMode, ShellDialect, evaluate_command};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -287,6 +287,78 @@ where
     {
         Some("monitor") => MonitorMode::Monitor,
         _ => MonitorMode::Off,
+    }
+}
+
+pub fn evaluate_activated_command_with<Query>(
+    repository_url: &str,
+    session_id: &str,
+    source_event_id: &str,
+    command: &str,
+    occurred_at: i64,
+    query_mode: Query,
+) -> Option<ControlRequest>
+where
+    Query: FnOnce(&str) -> MonitorMode,
+{
+    let repository_url = crate::repo_url::normalize_repo_url(repository_url).ok()?;
+    if !bounded_identity(session_id) || !bounded_identity(source_event_id) {
+        return None;
+    }
+    let mode = query_mode(&repository_url);
+    let finding = evaluate_command(
+        mode,
+        host_shell_dialect(),
+        ExecutionContext::ParsedCommand,
+        command,
+    )
+    .finding?;
+    let occurred_at = DateTime::<Utc>::from_timestamp(occurred_at, 0)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    Some(ControlRequest::SubmitSecurityFinding {
+        repository_url,
+        session_id: session_id.to_string(),
+        source_event_id: source_event_id.to_string(),
+        rule_id: finding.rule_id.to_string(),
+        rule_version: finding.rule_version.to_string(),
+        severity: finding.severity.to_string(),
+        operating_system: host_operating_system().to_string(),
+        occurred_at,
+    })
+}
+
+fn bounded_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128
+}
+
+fn host_shell_dialect() -> ShellDialect {
+    #[cfg(windows)]
+    {
+        ShellDialect::Unavailable
+    }
+    #[cfg(not(windows))]
+    {
+        ShellDialect::Posix
+    }
+}
+
+fn host_operating_system() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux"
+    }
+    #[cfg(windows)]
+    {
+        "windows"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        "unavailable"
     }
 }
 

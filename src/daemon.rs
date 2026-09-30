@@ -6974,6 +6974,9 @@ impl ActorDaemonCoordinator {
                 };
                 Ok(ControlResponse::ok(None, Some(json!({ "mode": mode }))))
             }
+            ControlRequest::SubmitSecurityFinding { .. } => Err(GitAiError::Generic(
+                "security finding submission is not connected".to_string(),
+            )),
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
                 serde_json::to_value(result)

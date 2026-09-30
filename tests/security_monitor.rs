@@ -1,4 +1,5 @@
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
+use git_ai::security::activation::evaluate_activated_command_with;
 use git_ai::security::{
     DeleteInput, DownloadPipelineInput, DownloadSource, EvaluationInput, ExecutedProgramClass,
     ExecutionContext, FindingOperatingSystem, FindingUploadContext, InterpreterClass,
@@ -6,7 +7,6 @@ use git_ai::security::{
     ReverseShellInput, SecurityFindingUploadBatch, ShellDialect, TargetClass, TargetExpansion,
     TransportClass, evaluate, evaluate_command,
 };
-use git_ai::security::activation::evaluate_activated_command_with;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashSet;
