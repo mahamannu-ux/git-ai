@@ -1,7 +1,8 @@
-use git_ai::metrics::delivery::EvidenceDeliveryBinding;
 use git_ai::daemon::control_api::ControlRequest;
+use git_ai::metrics::delivery::EvidenceDeliveryBinding;
 use git_ai::security::activation::{
-    evaluate_activated_command_with, project_security_finding_candidate,
+    admit_security_finding_candidate_with, evaluate_activated_command_with,
+    project_security_finding_candidate,
 };
 use git_ai::security::delivery_queue::{SecurityFindingFailureClass, SecurityFindingQueue};
 use git_ai::security::{
@@ -168,9 +169,34 @@ fn daemon_projects_only_approved_candidate_into_exact_repository_queue() {
     altered.severity = "critical".to_string();
     assert!(project_security_finding_candidate(&altered, &route).is_err());
 
-    let mut crossed = candidate;
+    let mut crossed = candidate.clone();
     crossed.repository_url = "https://github.com/example/repository-b".to_string();
     assert!(project_security_finding_candidate(&crossed, &route).is_err());
+
+    let admitted = admit_security_finding_candidate_with(
+        &candidate,
+        1_790_762_401,
+        |_, _| MonitorMode::Monitor,
+        |_| Ok(route.clone()),
+        |batch, binding, queued_at| {
+            assert_eq!(binding, &route);
+            assert_eq!(queued_at, 1_790_762_401);
+            assert!(!serde_json::to_string(batch).unwrap().contains("secret"));
+            Ok(())
+        },
+    );
+    assert!(admitted.is_ok());
+
+    assert!(
+        admit_security_finding_candidate_with(
+            &candidate,
+            1_790_762_401,
+            |_, _| MonitorMode::Off,
+            |_| panic!("off mode must not resolve a binding"),
+            |_, _, _| panic!("off mode must not enqueue"),
+        )
+        .is_err()
+    );
 }
 
 #[test]
