@@ -6,9 +6,11 @@
 
 use crate::api::client::ApiContext;
 use crate::error::GitAiError;
+use crate::metrics::delivery::MetricDeliveryHealthBinding;
 use crate::security::MonitorMode;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 
 const ACTIVATION_SCHEMA: &str = "trackai.security-activation/0.1";
 const MAX_LEASE_SECONDS: i64 = 300;
@@ -112,6 +114,65 @@ impl SecurityActivationCache {
     fn clear(&mut self) {
         self.lease = None;
     }
+
+    fn refresh_due_at(&self, now: i64) -> bool {
+        self.lease
+            .as_ref()
+            .is_none_or(|lease| !lease.is_fresh_at(now) || lease.refresh_after.timestamp() <= now)
+    }
+}
+
+type ActivationRouteKey = (String, String, String);
+
+#[derive(Debug, Default)]
+pub struct SecurityActivationRegistry {
+    routes: BTreeMap<ActivationRouteKey, SecurityActivationCache>,
+}
+
+impl SecurityActivationRegistry {
+    pub fn mode_for(&self, binding: &MetricDeliveryHealthBinding, now: i64) -> MonitorMode {
+        self.routes
+            .get(&activation_route_key(binding))
+            .map_or(MonitorMode::Off, |cache| cache.mode_at(now))
+    }
+
+    pub fn refresh_due_for(&self, binding: &MetricDeliveryHealthBinding, now: i64) -> bool {
+        self.routes
+            .get(&activation_route_key(binding))
+            .is_none_or(|cache| cache.refresh_due_at(now))
+    }
+
+    pub fn replace_from_json(
+        &mut self,
+        binding: &MetricDeliveryHealthBinding,
+        raw: &str,
+        now: i64,
+    ) -> Result<(), GitAiError> {
+        let key = activation_route_key(binding);
+        let cache = self.routes.entry(key).or_default();
+        cache.clear();
+        cache.replace_from_json(raw, now)
+    }
+
+    pub fn retain_routes<'a>(
+        &mut self,
+        bindings: impl IntoIterator<Item = &'a MetricDeliveryHealthBinding>,
+    ) {
+        let retained = bindings
+            .into_iter()
+            .map(activation_route_key)
+            .collect::<BTreeSet<_>>();
+        self.routes.retain(|key, _| retained.contains(key));
+    }
+
+}
+
+fn activation_route_key(binding: &MetricDeliveryHealthBinding) -> ActivationRouteKey {
+    (
+        binding.tenant_id.clone(),
+        binding.api_base_url.clone(),
+        binding.credential_key_id.clone(),
+    )
 }
 
 pub fn fetch_security_activation(
