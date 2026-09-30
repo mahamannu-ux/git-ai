@@ -6962,6 +6962,18 @@ impl ActorDaemonCoordinator {
                 });
                 Ok(ControlResponse::ok(None, None))
             }
+            ControlRequest::SecurityActivationQuery { repository_url } => {
+                let mode =
+                    crate::security::activation::configured_security_monitor_mode_for_repository(
+                        &repository_url,
+                        chrono::Utc::now().timestamp(),
+                    );
+                let mode = match mode {
+                    crate::security::MonitorMode::Off => "off",
+                    crate::security::MonitorMode::Monitor => "monitor",
+                };
+                Ok(ControlResponse::ok(None, Some(json!({ "mode": mode }))))
+            }
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
                 serde_json::to_value(result)

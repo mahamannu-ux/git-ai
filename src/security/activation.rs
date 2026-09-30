@@ -5,6 +5,7 @@
 //! malformed, expired, or failed refresh returns the cache to off.
 
 use crate::api::client::ApiContext;
+use crate::daemon::control_api::{ControlRequest, ControlResponse};
 use crate::error::GitAiError;
 use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
 use crate::security::MonitorMode;
@@ -243,6 +244,50 @@ pub fn configured_security_monitor_mode(
     configured_security_activations()
         .read()
         .map_or(MonitorMode::Off, |registry| registry.mode_for(binding, now))
+}
+
+pub fn configured_security_monitor_mode_for_repository(
+    repository_url: &str,
+    now: i64,
+) -> MonitorMode {
+    configured_security_activations()
+        .read()
+        .map_or(MonitorMode::Off, |registry| {
+            registry.mode_for_repository(repository_url, now)
+        })
+}
+
+pub fn query_daemon_security_monitor_mode(repository_url: &str) -> MonitorMode {
+    query_daemon_security_monitor_mode_with(repository_url, |request| {
+        crate::daemon::telemetry_handle::send_via_daemon(&request)
+    })
+}
+
+pub fn query_daemon_security_monitor_mode_with<Send>(
+    repository_url: &str,
+    send: Send,
+) -> MonitorMode
+where
+    Send: FnOnce(ControlRequest) -> Result<ControlResponse, String>,
+{
+    let request = ControlRequest::SecurityActivationQuery {
+        repository_url: repository_url.to_string(),
+    };
+    let Ok(response) = send(request) else {
+        return MonitorMode::Off;
+    };
+    if !response.ok {
+        return MonitorMode::Off;
+    }
+    match response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("mode"))
+        .and_then(|mode| mode.as_str())
+    {
+        Some("monitor") => MonitorMode::Monitor,
+        _ => MonitorMode::Off,
+    }
 }
 
 pub fn refresh_configured_security_activations() {
