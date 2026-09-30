@@ -128,6 +128,7 @@ type ActivationRouteKey = (String, String, String);
 #[derive(Debug, Default)]
 pub struct SecurityActivationRegistry {
     routes: BTreeMap<ActivationRouteKey, SecurityActivationCache>,
+    repositories: BTreeMap<String, ActivationRouteKey>,
 }
 
 impl SecurityActivationRegistry {
@@ -135,6 +136,30 @@ impl SecurityActivationRegistry {
         self.routes
             .get(&activation_route_key(binding))
             .map_or(MonitorMode::Off, |cache| cache.mode_at(now))
+    }
+
+    pub fn mode_for_repository(&self, repository_url: &str, now: i64) -> MonitorMode {
+        let Ok(repository_url) = crate::repo_url::normalize_repo_url(repository_url) else {
+            return MonitorMode::Off;
+        };
+        self.repositories
+            .get(&repository_url)
+            .and_then(|key| self.routes.get(key))
+            .map_or(MonitorMode::Off, |cache| cache.mode_at(now))
+    }
+
+    pub fn replace_repository_bindings(
+        &mut self,
+        bindings: impl IntoIterator<Item = (String, MetricDeliveryHealthBinding)>,
+    ) {
+        self.repositories = bindings
+            .into_iter()
+            .filter_map(|(repository_url, binding)| {
+                crate::repo_url::normalize_repo_url(&repository_url)
+                    .ok()
+                    .map(|repository_url| (repository_url, activation_route_key(&binding)))
+            })
+            .collect();
     }
 
     pub fn refresh_due_for(&self, binding: &MetricDeliveryHealthBinding, now: i64) -> bool {
@@ -164,6 +189,7 @@ impl SecurityActivationRegistry {
             .map(activation_route_key)
             .collect::<BTreeSet<_>>();
         self.routes.retain(|key, _| retained.contains(key));
+        self.repositories.retain(|_, key| retained.contains(key));
     }
 
     pub fn prepare_refresh(
@@ -198,6 +224,7 @@ impl SecurityActivationRegistry {
 
     fn clear(&mut self) {
         self.routes.clear();
+        self.repositories.clear();
     }
 }
 
