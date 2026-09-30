@@ -116,9 +116,31 @@ fn activation_registry_keeps_company_routes_separate() {
             now,
         )
         .unwrap();
+    registry.replace_repository_bindings([
+        (
+            "https://github.com/example/company-a".to_string(),
+            company_a.clone(),
+        ),
+        (
+            "https://github.com/example/company-b".to_string(),
+            company_b.clone(),
+        ),
+    ]);
 
     assert_eq!(registry.mode_for(&company_a, now), MonitorMode::Monitor);
     assert_eq!(registry.mode_for(&company_b, now), MonitorMode::Off);
+    assert_eq!(
+        registry.mode_for_repository("git@github.com:example/company-a.git", now),
+        MonitorMode::Monitor
+    );
+    assert_eq!(
+        registry.mode_for_repository("https://github.com/example/company-b", now),
+        MonitorMode::Off
+    );
+    assert_eq!(
+        registry.mode_for_repository("not-a-repository", now),
+        MonitorMode::Off
+    );
     assert!(!registry.refresh_due_for(&company_a, now + 59));
     assert!(registry.refresh_due_for(&company_a, now + 60));
 
