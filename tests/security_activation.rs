@@ -178,11 +178,20 @@ fn background_refresh_uses_exact_task4_route_and_fails_offline_to_off() {
     let registry = RwLock::new(SecurityActivationRegistry::default());
 
     refresh_security_activations(&registry, &runtime, now);
-    assert_eq!(registry.read().unwrap().mode_for(&binding, now), MonitorMode::Monitor);
+    assert_eq!(
+        registry.read().unwrap().mode_for(&binding, now),
+        MonitorMode::Monitor
+    );
     refresh_security_activations(&registry, &runtime, now + 30);
-    assert_eq!(registry.read().unwrap().mode_for(&binding, now + 30), MonitorMode::Monitor);
-    refresh_security_activations(&registry, &runtime, now + 60);
-    assert_eq!(registry.read().unwrap().mode_for(&binding, now + 60), MonitorMode::Off);
-
+    assert_eq!(
+        registry.read().unwrap().mode_for(&binding, now + 30),
+        MonitorMode::Monitor
+    );
     mock.assert();
+    mock.remove();
+    refresh_security_activations(&registry, &runtime, now + 60);
+    assert_eq!(
+        registry.read().unwrap().mode_for(&binding, now + 60),
+        MonitorMode::Off
+    );
 }

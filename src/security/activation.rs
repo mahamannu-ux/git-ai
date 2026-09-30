@@ -6,11 +6,12 @@
 
 use crate::api::client::ApiContext;
 use crate::error::GitAiError;
-use crate::metrics::delivery::MetricDeliveryHealthBinding;
+use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
 use crate::security::MonitorMode;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
 
 const ACTIVATION_SCHEMA: &str = "trackai.security-activation/0.1";
 const MAX_LEASE_SECONDS: i64 = 300;
@@ -181,6 +182,19 @@ impl SecurityActivationRegistry {
         }
         due
     }
+
+    fn replace(
+        &mut self,
+        binding: &MetricDeliveryHealthBinding,
+        lease: SecurityActivationLease,
+        now: i64,
+    ) -> Result<(), GitAiError> {
+        let cache = self
+            .routes
+            .entry(activation_route_key(binding))
+            .or_default();
+        cache.replace(lease, now)
+    }
 }
 
 fn activation_route_key(binding: &MetricDeliveryHealthBinding) -> ActivationRouteKey {
@@ -216,6 +230,37 @@ where
     cache.clear();
     let lease = fetch()?;
     cache.replace(lease, now)
+}
+
+pub fn refresh_security_activations(
+    registry: &RwLock<SecurityActivationRegistry>,
+    runtime: &MetricDeliveryRuntime,
+    now: i64,
+) {
+    let bindings = runtime.health_bindings();
+    let due = match registry.write() {
+        Ok(mut registry) => registry.prepare_refresh(bindings, now),
+        Err(_) => return,
+    };
+
+    for binding in due {
+        let Ok(credential) = runtime.credential_for_health_binding(&binding) else {
+            continue;
+        };
+        let context = ApiContext {
+            base_url: binding.api_base_url.clone(),
+            auth_token: None,
+            api_key: Some(credential.to_string()),
+            author_identity: None,
+            timeout_secs: Some(5),
+        };
+        let Ok(lease) = fetch_security_activation(&context) else {
+            continue;
+        };
+        if let Ok(mut registry) = registry.write() {
+            let _ = registry.replace(&binding, lease, now);
+        }
+    }
 }
 
 fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, GitAiError> {
