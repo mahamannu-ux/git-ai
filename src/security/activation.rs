@@ -300,8 +300,12 @@ pub fn refresh_security_activations(
     now: i64,
 ) {
     let bindings = runtime.health_bindings();
+    let repository_bindings = runtime.security_activation_bindings();
     let due = match registry.write() {
-        Ok(mut registry) => registry.prepare_refresh(bindings, now),
+        Ok(mut registry) => {
+            registry.replace_repository_bindings(repository_bindings);
+            registry.prepare_refresh(bindings, now)
+        }
         Err(_) => return,
     };
 

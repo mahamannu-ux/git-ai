@@ -347,6 +347,23 @@ impl DeliveryPolicyCache {
         bindings.into_values().collect()
     }
 
+    fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
+        self.repositories
+            .values()
+            .filter(|entry| entry.repository_id.is_some())
+            .map(|entry| {
+                (
+                    entry.repository_url.clone(),
+                    MetricDeliveryHealthBinding {
+                        tenant_id: entry.tenant_id.clone(),
+                        api_base_url: entry.api_base_url.clone(),
+                        credential_key_id: entry.credential_key_id.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     pub fn resolve_evidence_repository(
         &self,
         raw_repository: &str,
@@ -472,6 +489,10 @@ impl MetricDeliveryRuntime {
 
     pub fn health_bindings(&self) -> Vec<MetricDeliveryHealthBinding> {
         self.policy.health_bindings()
+    }
+
+    pub fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
+        self.policy.security_activation_bindings()
     }
 
     pub fn bind_evidence_repository(
