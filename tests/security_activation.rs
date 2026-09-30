@@ -121,6 +121,14 @@ fn activation_registry_keeps_company_routes_separate() {
     assert!(!registry.refresh_due_for(&company_a, now + 59));
     assert!(registry.refresh_due_for(&company_a, now + 60));
 
+    let due = registry.prepare_refresh(
+        [company_a.clone(), company_b.clone()],
+        now + 60,
+    );
+    assert_eq!(due, vec![company_a.clone(), company_b.clone()]);
+    assert_eq!(registry.mode_for(&company_a, now + 60), MonitorMode::Off);
+    assert_eq!(registry.mode_for(&company_b, now + 60), MonitorMode::Off);
+
     registry.retain_routes([&company_b]);
     assert_eq!(registry.mode_for(&company_a, now + 1), MonitorMode::Off);
 }
