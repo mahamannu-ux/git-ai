@@ -726,7 +726,7 @@ fn task6_opencode_monitor_delivers_safe_finding_end_to_end() {
         "version": 1,
         "issuedAt": (now - ChronoDuration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
         "refreshAfter": (now + ChronoDuration::seconds(60)).to_rfc3339_opts(SecondsFormat::Secs, true),
-        "expiresAt": (now + ChronoDuration::seconds(300)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        "expiresAt": (now + ChronoDuration::seconds(299)).to_rfc3339_opts(SecondsFormat::Secs, true),
     });
     let activation_mock = server
         .mock("GET", "/worker/security/activation")
