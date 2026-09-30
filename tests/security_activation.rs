@@ -1,7 +1,9 @@
 use git_ai::api::ApiContext;
+use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
 use git_ai::security::MonitorMode;
 use git_ai::security::activation::{
-    SecurityActivationCache, fetch_security_activation, refresh_security_activation_with,
+    SecurityActivationCache, SecurityActivationRegistry, fetch_security_activation,
+    refresh_security_activation_with,
 };
 
 fn context(base_url: String) -> ApiContext {
@@ -11,6 +13,14 @@ fn context(base_url: String) -> ApiContext {
         api_key: Some("managed-machine-secret".to_string()),
         author_identity: None,
         timeout_secs: Some(5),
+    }
+}
+
+fn binding(tenant_id: &str, credential_key_id: &str) -> MetricDeliveryHealthBinding {
+    MetricDeliveryHealthBinding {
+        tenant_id: tenant_id.to_string(),
+        api_base_url: "https://trackai.example".to_string(),
+        credential_key_id: credential_key_id.to_string(),
     }
 }
 
@@ -90,4 +100,27 @@ fn refresh_failure_clears_an_existing_monitor_value() {
 
     assert!(result.is_err());
     assert_eq!(cache.mode_at(now + 30), MonitorMode::Off);
+}
+
+#[test]
+fn activation_registry_keeps_company_routes_separate() {
+    let now = 1_790_762_400;
+    let company_a = binding("11111111-1111-4111-8111-111111111111", "credential-a");
+    let company_b = binding("22222222-2222-4222-8222-222222222222", "credential-b");
+    let mut registry = SecurityActivationRegistry::default();
+    registry
+        .replace_from_json(
+            &company_a,
+            r#"{"schemaVersion":"trackai.security-activation/0.1","mode":"monitor","version":1,"issuedAt":"2026-09-30T10:00:00Z","refreshAfter":"2026-09-30T10:01:00Z","expiresAt":"2026-09-30T10:05:00Z"}"#,
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(registry.mode_for(&company_a, now), MonitorMode::Monitor);
+    assert_eq!(registry.mode_for(&company_b, now), MonitorMode::Off);
+    assert!(!registry.refresh_due_for(&company_a, now + 59));
+    assert!(registry.refresh_due_for(&company_a, now + 60));
+
+    registry.retain_routes([&company_b]);
+    assert_eq!(registry.mode_for(&company_a, now + 1), MonitorMode::Off);
 }
