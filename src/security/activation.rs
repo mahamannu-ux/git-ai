@@ -10,6 +10,7 @@ use crate::error::GitAiError;
 use crate::metrics::delivery::{
     EvidenceDeliveryBinding, MetricDeliveryHealthBinding, MetricDeliveryRuntime,
 };
+use crate::security::delivery_queue::SecurityFindingQueue;
 use crate::security::{
     ExecutionContext, FindingOperatingSystem, FindingUploadContext, MonitorMode, SafeFinding,
     SecurityFindingUploadBatch, ShellDialect, evaluate_command,
@@ -412,6 +413,61 @@ pub fn project_security_finding_candidate(
         },
     )
     .map_err(|_| invalid_candidate())
+}
+
+pub fn admit_security_finding_candidate_with<Mode, Resolve, Enqueue>(
+    candidate: &SecurityFindingCandidate,
+    now: u64,
+    mode_for_repository: Mode,
+    resolve_binding: Resolve,
+    enqueue: Enqueue,
+) -> Result<(), GitAiError>
+where
+    Mode: FnOnce(&str, i64) -> MonitorMode,
+    Resolve: FnOnce(&str) -> Result<EvidenceDeliveryBinding, GitAiError>,
+    Enqueue: FnOnce(
+        &SecurityFindingUploadBatch,
+        &EvidenceDeliveryBinding,
+        u64,
+    ) -> Result<(), GitAiError>,
+{
+    if mode_for_repository(&candidate.repository_url, now as i64) != MonitorMode::Monitor {
+        return Err(GitAiError::Generic(
+            "security monitoring is not active".to_string(),
+        ));
+    }
+    let binding = resolve_binding(&candidate.repository_url)?;
+    let batch = project_security_finding_candidate(candidate, &binding)?;
+    enqueue(&batch, &binding, now)
+}
+
+pub fn enqueue_configured_security_finding(
+    candidate: &SecurityFindingCandidate,
+    now: u64,
+) -> Result<(), GitAiError> {
+    if configured_security_monitor_mode_for_repository(&candidate.repository_url, now as i64)
+        != MonitorMode::Monitor
+    {
+        return Err(GitAiError::Generic(
+            "security monitoring is not active".to_string(),
+        ));
+    }
+    let runtime = MetricDeliveryRuntime::load_optional_default()
+        .map_err(|_| {
+            GitAiError::Generic("security delivery configuration unavailable".to_string())
+        })?
+        .ok_or_else(|| {
+            GitAiError::Generic("security delivery configuration unavailable".to_string())
+        })?;
+    let binding = runtime
+        .bind_evidence_repository(&candidate.repository_url)
+        .map_err(|_| GitAiError::Generic("security repository binding unavailable".to_string()))?;
+    let batch = project_security_finding_candidate(candidate, &binding)?;
+    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths()?;
+    std::fs::create_dir_all(&daemon_config.internal_dir)?;
+    let queue_path = daemon_config.internal_dir.join("security-findings.db");
+    let mut queue = SecurityFindingQueue::open_at_path(&queue_path)?;
+    queue.enqueue(&batch, &binding, now).map(|_| ())
 }
 
 fn approved_safe_finding(candidate: &SecurityFindingCandidate) -> Option<SafeFinding> {

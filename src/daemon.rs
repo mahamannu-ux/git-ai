@@ -6974,9 +6974,13 @@ impl ActorDaemonCoordinator {
                 };
                 Ok(ControlResponse::ok(None, Some(json!({ "mode": mode }))))
             }
-            ControlRequest::SubmitSecurityFinding { .. } => Err(GitAiError::Generic(
-                "security finding submission is not connected".to_string(),
-            )),
+            ControlRequest::SubmitSecurityFinding { candidate } => {
+                crate::security::activation::enqueue_configured_security_finding(
+                    &candidate,
+                    chrono::Utc::now().timestamp() as u64,
+                )
+                .map(|_| ControlResponse::ok(None, None))
+            }
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
                 serde_json::to_value(result)
