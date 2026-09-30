@@ -204,6 +204,13 @@ fn background_refresh_uses_exact_task4_route_and_fails_offline_to_off() {
         registry.read().unwrap().mode_for(&binding, now),
         MonitorMode::Monitor
     );
+    assert_eq!(
+        registry
+            .read()
+            .unwrap()
+            .mode_for_repository("git@github.com:example/repository-a.git", now),
+        MonitorMode::Monitor
+    );
     refresh_security_activations(&registry, &runtime, now + 30);
     assert_eq!(
         registry.read().unwrap().mode_for(&binding, now + 30),
