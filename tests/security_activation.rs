@@ -1,12 +1,15 @@
 use git_ai::api::ApiContext;
 use git_ai::daemon::control_api::{ControlRequest, ControlResponse};
 use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
+#[cfg(unix)]
 use git_ai::metrics::delivery::MetricDeliveryRuntime;
 use git_ai::security::MonitorMode;
+#[cfg(unix)]
+use git_ai::security::activation::refresh_security_activations;
 use git_ai::security::activation::{
     SecurityActivationCache, SecurityActivationRegistry, configured_security_monitor_mode,
     fetch_security_activation, query_daemon_security_monitor_mode_with,
-    refresh_security_activation_with, refresh_security_activations,
+    refresh_security_activation_with,
 };
 
 fn context(base_url: String) -> ApiContext {
