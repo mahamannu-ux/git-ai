@@ -429,10 +429,8 @@ fn execute_pre_bash_call(e: PreBashCall) -> Result<Vec<CheckpointRequest>, GitAi
     };
 
     let started_at_ns = crate::daemon::bash_history_db::unix_time_ns();
-    let repo_work_dir = match discover_repository_in_path_no_git_exec(e.context.cwd.as_path())
-        .and_then(|repo| repo.workdir())
-    {
-        Ok(repo_work_dir) => repo_work_dir,
+    let repository = match discover_repository_in_path_no_git_exec(e.context.cwd.as_path()) {
+        Ok(repository) => repository,
         Err(error) => {
             let error_message = error.to_string();
             bash_tool::signal_daemon_bash_hook_attempt(
@@ -453,6 +451,20 @@ fn execute_pre_bash_call(e: PreBashCall) -> Result<Vec<CheckpointRequest>, GitAi
             return Ok(vec![]);
         }
     };
+    let repo_work_dir = repository.workdir()?;
+
+    if e.context.agent_id.tool == "opencode"
+        && let Some(command) = e.command.as_deref()
+        && let Some(repository_url) = crate::repo_url::resolve_repo_url_from_repo(&repository)
+    {
+        crate::security::activation::submit_activated_command(
+            &repository_url,
+            &e.context.external_session_id,
+            &e.tool_use_id,
+            command,
+            chrono::Utc::now().timestamp(),
+        );
+    }
 
     if config::Config::get()
         .get_feature_flags()

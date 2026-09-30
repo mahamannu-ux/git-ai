@@ -626,12 +626,12 @@ fn activated_opencode_flow_queries_then_submits_without_raw_command() {
         |request| {
             captured.push(serde_json::to_string(&request).unwrap());
             match request {
-                git_ai::daemon::ControlRequest::SecurityActivationQuery { .. } => Ok(
-                    git_ai::daemon::ControlResponse::ok(
+                git_ai::daemon::ControlRequest::SecurityActivationQuery { .. } => {
+                    Ok(git_ai::daemon::ControlResponse::ok(
                         None,
                         Some(serde_json::json!({ "mode": "monitor" })),
-                    ),
-                ),
+                    ))
+                }
                 git_ai::daemon::ControlRequest::SubmitSecurityFinding { .. } => {
                     Ok(git_ai::daemon::ControlResponse::ok(None, None))
                 }

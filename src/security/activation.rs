@@ -337,6 +337,48 @@ where
     })
 }
 
+pub fn submit_activated_command(
+    repository_url: &str,
+    session_id: &str,
+    source_event_id: &str,
+    command: &str,
+    occurred_at: i64,
+) -> bool {
+    submit_activated_command_with(
+        repository_url,
+        session_id,
+        source_event_id,
+        command,
+        occurred_at,
+        |request| crate::daemon::telemetry_handle::send_via_daemon(&request),
+    )
+}
+
+pub fn submit_activated_command_with<Send>(
+    repository_url: &str,
+    session_id: &str,
+    source_event_id: &str,
+    command: &str,
+    occurred_at: i64,
+    mut send: Send,
+) -> bool
+where
+    Send: FnMut(ControlRequest) -> Result<ControlResponse, String>,
+{
+    let mode = query_daemon_security_monitor_mode_with(repository_url, |request| send(request));
+    let Some(request) = evaluate_activated_command_with(
+        repository_url,
+        session_id,
+        source_event_id,
+        command,
+        occurred_at,
+        |_| mode,
+    ) else {
+        return false;
+    };
+    send(request).is_ok_and(|response| response.ok)
+}
+
 fn bounded_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128
 }
