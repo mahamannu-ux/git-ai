@@ -6,6 +6,19 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityFindingCandidate {
+    pub repository_url: String,
+    pub session_id: String,
+    pub source_event_id: String,
+    pub rule_id: String,
+    pub rule_version: String,
+    pub severity: String,
+    pub operating_system: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum ControlRequest {
     #[serde(rename = "ping")]
@@ -26,16 +39,7 @@ pub enum ControlRequest {
     #[serde(rename = "security.activation.query")]
     SecurityActivationQuery { repository_url: String },
     #[serde(rename = "security.finding.submit")]
-    SubmitSecurityFinding {
-        repository_url: String,
-        session_id: String,
-        source_event_id: String,
-        rule_id: String,
-        rule_version: String,
-        severity: String,
-        operating_system: String,
-        occurred_at: String,
-    },
+    SubmitSecurityFinding { candidate: SecurityFindingCandidate },
     #[serde(rename = "snapshot.watermarks")]
     SnapshotWatermarks { repo_working_dir: String },
     #[serde(rename = "bash_session.start")]

@@ -5,7 +5,7 @@
 //! malformed, expired, or failed refresh returns the cache to off.
 
 use crate::api::client::ApiContext;
-use crate::daemon::control_api::{ControlRequest, ControlResponse};
+use crate::daemon::control_api::{ControlRequest, ControlResponse, SecurityFindingCandidate};
 use crate::error::GitAiError;
 use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
 use crate::security::{ExecutionContext, MonitorMode, ShellDialect, evaluate_command};
@@ -317,6 +317,7 @@ where
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     Some(ControlRequest::SubmitSecurityFinding {
+        candidate: SecurityFindingCandidate {
         repository_url,
         session_id: session_id.to_string(),
         source_event_id: source_event_id.to_string(),
@@ -325,6 +326,7 @@ where
         severity: finding.severity.to_string(),
         operating_system: host_operating_system().to_string(),
         occurred_at,
+        },
     })
 }
 
