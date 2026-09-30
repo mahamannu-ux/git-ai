@@ -1,9 +1,10 @@
 use git_ai::api::ApiContext;
 use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
+use git_ai::metrics::delivery::MetricDeliveryRuntime;
 use git_ai::security::MonitorMode;
 use git_ai::security::activation::{
     SecurityActivationCache, SecurityActivationRegistry, fetch_security_activation,
-    refresh_security_activation_with,
+    refresh_security_activation_with, refresh_security_activations,
 };
 
 fn context(base_url: String) -> ApiContext {
@@ -128,4 +129,60 @@ fn activation_registry_keeps_company_routes_separate() {
 
     registry.retain_routes([&company_b]);
     assert_eq!(registry.mode_for(&company_a, now + 1), MonitorMode::Off);
+}
+
+#[cfg(unix)]
+#[test]
+fn background_refresh_uses_exact_task4_route_and_fails_offline_to_off() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::RwLock;
+
+    let now = 1_790_762_400;
+    let mut server = mockito::Server::new();
+    let directory = tempfile::tempdir().unwrap();
+    let policy_path = directory.path().join("trackai-delivery-policy.json");
+    let keyring_path = directory.path().join("trackai-machine-credentials.json");
+    let key_id = "abcdefghijklmnop";
+    let credential = format!("trk_v1.{key_id}.{}", "A".repeat(43));
+    std::fs::write(
+        &policy_path,
+        serde_json::json!({
+            "version": 1,
+            "repositories": [{
+                "repository_url": "https://github.com/example/repository-a",
+                "repository_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "tenant_id": "11111111-1111-4111-8111-111111111111",
+                "api_base_url": server.url(),
+                "credential_key_id": key_id,
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        &keyring_path,
+        serde_json::json!({ "version": 1, "credentials": [credential] }).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = MetricDeliveryRuntime::load_from_paths(&policy_path, &keyring_path).unwrap();
+    let binding = runtime.health_bindings().remove(0);
+    let mock = server
+        .mock("GET", "/worker/security/activation")
+        .match_header("x-api-key", mockito::Matcher::Regex("^trk_v1\\.".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"schemaVersion":"trackai.security-activation/0.1","mode":"monitor","version":1,"issuedAt":"2026-09-30T10:00:00Z","refreshAfter":"2026-09-30T10:01:00Z","expiresAt":"2026-09-30T10:05:00Z"}"#)
+        .expect(1)
+        .create();
+    let registry = RwLock::new(SecurityActivationRegistry::default());
+
+    refresh_security_activations(&registry, &runtime, now);
+    assert_eq!(registry.read().unwrap().mode_for(&binding, now), MonitorMode::Monitor);
+    refresh_security_activations(&registry, &runtime, now + 30);
+    assert_eq!(registry.read().unwrap().mode_for(&binding, now + 30), MonitorMode::Monitor);
+    refresh_security_activations(&registry, &runtime, now + 60);
+    assert_eq!(registry.read().unwrap().mode_for(&binding, now + 60), MonitorMode::Off);
+
+    mock.assert();
 }
