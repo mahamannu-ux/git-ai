@@ -1817,10 +1817,17 @@ impl TestRepo {
     }
 
     pub(crate) fn restart_dedicated_daemon_for_test(&mut self) {
+        self.restart_dedicated_daemon_with_env_for_test(&[]);
+    }
+
+    pub(crate) fn restart_dedicated_daemon_with_env_for_test(
+        &mut self,
+        daemon_env: &[(&str, &str)],
+    ) {
         assert_eq!(
             self.daemon_scope,
             DaemonTestScope::Dedicated,
-            "restart_dedicated_daemon_for_test requires a dedicated daemon repo"
+            "daemon restart requires a dedicated daemon repo"
         );
         let family_key = self.daemon_family_key();
         let pending_summary = {
@@ -1838,7 +1845,15 @@ impl TestRepo {
         if let Some(daemon) = self.daemon_process.take() {
             daemon.shutdown();
         }
-        self.setup_daemon_mode();
+        let daemon = Arc::new(DaemonProcess::start_with_env(
+            &self.path,
+            &self.test_home,
+            &self.test_db_path,
+            daemon_env,
+        ));
+        self.test_db_path = daemon.test_db_path.clone();
+        self.daemon_process = Some(daemon);
+        self.sync_test_home_config();
     }
 
     fn daemon_completion_log_path_for_family(&self, family_key: &str) -> PathBuf {
