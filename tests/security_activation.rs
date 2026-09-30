@@ -3,8 +3,8 @@ use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
 use git_ai::metrics::delivery::MetricDeliveryRuntime;
 use git_ai::security::MonitorMode;
 use git_ai::security::activation::{
-    SecurityActivationCache, SecurityActivationRegistry, fetch_security_activation,
-    refresh_security_activation_with, refresh_security_activations,
+    SecurityActivationCache, SecurityActivationRegistry, configured_security_monitor_mode,
+    fetch_security_activation, refresh_security_activation_with, refresh_security_activations,
 };
 
 fn context(base_url: String) -> ApiContext {
@@ -194,4 +194,17 @@ fn background_refresh_uses_exact_task4_route_and_fails_offline_to_off() {
         registry.read().unwrap().mode_for(&binding, now + 60),
         MonitorMode::Off
     );
+}
+
+#[test]
+fn daemon_schedules_activation_refresh_outside_the_git_event_path() {
+    let unknown = binding("33333333-3333-4333-8333-333333333333", "credential-c");
+    assert_eq!(
+        configured_security_monitor_mode(&unknown, 1_790_762_400),
+        MonitorMode::Off
+    );
+
+    let worker = std::fs::read_to_string("src/daemon/telemetry_worker.rs").unwrap();
+    assert!(worker.contains("spawn_security_activation_refresh_worker();"));
+    assert!(worker.contains("spawn_blocking(refresh_configured_security_activations)"));
 }
