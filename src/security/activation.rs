@@ -165,6 +165,22 @@ impl SecurityActivationRegistry {
         self.routes.retain(|key, _| retained.contains(key));
     }
 
+    pub fn prepare_refresh(
+        &mut self,
+        bindings: impl IntoIterator<Item = MetricDeliveryHealthBinding>,
+        now: i64,
+    ) -> Vec<MetricDeliveryHealthBinding> {
+        let bindings = bindings.into_iter().collect::<Vec<_>>();
+        self.retain_routes(bindings.iter());
+        let due = bindings
+            .into_iter()
+            .filter(|binding| self.refresh_due_for(binding, now))
+            .collect::<Vec<_>>();
+        for binding in &due {
+            self.routes.remove(&activation_route_key(binding));
+        }
+        due
+    }
 }
 
 fn activation_route_key(binding: &MetricDeliveryHealthBinding) -> ActivationRouteKey {
