@@ -7,10 +7,16 @@
 use crate::api::client::ApiContext;
 use crate::daemon::control_api::{ControlRequest, ControlResponse, SecurityFindingCandidate};
 use crate::error::GitAiError;
-use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
-use crate::security::{ExecutionContext, MonitorMode, ShellDialect, evaluate_command};
+use crate::metrics::delivery::{
+    EvidenceDeliveryBinding, MetricDeliveryHealthBinding, MetricDeliveryRuntime,
+};
+use crate::security::{
+    ExecutionContext, FindingOperatingSystem, FindingUploadContext, MonitorMode, SafeFinding,
+    SecurityFindingUploadBatch, ShellDialect, evaluate_command,
+};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{OnceLock, RwLock};
 
@@ -318,14 +324,14 @@ where
 
     Some(ControlRequest::SubmitSecurityFinding {
         candidate: SecurityFindingCandidate {
-        repository_url,
-        session_id: session_id.to_string(),
-        source_event_id: source_event_id.to_string(),
-        rule_id: finding.rule_id.to_string(),
-        rule_version: finding.rule_version.to_string(),
-        severity: finding.severity.to_string(),
-        operating_system: host_operating_system().to_string(),
-        occurred_at,
+            repository_url,
+            session_id: session_id.to_string(),
+            source_event_id: source_event_id.to_string(),
+            rule_id: finding.rule_id.to_string(),
+            rule_version: finding.rule_version.to_string(),
+            severity: finding.severity.to_string(),
+            operating_system: host_operating_system().to_string(),
+            occurred_at,
         },
     })
 }
@@ -362,6 +368,104 @@ fn host_operating_system() -> &'static str {
     {
         "unavailable"
     }
+}
+
+pub fn project_security_finding_candidate(
+    candidate: &SecurityFindingCandidate,
+    binding: &EvidenceDeliveryBinding,
+) -> Result<SecurityFindingUploadBatch, GitAiError> {
+    let candidate_repository = crate::repo_url::normalize_repo_url(&candidate.repository_url)
+        .map_err(|_| invalid_candidate())?;
+    if candidate_repository != binding.repository_url
+        || !bounded_identity(&candidate.session_id)
+        || !bounded_identity(&candidate.source_event_id)
+    {
+        return Err(invalid_candidate());
+    }
+    let finding = approved_safe_finding(candidate).ok_or_else(invalid_candidate)?;
+    let operating_system = match candidate.operating_system.as_str() {
+        "macos" => FindingOperatingSystem::Macos,
+        "linux" => FindingOperatingSystem::Linux,
+        "windows" => FindingOperatingSystem::Windows,
+        "wsl" => FindingOperatingSystem::Wsl,
+        _ => return Err(invalid_candidate()),
+    };
+    let occurred_at = DateTime::parse_from_rfc3339(&candidate.occurred_at)
+        .map_err(|_| invalid_candidate())?
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let stable_id = stable_candidate_id(candidate, &candidate_repository);
+
+    SecurityFindingUploadBatch::from_safe_finding(
+        finding,
+        FindingUploadContext {
+            finding_id: format!("task6-f-{stable_id}"),
+            delivery_id: format!("task6-d-{stable_id}"),
+            repository_id: binding.repository_id.clone(),
+            session_id: candidate.session_id.clone(),
+            source_event_id: candidate.source_event_id.clone(),
+            correlation_id: None,
+            operating_system,
+            occurred_at,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            rule_pack_version: "task6-rules/0.1".to_string(),
+        },
+    )
+    .map_err(|_| invalid_candidate())
+}
+
+fn approved_safe_finding(candidate: &SecurityFindingCandidate) -> Option<SafeFinding> {
+    match (
+        candidate.rule_id.as_str(),
+        candidate.rule_version.as_str(),
+        candidate.severity.as_str(),
+    ) {
+        ("trackai.exec.destructive_recursive_delete", "1.5", "critical") => Some(SafeFinding {
+            rule_id: "trackai.exec.destructive_recursive_delete",
+            rule_version: "1.5",
+            severity: "critical",
+            alert_title: "Large deletion requested",
+            effect: "monitor",
+            phase: "requested",
+        }),
+        ("trackai.exec.download_pipe_shell", "1.4", "high") => Some(SafeFinding {
+            rule_id: "trackai.exec.download_pipe_shell",
+            rule_version: "1.4",
+            severity: "high",
+            alert_title: "Downloaded content requested for immediate execution",
+            effect: "monitor",
+            phase: "requested",
+        }),
+        ("trackai.exec.reverse_shell", "1.3", "high") => Some(SafeFinding {
+            rule_id: "trackai.exec.reverse_shell",
+            rule_version: "1.3",
+            severity: "high",
+            alert_title: "Remote command channel requested",
+            effect: "monitor",
+            phase: "requested",
+        }),
+        _ => None,
+    }
+}
+
+fn stable_candidate_id(candidate: &SecurityFindingCandidate, repository_url: &str) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        repository_url,
+        candidate.session_id.as_str(),
+        candidate.source_event_id.as_str(),
+        candidate.rule_id.as_str(),
+        candidate.rule_version.as_str(),
+        candidate.occurred_at.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("{:x}", digest.finalize())[..32].to_string()
+}
+
+fn invalid_candidate() -> GitAiError {
+    GitAiError::Generic("security finding candidate was invalid".to_string())
 }
 
 pub fn refresh_configured_security_activations() {
