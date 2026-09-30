@@ -62,7 +62,7 @@ pub struct SecurityFindingQueue {
 
 impl SecurityFindingQueue {
     pub fn open_at_path(path: &Path) -> Result<Self, GitAiError> {
-        let connection = Connection::open(path)?;
+        let connection = crate::sqlite::open_with_memory_limits(path)?;
         connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS security_finding_queue (

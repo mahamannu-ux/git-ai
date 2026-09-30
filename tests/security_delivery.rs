@@ -1,9 +1,12 @@
 use git_ai::error::GitAiError;
 use git_ai::metrics::delivery::EvidenceDeliveryBinding;
+#[cfg(unix)]
 use git_ai::metrics::delivery::MetricDeliveryRuntime;
+#[cfg(unix)]
+use git_ai::security::delivery::flush_security_findings;
 use git_ai::security::delivery::{
-    SecurityFindingUploadError, SecurityFindingUploadResponse, flush_security_findings,
-    flush_security_findings_with, upload_security_findings,
+    SecurityFindingUploadError, SecurityFindingUploadResponse, flush_security_findings_with,
+    upload_security_findings,
 };
 use git_ai::security::delivery_queue::SecurityFindingQueue;
 use git_ai::security::{
