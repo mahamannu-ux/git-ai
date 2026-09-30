@@ -1,10 +1,12 @@
 use git_ai::api::ApiContext;
+use git_ai::daemon::control_api::{ControlRequest, ControlResponse};
 use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
 use git_ai::metrics::delivery::MetricDeliveryRuntime;
 use git_ai::security::MonitorMode;
 use git_ai::security::activation::{
     SecurityActivationCache, SecurityActivationRegistry, configured_security_monitor_mode,
-    fetch_security_activation, refresh_security_activation_with, refresh_security_activations,
+    fetch_security_activation, query_daemon_security_monitor_mode_with,
+    refresh_security_activation_with, refresh_security_activations,
 };
 
 fn context(base_url: String) -> ApiContext {
@@ -236,4 +238,41 @@ fn daemon_schedules_activation_refresh_outside_the_git_event_path() {
     let worker = std::fs::read_to_string("src/daemon/telemetry_worker.rs").unwrap();
     assert!(worker.contains("spawn_security_activation_refresh_worker();"));
     assert!(worker.contains("spawn_blocking(refresh_configured_security_activations)"));
+}
+
+#[test]
+fn local_daemon_activation_query_carries_only_repository_identity() {
+    let repository_url = "https://github.com/example/repository-a";
+    let mode = query_daemon_security_monitor_mode_with(repository_url, |request| {
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "method": "security.activation.query",
+                "params": { "repository_url": repository_url },
+            })
+        );
+        assert!(matches!(
+            request,
+            ControlRequest::SecurityActivationQuery { .. }
+        ));
+        Ok(ControlResponse::ok(
+            None,
+            Some(serde_json::json!({ "mode": "monitor" })),
+        ))
+    });
+    assert_eq!(mode, MonitorMode::Monitor);
+
+    for response in [
+        Ok(ControlResponse::ok(
+            None,
+            Some(serde_json::json!({ "mode": "unexpected" })),
+        )),
+        Err("daemon unavailable".to_string()),
+    ] {
+        assert_eq!(
+            query_daemon_security_monitor_mode_with(repository_url, |_| response),
+            MonitorMode::Off
+        );
+    }
 }
