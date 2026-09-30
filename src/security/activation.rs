@@ -11,7 +11,7 @@ use crate::security::MonitorMode;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 const ACTIVATION_SCHEMA: &str = "trackai.security-activation/0.1";
 const MAX_LEASE_SECONDS: i64 = 300;
@@ -194,6 +194,41 @@ impl SecurityActivationRegistry {
             .entry(activation_route_key(binding))
             .or_default();
         cache.replace(lease, now)
+    }
+
+    fn clear(&mut self) {
+        self.routes.clear();
+    }
+}
+
+static CONFIGURED_SECURITY_ACTIVATIONS: OnceLock<RwLock<SecurityActivationRegistry>> =
+    OnceLock::new();
+
+fn configured_security_activations() -> &'static RwLock<SecurityActivationRegistry> {
+    CONFIGURED_SECURITY_ACTIVATIONS
+        .get_or_init(|| RwLock::new(SecurityActivationRegistry::default()))
+}
+
+pub fn configured_security_monitor_mode(
+    binding: &MetricDeliveryHealthBinding,
+    now: i64,
+) -> MonitorMode {
+    configured_security_activations()
+        .read()
+        .map_or(MonitorMode::Off, |registry| registry.mode_for(binding, now))
+}
+
+pub fn refresh_configured_security_activations() {
+    let registry = configured_security_activations();
+    match MetricDeliveryRuntime::load_optional_default() {
+        Ok(Some(runtime)) => {
+            refresh_security_activations(registry, &runtime, Utc::now().timestamp());
+        }
+        Ok(None) | Err(_) => {
+            if let Ok(mut registry) = registry.write() {
+                registry.clear();
+            }
+        }
     }
 }
 
