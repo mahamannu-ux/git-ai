@@ -715,6 +715,10 @@ fn task6_opencode_monitor_delivers_safe_finding_end_to_end() {
     .unwrap();
     fs::set_permissions(&keyring_path, fs::Permissions::from_mode(0o600)).unwrap();
 
+    // The integration harness may spend several minutes building the daemon on
+    // slower machines. Build it before creating the deliberately short lease.
+    let _ = crate::repos::test_repo::get_binary_path();
+
     let now = Utc::now();
     let activation = json!({
         "schemaVersion": "trackai.security-activation/0.1",
