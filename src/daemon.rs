@@ -6962,6 +6962,37 @@ impl ActorDaemonCoordinator {
                 });
                 Ok(ControlResponse::ok(None, None))
             }
+            ControlRequest::SecurityActivationQuery { repository_url } => {
+                let mode =
+                    crate::security::activation::configured_security_monitor_mode_for_repository(
+                        &repository_url,
+                        chrono::Utc::now().timestamp(),
+                    );
+                let mode = match mode {
+                    crate::security::MonitorMode::Off => "off",
+                    crate::security::MonitorMode::Monitor => "monitor",
+                };
+                Ok(ControlResponse::ok(None, Some(json!({ "mode": mode }))))
+            }
+            ControlRequest::SubmitSecurityFinding { candidate } => {
+                crate::security::activation::enqueue_configured_security_finding(
+                    &candidate,
+                    chrono::Utc::now().timestamp() as u64,
+                )
+                .map(|_| {
+                    std::mem::drop(tokio::task::spawn_blocking(|| {
+                        if let Err(error) =
+                            crate::security::delivery::flush_configured_security_findings(
+                                chrono::Utc::now().timestamp() as u64,
+                                100,
+                            )
+                        {
+                            tracing::warn!(%error, "security finding delivery failed");
+                        }
+                    }));
+                    ControlResponse::ok(None, None)
+                })
+            }
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
                 serde_json::to_value(result)

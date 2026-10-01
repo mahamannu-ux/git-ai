@@ -219,16 +219,40 @@ impl MockApiServer {
         let stop_thread = Arc::clone(&stop);
 
         let thread = thread::spawn(move || {
+            let mut connection_threads = Vec::new();
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_http_connection(stream, &tx);
+                        if stop_thread.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let connection_tx = tx.clone();
+                        connection_threads.push(thread::spawn(move || {
+                            handle_http_connection(stream, &connection_tx);
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("mock API accept failed: {}", error),
                 }
+
+                let mut index = 0;
+                while index < connection_threads.len() {
+                    if connection_threads[index].is_finished() {
+                        connection_threads.swap_remove(index).join().expect(
+                            "mock API connection handler should complete without panicking",
+                        );
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+
+            for connection_thread in connection_threads {
+                connection_thread
+                    .join()
+                    .expect("mock API connection handler should complete without panicking");
             }
         });
 
@@ -265,6 +289,13 @@ impl Drop for MockApiServer {
 }
 
 fn handle_http_connection(mut stream: TcpStream, tx: &mpsc::Sender<Value>) {
+    // The listener itself is nonblocking so the accept loop can observe the
+    // stop flag. Accepted sockets must be returned to blocking mode before
+    // parsing: otherwise an early `WouldBlock` is treated as EOF and the mock
+    // closes a valid upload before its request bytes arrive.
+    stream
+        .set_nonblocking(false)
+        .expect("failed to set blocking mock API connection");
     let Some((path, body)) = read_http_request(&mut stream) else {
         return;
     };
@@ -327,8 +358,13 @@ fn handle_http_connection(mut stream: TcpStream, tx: &mpsc::Sender<Value>) {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    // The daemon_mode suite runs up to 12 daemon processes concurrently. A
+    // two-second read timeout can expire after accept but before a scheduled
+    // client finishes sending its request, which makes the mock drop a valid
+    // notes upload with `Peer disconnected`. Keep this bounded while matching
+    // the await windows used by the delivery tests.
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("failed to set mock API read timeout");
 
     let mut buffer = Vec::new();
@@ -5855,15 +5891,29 @@ fn await_waits_for_metrics_and_notes_flush() {
         .iter()
         .filter(|r| r["path"].as_str() == Some("/worker/notes/upload"))
         .count();
+    let request_paths = requests
+        .iter()
+        .filter_map(|request| request["path"].as_str())
+        .collect::<Vec<_>>();
+    let delivery_logs = repo
+        .daemon_stderr_contents()
+        .lines()
+        .filter(|line| line.contains("notes:") || line.contains("metrics upload"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         metrics_requests > 0,
-        "expected at least one metrics upload, got {}",
-        metrics_requests
+        "expected at least one metrics upload, got {}; request paths: {:?}; delivery logs:\n{}",
+        metrics_requests,
+        request_paths,
+        delivery_logs
     );
     assert!(
         notes_requests > 0,
-        "expected at least one notes upload, got {}",
-        notes_requests
+        "expected at least one notes upload, got {}; request paths: {:?}; delivery logs:\n{}",
+        notes_requests,
+        request_paths,
+        delivery_logs
     );
 }
 
@@ -5879,7 +5929,11 @@ fn daemon_debug_logging_does_not_reupload_ureq_logs() {
     repo.git_ai(&["await", "--timeout", "10"])
         .expect("initial daemon log flush should succeed");
 
-    let first_upload_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Under the normal 12-thread daemon_mode suite, daemon startup and the
+    // asynchronous log worker can take longer than two seconds to reach the
+    // mock server. Poll for the same bounded interval used by `await` so this
+    // test measures log filtering rather than host scheduling latency.
+    let first_upload_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
     while std::time::Instant::now() < first_upload_deadline {
         requests.extend(mock_api.collect_requests());
@@ -5911,7 +5965,11 @@ fn daemon_debug_logging_does_not_reupload_ureq_logs() {
 
     assert!(
         !uploaded_targets.is_empty(),
-        "expected the daemon to upload its startup logs"
+        "expected the daemon to upload its startup logs; captured request paths: {:?}",
+        requests
+            .iter()
+            .filter_map(|request| request["path"].as_str())
+            .collect::<Vec<_>>()
     );
     assert!(
         uploaded_targets
