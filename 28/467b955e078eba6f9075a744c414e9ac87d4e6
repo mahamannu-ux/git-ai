@@ -1,0 +1,19 @@
+src/commands/daemon.rs
+  s_cce3aac5ee0911::t_bfa4f2f989ff25 85-90,99-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "28467b955e078eba6f9075a744c414e9ac87d4e6",
+  "prompts": {},
+  "sessions": {
+    "s_cce3aac5ee0911": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_edfd3b357ffeK0UOEq5TF367y2",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
