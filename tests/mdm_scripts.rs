@@ -142,6 +142,10 @@ fn scripts_reject_unsafe_bin_paths() {
         "Windows script must require an absolute --bin path"
     );
     assert!(
+        windows.contains("[a-zA-Z]:[\\\\/]"),
+        "Windows script must require a fully-qualified --bin path: drive-relative (C:foo) and root-relative (\\foo) forms are not absolute"
+    );
+    assert!(
         windows.contains("not found; install git-ai first or pass --bin"),
         "Windows script must verify --bin exists"
     );

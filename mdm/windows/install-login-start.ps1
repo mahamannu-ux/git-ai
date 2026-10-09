@@ -78,7 +78,13 @@ if ($principalObj.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrato
 }
 
 if (-not $Bin) { $Bin = $DefaultBin }
-if (-not [IO.Path]::IsPathRooted($Bin)) {
+# Fully-qualified paths only: drive-absolute (C:\...), forward-slash
+# (C:/...), or UNC (\\server\...). IsPathRooted is insufficient here because
+# it also accepts drive-relative (C:relative\...) and root-relative
+# (\relative\...) forms, which resolve against the caller's drive and
+# directory. ([IO.Path]::IsPathFullyQualified is not available on Windows
+# PowerShell 5.1, so match the anchored forms explicitly.)
+if ($Bin -notmatch '^([a-zA-Z]:[\\/]|\\\\)') {
     Fail '--bin must be an absolute path'
 }
 if ($Bin.Contains("`r") -or $Bin.Contains("`n")) {

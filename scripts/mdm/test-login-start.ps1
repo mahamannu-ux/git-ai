@@ -181,10 +181,13 @@ function Invoke-LifecycleScenario {
     if (Test-Registered) { Fail 'task still registered after --uninstall' }
     Write-Log 'uninstall clean'
 
-    # A relative --bin must be rejected without touching the daemon.
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $MdmScript --bin 'relative\path' *> $null
-    if ($LASTEXITCODE -eq 0) { Fail 'relative --bin path was accepted' }
-    Write-Log 'relative --bin rejected'
+    # Non-absolute --bin forms (relative, drive-relative, root-relative)
+    # must be rejected without touching the daemon.
+    foreach ($badBin in @('relative\path', 'C:relative\git-ai.exe', '\relative\git-ai.exe')) {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $MdmScript --bin $badBin *> $null
+        if ($LASTEXITCODE -eq 0) { Fail "non-absolute --bin path was accepted: $badBin" }
+    }
+    Write-Log 'non-absolute --bin paths rejected'
 
     Stop-Daemon
     Invoke-UnusualBinaryPathScenario
