@@ -82,14 +82,26 @@ fn handle_start(args: &[String]) -> Result<(), String> {
             Ok(_) => return Ok(()),
             // A daemon that is still releasing its lock (logout/login,
             // self-update) blocks the first attempt; login launchers pass a
-            // retry window so that race does not leave the daemon down.
-            Err(err) if Instant::now() + START_RETRY_INTERVAL < deadline => {
+            // retry window so that race does not leave the daemon down. Only
+            // this race is retried: policy denials, configuration errors,
+            // spawn failures, and timeouts return immediately.
+            Err(err)
+                if is_lock_held_error(&err) && Instant::now() + START_RETRY_INTERVAL < deadline =>
+            {
                 eprintln!("Daemon not started yet ({}); retrying", err);
                 thread::sleep(START_RETRY_INTERVAL);
             }
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Whether a `bg start` failure is the login-time lock race (`bg shutdown`
+/// returns before the old daemon releases `daemon.lock`). Everything else —
+/// policy denials, configuration errors, spawn failures, timeouts — must not
+/// be retried.
+fn is_lock_held_error(err: &str) -> bool {
+    err.contains("lock held")
 }
 
 /// Pause between `bg start --retry-secs` attempts.

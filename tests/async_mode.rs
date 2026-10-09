@@ -677,3 +677,47 @@ fn daemon_start_rejects_invalid_retry_window() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Only the login-time lock race is retried: policy denials (and likewise
+/// configuration, spawn, and timeout failures) must return immediately
+/// instead of waiting out the retry window.
+#[test]
+fn daemon_start_retry_returns_policy_denials_immediately() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    write_daemon_config(&repo);
+
+    // Build the test binary outside the timed section: the harness compiles
+    // it on first use, which would otherwise pollute the timing assertion.
+    let _ = get_binary_path();
+    let started = Instant::now();
+    let mut command = Command::new(get_binary_path());
+    command
+        .args(["bg", "start", "--retry-secs", "20"])
+        .current_dir(repo.test_home_path());
+    configure_test_home_env(&mut command, &repo);
+    configure_test_daemon_env(&mut command, &repo);
+    // Policy denial: a startup failure other than the held lock.
+    command.env("CURSOR_SANDBOX", "1");
+    let output = command
+        .output()
+        .expect("failed to invoke git-ai daemon command");
+    let elapsed = started.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "bg start inside a sandbox should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sandbox"),
+        "stderr should report the policy denial: {stderr}"
+    );
+    assert!(
+        !stderr.contains("retrying"),
+        "policy denials must not be retried: {stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "policy denials must return immediately instead of waiting out the retry window (took {elapsed:?})"
+    );
+}
