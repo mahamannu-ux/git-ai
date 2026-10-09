@@ -142,7 +142,9 @@ fn scripts_reject_unsafe_bin_paths() {
         "Windows script must verify --bin exists"
     );
     assert!(
-        windows.to_lowercase().contains("carriage return") || windows.contains("`r") || windows.contains("\\r"),
+        windows.to_lowercase().contains("carriage return")
+            || windows.contains("`r")
+            || windows.contains("\\r"),
         "Windows script must reject newline/carriage-return --bin paths"
     );
 }

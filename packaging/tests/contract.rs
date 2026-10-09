@@ -42,10 +42,7 @@ fn packaging_readme() -> String {
 
 #[test]
 fn msi_accepts_no_credential_input() {
-    for (name, contents) in [
-        ("git-ai.wxs", wxs()),
-        ("build-msi.ps1", build_msi()),
-    ] {
+    for (name, contents) in [("git-ai.wxs", wxs()), ("build-msi.ps1", build_msi())] {
         for forbidden in ["API_KEY", "API_BASE", "trk_v1", "api-key"] {
             assert!(
                 !contents.contains(forbidden),
@@ -95,7 +92,12 @@ fn msi_remains_per_user_with_clean_uninstall() {
             && wxs.contains(r#"Permanent="no""#),
         "MSI PATH entry must be per-user, first in order, and removed on uninstall"
     );
-    for forbidden in ["ALLUSERS", "ProgramFiles", "ProgramFiles64", r#"Scope="perMachine""#] {
+    for forbidden in [
+        "ALLUSERS",
+        "ProgramFiles",
+        "ProgramFiles64",
+        r#"Scope="perMachine""#,
+    ] {
         assert!(
             !wxs.contains(forbidden),
             "MSI must not gain an all-users/System install mode ({forbidden})"
@@ -106,7 +108,14 @@ fn msi_remains_per_user_with_clean_uninstall() {
 #[test]
 fn macos_postinstall_carries_no_credential() {
     let postinstall = postinstall();
-    for forbidden in ["API_KEY", "API_BASE", "trk_v1", "api-key", "--api-key", "--api-base"] {
+    for forbidden in [
+        "API_KEY",
+        "API_BASE",
+        "trk_v1",
+        "api-key",
+        "--api-key",
+        "--api-base",
+    ] {
         assert!(
             !postinstall.contains(forbidden),
             "macOS postinstall must contain no credential/config argument ({forbidden})"
