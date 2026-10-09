@@ -138,6 +138,10 @@ fn scripts_reject_unsafe_bin_paths() {
 
     let windows = windows_script();
     assert!(
+        windows.contains("must be an absolute path"),
+        "Windows script must require an absolute --bin path"
+    );
+    assert!(
         windows.contains("not found; install git-ai first or pass --bin"),
         "Windows script must verify --bin exists"
     );

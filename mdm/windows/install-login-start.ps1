@@ -78,6 +78,9 @@ if ($principalObj.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrato
 }
 
 if (-not $Bin) { $Bin = $DefaultBin }
+if (-not [IO.Path]::IsPathRooted($Bin)) {
+    Fail '--bin must be an absolute path'
+}
 if ($Bin.Contains("`r") -or $Bin.Contains("`n")) {
     Fail '--bin path must not contain a newline or carriage return'
 }

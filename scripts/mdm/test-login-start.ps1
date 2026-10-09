@@ -181,6 +181,11 @@ function Invoke-LifecycleScenario {
     if (Test-Registered) { Fail 'task still registered after --uninstall' }
     Write-Log 'uninstall clean'
 
+    # A relative --bin must be rejected without touching the daemon.
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $MdmScript --bin 'relative\path' *> $null
+    if ($LASTEXITCODE -eq 0) { Fail 'relative --bin path was accepted' }
+    Write-Log 'relative --bin rejected'
+
     Stop-Daemon
     Invoke-UnusualBinaryPathScenario
     Invoke-LauncherRetryScenario
