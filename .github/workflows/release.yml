@@ -722,10 +722,16 @@ jobs:
           ' repo/install.ps1 > release/install.ps1
           echo "Generated version-pinned install.ps1 for $VERSION from $REPO"
 
+      - name: Copy MDM login-start scripts
+        run: |
+          cp repo/mdm/macos/install-login-start.sh release/git-ai-login-start-macos.sh
+          cp repo/mdm/windows/install-login-start.ps1 release/git-ai-login-start-windows.ps1
+          chmod +x release/git-ai-login-start-macos.sh
+
       - name: Add install scripts to SHA256SUMS
         run: |
           cd release
-          sha256sum install.sh install.ps1 >> SHA256SUMS
+          sha256sum install.sh install.ps1 git-ai-login-start-* >> SHA256SUMS
 
       - name: Generate attestations for release artifacts
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -781,6 +787,11 @@ jobs:
             - **macOS PKG (Intel)**: `git-ai-macos-x64.pkg`
             - **macOS PKG (Apple Silicon)**: `git-ai-macos-arm64.pkg`
             - **macOS PKG (Universal)**: `git-ai-macos-universal.pkg`
+
+            ### MDM login-start scripts
+            Register `git-ai bg start` to run at login (see `mdm/README.md`):
+            - **macOS LaunchAgent**: `git-ai-login-start-macos.sh`
+            - **Windows Scheduled Task**: `git-ai-login-start-windows.ps1`
 
             ### SHA256 Checksums
             ```
