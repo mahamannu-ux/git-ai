@@ -1,0 +1,23 @@
+mdm/macos/install-login-start.sh
+  s_cce3aac5ee0911::t_4389cd38c9330c 1-160
+scripts/mdm/test-login-start.ps1
+  s_cce3aac5ee0911::t_36f04b4ff2754e 1-293
+scripts/mdm/test-login-start.sh
+  s_cce3aac5ee0911::t_4fdd40d685ce6d 1-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "73304bbbc0860facf335d8d3bd24bcdc52be969b",
+  "prompts": {},
+  "sessions": {
+    "s_cce3aac5ee0911": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_edfd3b357ffeK0UOEq5TF367y2",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
