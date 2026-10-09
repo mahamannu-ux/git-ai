@@ -1,0 +1,21 @@
+packaging/tests/contract.rs
+  s_cce3aac5ee0911::t_3adf9e8af38597 45,95-100,111-118
+tests/mdm_scripts.rs
+  s_cce3aac5ee0911::t_ef5586f880ca6e 145-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "1852a79ed96dfa14021a694d4e78aed3cb974d5d",
+  "prompts": {},
+  "sessions": {
+    "s_cce3aac5ee0911": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_edfd3b357ffeK0UOEq5TF367y2",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
