@@ -18,13 +18,8 @@ all-users or Administrator install mode. The macOS PKG copies its bundled
 binary into the active console user's `~/.git-ai/bin`, then runs setup as that
 user. It fails if no valid console user is logged in or per-user setup fails.
 
-For an enterprise endpoint, pass configuration to the MSI when installing:
-
-```powershell
-msiexec /i git-ai-windows-x64.msi API_BASE=https://usegitai.com API_KEY=your-api-key
-```
-
-These values configure only the installing user's Git AI config. They are
-hidden from MSI logs, but command-line arguments can still be visible to local
-process inspection and shell history. Use your endpoint-management secret
-mechanism when available.
+For a managed rollout, upload the release PKG/MSI from your endpoint-management
+system and install it post-login for the target user. Enrollment and
+configuration resume in Task9c: the packages never receive, exchange, write,
+or log a TrackAI machine credential, and live tenant evidence remains pending.
+Managed configuration and OS secret-store bootstrap belong to Task9c.

@@ -533,24 +533,52 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem release\git-ai-windows-x64.msi).FullName
-          $apiBase = 'https://dev.usegitai.com'
-          $apiKey = 'ci-package-test-key'
           $gitAi = Join-Path $env:USERPROFILE '.git-ai\bin\git-ai.exe'
           $configPath = Join-Path $env:USERPROFILE '.git-ai\config.json'
 
-          $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart API_BASE=$apiBase API_KEY=$apiKey" -Wait -PassThru
+          # Quiet install with no credential or configuration values: the MSI
+          # is secret-free (Task9b) and Task9c owns managed configuration.
+          $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "MSI install failed with exit code $($install.ExitCode)" }
 
-          $config = Get-Content $configPath -Raw | ConvertFrom-Json
-          if ($config.api_base_url -ne $apiBase) { throw 'MSI did not persist API_BASE for the installing user' }
-          if ([string]::IsNullOrWhiteSpace($config.api_key)) { throw 'MSI did not persist API_KEY for the installing user' }
+          if (-not (Test-Path $gitAi)) { throw 'MSI did not install git-ai.exe for the installing user' }
+          $binaryVersion = (& $gitAi --version).Trim()
+          if ([string]::IsNullOrWhiteSpace($binaryVersion)) { throw 'installed git-ai.exe reports no version' }
           if ((Get-Acl $gitAi).Owner -eq 'NT AUTHORITY\SYSTEM') { throw 'MSI binary is owned by SYSTEM' }
-          if ((Get-Acl $configPath).Owner -eq 'NT AUTHORITY\SYSTEM') { throw 'MSI config is owned by SYSTEM' }
+
+          # The registered MSI version must match the installed binary.
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0)
+          )
+          $query = "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'ProductCode'"
+          $view = $database.GetType().InvokeMember(
+            'OpenView', 'InvokeMethod', $null, $database, @($query)
+          )
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          $productCode = $record.GetType().InvokeMember(
+            'StringData', 'GetProperty', $null, $record, 1
+          )
+          $registeredVersion = $installer.GetType().InvokeMember(
+            'ProductInfo', 'GetProperty', $null, $installer, @($productCode, 'VersionString')
+          )
+          if ($registeredVersion -ne $binaryVersion) {
+            throw "MSI version '$registeredVersion' does not match binary version '$binaryVersion'"
+          }
+
+          # No credential or configuration side effect for the installing user.
+          if (Test-Path $configPath) {
+            $config = Get-Content $configPath -Raw | ConvertFrom-Json
+            if ($config.PSObject.Properties.Name -contains 'api_key') { throw 'MSI wrote a credential to the user config' }
+            if ($config.PSObject.Properties.Name -contains 'api_base_url') { throw 'MSI wrote configuration to the user config' }
+          }
           if (Test-Path (Join-Path $env:LOCALAPPDATA 'Git AI')) { throw 'MSI created the retired LocalAppData runtime' }
           if (Test-Path (Join-Path $env:ProgramFiles 'Git AI')) { throw 'MSI created a system-wide runtime' }
 
           $uninstall = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "MSI uninstall failed with exit code $($uninstall.ExitCode)" }
+          if (Test-Path $gitAi) { throw 'MSI uninstall did not remove git-ai.exe' }
 
   test-pkg:
     name: Test macOS PKG installer
@@ -598,6 +626,11 @@ jobs:
           fi
           if [ -e /usr/local/bin/git-ai ]; then
             echo '::error::PKG created a system-wide binary'
+            exit 1
+          fi
+          console_config="$console_home/.git-ai/config.json"
+          if [ -f "$console_config" ] && grep -q '"api_key"' "$console_config"; then
+            echo '::error::PKG wrote a credential to the user config'
             exit 1
           fi
 
