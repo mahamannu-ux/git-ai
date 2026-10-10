@@ -54,6 +54,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "uninstall-hooks"
             | "usage"
             | "evidence"
+            | "fleet"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -196,6 +197,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "evidence" => {
             commands::evidence::handle_evidence(&args[1..]);
+        }
+        "fleet" => {
+            commands::fleet::handle_fleet(&args[1..]);
         }
         "await" => {
             commands::r#await::handle_await(&args[1..]);
@@ -354,6 +358,11 @@ fn print_help() {
     eprintln!("    --json                 Output in JSON format");
     eprintln!("  evidence           Consent-gated OpenCode evidence upload");
     eprintln!("    sync-opencode --database <path> --session <id> --repository-url <url>");
+    eprintln!("  fleet              Managed fleet bootstrap and machine credentials");
+    eprintln!("    bootstrap install                 Read non-secret routing JSON from stdin");
+    eprintln!("    credential install                Read one machine credential from stdin");
+    eprintln!("    credential status");
+    eprintln!("    credential delete --key-id <id>");
     eprintln!("  analyze [beta]      Analyze agent sessions and effectiveness");
     eprintln!("  status             Show uncommitted AI authorship status (debug)");
     eprintln!("    --json                 Output in JSON format");

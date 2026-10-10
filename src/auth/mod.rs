@@ -2,6 +2,7 @@ pub mod client;
 pub mod credential_backend;
 pub mod credentials;
 pub mod identity;
+pub mod machine_credentials;
 pub mod state;
 pub mod types;
 

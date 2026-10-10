@@ -63,6 +63,7 @@ mod event_timestamp_extraction;
 mod fast_reader;
 mod fetch_notes;
 mod firebender;
+mod fleet_commands;
 mod formatting_non_substantial_ai_attribution;
 mod fuzzer;
 mod gemini;
