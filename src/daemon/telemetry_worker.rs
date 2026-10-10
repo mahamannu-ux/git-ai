@@ -51,6 +51,8 @@ static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
 static SECURITY_ACTIVATION_REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
 static LAST_CLIENT_DELIVERY_HEALTH_REPORT_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(target_os = "macos", windows))]
+static LAST_MANAGED_FLEET_REFRESH_AT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_LOG_UPLOAD_IN_FLIGHT: std::sync::OnceLock<Arc<AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -748,6 +750,12 @@ fn flush_pending_metrics_for_current_config(
             {
                 tracing::warn!(%error, "telemetry: failed to report counts-only delivery health");
             }
+            #[cfg(any(target_os = "macos", windows))]
+            if managed_fleet_refresh_is_due(current_unix_ts())
+                && let Err(error) = refresh_managed_fleet(&runtime)
+            {
+                tracing::warn!(%error, "telemetry: managed fleet refresh unavailable");
+            }
             result
         }
         Ok(None) => {
@@ -769,6 +777,123 @@ fn flush_pending_metrics_for_current_config(
             )))
         }
     }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn managed_fleet_refresh_is_due(now: u64) -> bool {
+    let previous = LAST_MANAGED_FLEET_REFRESH_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < CLIENT_DELIVERY_HEALTH_REPORT_INTERVAL_SECS {
+        return false;
+    }
+    LAST_MANAGED_FLEET_REFRESH_AT
+        .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn refresh_managed_fleet(runtime: &MetricDeliveryRuntime) -> Result<(), GitAiError> {
+    let binding = runtime
+        .fleet_binding()
+        .map_err(|error| GitAiError::Generic(error.to_string()))?;
+    let context = runtime
+        .fleet_api_context()
+        .map_err(|error| GitAiError::Generic(error.to_string()))?;
+    let response = context.get("/worker/fleet/configuration")?;
+    let now = chrono::Utc::now();
+    let outcome = match crate::fleet::classify_configuration_response(
+        response.status_code,
+        response.as_bytes(),
+    ) {
+        crate::fleet::ConfigurationResponse::NoChange => None,
+        crate::fleet::ConfigurationResponse::Candidate(raw) => {
+            let path = crate::fleet::default_state_path().ok_or_else(|| {
+                GitAiError::Generic("managed fleet state path unavailable".to_string())
+            })?;
+            Some(runtime.process_fleet_configuration(
+                raw,
+                now,
+                &crate::fleet::UnavailableVerifier,
+                &path,
+            ))
+        }
+        crate::fleet::ConfigurationResponse::Unavailable => None,
+    };
+    let db = MetricsDatabase::global()?;
+    let health = db
+        .lock()
+        .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?
+        .delivery_health(&binding.tenant_id, &binding.api_base_url)?;
+    let report = build_fleet_report(health, outcome.as_ref(), now)?;
+    let response = context.post_json("/worker/fleet/report", &report)?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(GitAiError::Generic(format!(
+            "managed fleet report returned HTTP {}",
+            response.status_code
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+fn build_fleet_report(
+    health: MetricDeliveryHealth,
+    outcome: Option<&crate::fleet::ProcessOutcome>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::fleet::FleetReport, GitAiError> {
+    fn count(value: usize) -> Result<u64, GitAiError> {
+        if value > 1_000_000 {
+            return Err(GitAiError::Generic(
+                "managed fleet queue count unavailable".to_string(),
+            ));
+        }
+        Ok(value as u64)
+    }
+    let observed_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let acknowledgement = outcome.and_then(|outcome| {
+        Some(crate::fleet::FleetAcknowledgement {
+            configuration_id: outcome.configuration_id.clone()?,
+            epoch: outcome.epoch?,
+            result_code: outcome.result,
+        })
+    });
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(windows)]
+    let platform = "windows";
+    #[cfg(all(test, not(any(target_os = "macos", windows))))]
+    let platform = "macos";
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => {
+            return Err(GitAiError::Generic(
+                "managed fleet architecture unavailable".to_string(),
+            ));
+        }
+    };
+    Ok(crate::fleet::FleetReport {
+        schema_version: 1,
+        reported_at: observed_at.clone(),
+        acknowledgement,
+        platform,
+        os_version: "unavailable",
+        architecture,
+        gitai_version: GIT_AI_VERSION,
+        service_state: "running",
+        queue: crate::fleet::FleetQueue {
+            pending_retryable: count(health.pending_retryable)?,
+            waiting_retry: count(health.waiting_retry)?,
+            processing: count(health.processing)?,
+            quarantined: count(health.quarantined)?,
+            rows_with_errors: count(health.rows_with_errors)?,
+        },
+        mdm_device_reference: None,
+        mdm_user_reference: None,
+        assignment_evidence: crate::fleet::AssignmentEvidence {
+            source: "unavailable",
+            observed_at,
+        },
+    })
 }
 
 fn client_delivery_health_report_is_due(now: u64) -> bool {
@@ -1897,6 +2022,45 @@ mod tests {
         assert!(serialized.get("credential").is_none());
         assert!(serialized.get("rawEvent").is_none());
         assert!(serialized.get("reason").is_none());
+    }
+
+    #[test]
+    fn fleet_report_is_closed_metadata_only_and_bounds_counts() {
+        let health = MetricDeliveryHealth {
+            pending_retryable: 1,
+            waiting_retry: 2,
+            processing: 3,
+            quarantined: 4,
+            rows_with_errors: 5,
+            oldest_pending_at: None,
+            last_delivered_at: None,
+        };
+        let outcome = crate::fleet::ProcessOutcome {
+            configuration_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()),
+            epoch: Some(7),
+            result: crate::fleet::AcknowledgementResult::VerificationUnavailable,
+        };
+        let report = build_fleet_report(
+            health.clone(),
+            Some(&outcome),
+            "2026-10-10T01:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            value["acknowledgement"]["resultCode"],
+            "verification_unavailable"
+        );
+        assert_eq!(value["assignmentEvidence"]["source"], "unavailable");
+        assert!(value["mdmDeviceReference"].is_null());
+        assert!(value.get("tenantId").is_none());
+        assert!(value.get("credential").is_none());
+
+        let mut oversized = health;
+        oversized.pending_retryable = 1_000_001;
+        assert!(
+            build_fleet_report(oversized, None, "2026-10-10T01:00:00Z".parse().unwrap(),).is_err()
+        );
     }
 
     fn event_json(ts: u32) -> String {

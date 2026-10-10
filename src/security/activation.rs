@@ -137,6 +137,7 @@ type ActivationRouteKey = (String, String, String);
 pub struct SecurityActivationRegistry {
     routes: BTreeMap<ActivationRouteKey, SecurityActivationCache>,
     repositories: BTreeMap<String, ActivationRouteKey>,
+    managed_repositories: BTreeMap<String, MonitorMode>,
 }
 
 impl SecurityActivationRegistry {
@@ -150,10 +151,33 @@ impl SecurityActivationRegistry {
         let Ok(repository_url) = crate::repo_url::normalize_repo_url(repository_url) else {
             return MonitorMode::Off;
         };
+        if let Some(mode) = self.managed_repositories.get(&repository_url) {
+            return *mode;
+        }
         self.repositories
             .get(&repository_url)
             .and_then(|key| self.routes.get(key))
             .map_or(MonitorMode::Off, |cache| cache.mode_at(now))
+    }
+
+    pub fn replace_managed_modes(
+        &mut self,
+        modes: impl IntoIterator<Item = (String, crate::fleet::SecurityMode)>,
+    ) {
+        self.managed_repositories = modes
+            .into_iter()
+            .filter_map(|(repository_url, mode)| {
+                crate::repo_url::normalize_repo_url(&repository_url)
+                    .ok()
+                    .map(|url| {
+                        let mode = match mode {
+                            crate::fleet::SecurityMode::Off => MonitorMode::Off,
+                            crate::fleet::SecurityMode::Monitor => MonitorMode::Monitor,
+                        };
+                        (url, mode)
+                    })
+            })
+            .collect();
     }
 
     pub fn replace_repository_bindings(
@@ -233,6 +257,7 @@ impl SecurityActivationRegistry {
     fn clear(&mut self) {
         self.routes.clear();
         self.repositories.clear();
+        self.managed_repositories.clear();
     }
 }
 
@@ -622,8 +647,10 @@ pub fn refresh_security_activations(
 ) {
     let bindings = runtime.health_bindings();
     let repository_bindings = runtime.security_activation_bindings();
+    let managed_modes = runtime.managed_security_modes();
     let due = match registry.write() {
         Ok(mut registry) => {
+            registry.replace_managed_modes(managed_modes);
             registry.replace_repository_bindings(repository_bindings);
             registry.prepare_refresh(bindings, now)
         }

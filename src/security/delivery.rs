@@ -189,12 +189,7 @@ pub fn flush_security_findings(
         queue,
         now,
         limit,
-        |binding| {
-            runtime
-                .credential_for_evidence_binding(binding)
-                .ok()
-                .map(str::to_string)
-        },
+        |binding| runtime.credential_for_evidence_binding(binding).ok(),
         upload_security_findings,
     )
 }
