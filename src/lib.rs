@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod evidence;
 pub mod feature_flags;
+pub mod fleet;
 pub mod git;
 pub mod http;
 pub mod mdm;
