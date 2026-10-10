@@ -7,6 +7,7 @@ use crate::metrics::types::MetricEvent;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const TRACKAI_DELIVERY_POLICY_FILE: &str = "trackai-delivery-policy.json";
 pub const TRACKAI_CREDENTIAL_KEYRING_FILE: &str = "trackai-machine-credentials.json";
@@ -157,6 +158,7 @@ pub enum MetricDeliveryRuntimeError {
     Policy(DeliveryPolicyError),
     CredentialKeyring(CredentialKeyringError),
     PolicyFileUnavailable,
+    FleetStateUnavailable,
     CredentialFileUnavailable,
     HomeDirectoryUnavailable,
     IncompleteConfiguration,
@@ -171,6 +173,7 @@ impl std::fmt::Display for MetricDeliveryRuntimeError {
             Self::Policy(error) => error.fmt(formatter),
             Self::CredentialKeyring(error) => error.fmt(formatter),
             Self::PolicyFileUnavailable => write!(formatter, "delivery policy file is unavailable"),
+            Self::FleetStateUnavailable => write!(formatter, "verified fleet state is unavailable"),
             Self::CredentialFileUnavailable => {
                 write!(formatter, "machine credential keyring file is unavailable")
             }
@@ -260,6 +263,7 @@ impl DeliveryPolicyCache {
         }
 
         let mut repositories = HashMap::with_capacity(document.repositories.len());
+        let mut repository_ids = std::collections::HashSet::new();
         for mut entry in document.repositories {
             entry.repository_url = crate::repo_url::normalize_repo_url(&entry.repository_url)
                 .map_err(|_| DeliveryPolicyError::InvalidRepository {
@@ -276,6 +280,13 @@ impl DeliveryPolicyCache {
             {
                 return Err(DeliveryPolicyError::InvalidBinding(
                     "repository ID must be a UUID".to_string(),
+                ));
+            }
+            if let Some(repository_id) = entry.repository_id.as_ref()
+                && !repository_ids.insert(repository_id.clone())
+            {
+                return Err(DeliveryPolicyError::InvalidBinding(
+                    "repository IDs must be unique".to_string(),
                 ));
             }
 
@@ -347,6 +358,13 @@ impl DeliveryPolicyCache {
         bindings.into_values().collect()
     }
 
+    pub fn repository_ids(&self) -> Vec<String> {
+        self.repositories
+            .values()
+            .filter_map(|entry| entry.repository_id.clone())
+            .collect()
+    }
+
     fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
         self.repositories
             .values()
@@ -393,15 +411,46 @@ impl DeliveryPolicyCache {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MetricDeliveryRuntime {
     policy: DeliveryPolicyCache,
-    keyring: MachineCredentialKeyring,
+    credentials: CredentialResolver,
+    managed: Option<crate::fleet::VerifiedConfiguration>,
+}
+
+#[derive(Clone)]
+enum CredentialResolver {
+    Legacy(MachineCredentialKeyring),
+    Managed(Arc<dyn crate::auth::machine_credentials::MachineCredentialStore>),
+}
+
+impl std::fmt::Debug for MetricDeliveryRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetricDeliveryRuntime")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MetricDeliveryRuntime {
     pub fn new(policy: DeliveryPolicyCache, keyring: MachineCredentialKeyring) -> Self {
-        Self { policy, keyring }
+        Self {
+            policy,
+            credentials: CredentialResolver::Legacy(keyring),
+            managed: None,
+        }
+    }
+
+    pub fn new_managed(
+        policy: DeliveryPolicyCache,
+        store: Arc<dyn crate::auth::machine_credentials::MachineCredentialStore>,
+        managed: Option<crate::fleet::VerifiedConfiguration>,
+    ) -> Self {
+        Self {
+            policy,
+            credentials: CredentialResolver::Managed(store),
+            managed,
+        }
     }
 
     pub fn load_from_paths(
@@ -461,69 +510,246 @@ impl MetricDeliveryRuntime {
             .join(".git-ai");
         let policy_path = nonempty_path_env(TRACKAI_DELIVERY_POLICY_PATH_ENV)
             .unwrap_or_else(|| base.join(TRACKAI_DELIVERY_POLICY_FILE));
-        let credential_path = nonempty_path_env(TRACKAI_CREDENTIAL_KEYRING_PATH_ENV)
-            .unwrap_or_else(|| base.join(TRACKAI_CREDENTIAL_KEYRING_FILE));
-        Self::load_optional_from_paths(&policy_path, &credential_path)
+        if let Some(credential_path) = nonempty_path_env(TRACKAI_CREDENTIAL_KEYRING_PATH_ENV) {
+            return Self::load_optional_from_paths(&policy_path, &credential_path);
+        }
+        if !policy_path
+            .try_exists()
+            .map_err(|_| MetricDeliveryRuntimeError::FleetStateUnavailable)?
+        {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(policy_path)
+            .map_err(|_| MetricDeliveryRuntimeError::PolicyFileUnavailable)?;
+        let managed = crate::fleet::default_state_path()
+            .map(|path| crate::fleet::load_state(&path))
+            .transpose()
+            .map_err(|_| MetricDeliveryRuntimeError::PolicyFileUnavailable)?
+            .and_then(|state| state.active);
+        Ok(Some(Self::new_managed(
+            DeliveryPolicyCache::from_json(&raw)?,
+            crate::auth::machine_credentials::default_machine_credential_store(),
+            managed,
+        )))
     }
 
     pub fn bind_event(
         &self,
         event: &MetricEvent,
     ) -> Result<MetricDeliveryBinding, MetricDeliveryRuntimeError> {
-        self.policy.resolve_event(event).map_err(Into::into)
+        let binding = self.policy.resolve_event(event)?;
+        if let Some(managed) = &self.managed
+            && !self.policy.managed_allows(
+                &binding.repository_url,
+                binding.branch.as_deref(),
+                managed,
+                chrono::Utc::now(),
+            )
+        {
+            return Err(DeliveryPolicyError::RepositoryNotEnrolled {
+                repository_url: binding.repository_url,
+            }
+            .into());
+        }
+        Ok(binding)
     }
 
-    pub fn credential_for_binding<'a>(
-        &'a self,
+    pub fn credential_for_binding(
+        &self,
         binding: &MetricDeliveryBinding,
-    ) -> Result<&'a str, MetricDeliveryRuntimeError> {
+    ) -> Result<String, MetricDeliveryRuntimeError> {
         binding
             .validate()
             .map_err(|_| MetricDeliveryRuntimeError::InvalidBinding)?;
-        self.keyring
-            .resolve(&binding.credential_key_id)
-            .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
-                key_id: binding.credential_key_id.clone(),
-            })
+        self.resolve_credential(&binding.credential_key_id)
     }
 
     pub fn health_bindings(&self) -> Vec<MetricDeliveryHealthBinding> {
         self.policy.health_bindings()
     }
 
+    pub fn fleet_api_context(
+        &self,
+    ) -> Result<crate::api::client::ApiContext, MetricDeliveryRuntimeError> {
+        let binding = self.fleet_binding()?;
+        let credential = self.credential_for_health_binding(&binding)?;
+        Ok(crate::api::client::ApiContext {
+            base_url: binding.api_base_url,
+            auth_token: None,
+            api_key: Some(credential),
+            author_identity: None,
+            timeout_secs: Some(5),
+        })
+    }
+
+    pub fn fleet_binding(&self) -> Result<MetricDeliveryHealthBinding, MetricDeliveryRuntimeError> {
+        let mut bindings = self.health_bindings();
+        if bindings.len() != 1 {
+            return Err(MetricDeliveryRuntimeError::InvalidBinding);
+        }
+        Ok(bindings.pop().expect("one binding"))
+    }
+
+    pub fn process_fleet_configuration(
+        &self,
+        raw: &[u8],
+        now: chrono::DateTime<chrono::Utc>,
+        verifier: &dyn crate::fleet::ConfigurationVerifier,
+        state_path: &std::path::Path,
+    ) -> crate::fleet::ProcessOutcome {
+        crate::fleet::process_configuration(
+            raw,
+            now,
+            env!("CARGO_PKG_VERSION"),
+            &self.policy,
+            verifier,
+            state_path,
+        )
+    }
+
     pub fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
         self.policy.security_activation_bindings()
+    }
+
+    pub fn managed_security_modes(&self) -> Vec<(String, crate::fleet::SecurityMode)> {
+        let Some(managed) = &self.managed else {
+            return Vec::new();
+        };
+        self.policy
+            .repositories
+            .values()
+            .filter_map(|entry| {
+                let repository_id = entry.repository_id.as_deref()?;
+                managed
+                    .envelope
+                    .repository_policies
+                    .iter()
+                    .any(|policy| policy.repository_id == repository_id)
+                    .then(|| {
+                        (
+                            entry.repository_url.clone(),
+                            managed.envelope.security_activation.mode,
+                        )
+                    })
+            })
+            .collect()
     }
 
     pub fn bind_evidence_repository(
         &self,
         repository_url: &str,
     ) -> Result<EvidenceDeliveryBinding, MetricDeliveryRuntimeError> {
-        self.policy
+        let binding = self
+            .policy
             .resolve_evidence_repository(repository_url)
-            .map_err(Into::into)
+            .map_err(MetricDeliveryRuntimeError::from)?;
+        if let Some(managed) = &self.managed
+            && !managed
+                .envelope
+                .repository_policies
+                .iter()
+                .any(|policy| policy.repository_id == binding.repository_id)
+        {
+            return Err(DeliveryPolicyError::RepositoryNotEnrolled {
+                repository_url: binding.repository_url,
+            }
+            .into());
+        }
+        Ok(binding)
     }
 
-    pub fn credential_for_evidence_binding<'a>(
-        &'a self,
+    pub fn credential_for_evidence_binding(
+        &self,
         binding: &EvidenceDeliveryBinding,
-    ) -> Result<&'a str, MetricDeliveryRuntimeError> {
-        self.keyring
-            .resolve(&binding.credential_key_id)
-            .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
-                key_id: binding.credential_key_id.clone(),
-            })
+    ) -> Result<String, MetricDeliveryRuntimeError> {
+        self.resolve_credential(&binding.credential_key_id)
     }
 
-    pub fn credential_for_health_binding<'a>(
-        &'a self,
+    pub fn credential_for_health_binding(
+        &self,
         binding: &MetricDeliveryHealthBinding,
-    ) -> Result<&'a str, MetricDeliveryRuntimeError> {
-        self.keyring
-            .resolve(&binding.credential_key_id)
-            .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
-                key_id: binding.credential_key_id.clone(),
+    ) -> Result<String, MetricDeliveryRuntimeError> {
+        self.resolve_credential(&binding.credential_key_id)
+    }
+
+    fn resolve_credential(&self, key_id: &str) -> Result<String, MetricDeliveryRuntimeError> {
+        match &self.credentials {
+            CredentialResolver::Legacy(keyring) => keyring.resolve(key_id).map(str::to_string),
+            CredentialResolver::Managed(store) => store
+                .load(key_id)
+                .ok()
+                .map(|value| value.expose().to_string()),
+        }
+        .ok_or_else(|| MetricDeliveryRuntimeError::CredentialNotFound {
+            key_id: key_id.to_string(),
+        })
+    }
+}
+
+impl DeliveryPolicyCache {
+    fn managed_allows(
+        &self,
+        repository_url: &str,
+        branch: Option<&str>,
+        managed: &crate::fleet::VerifiedConfiguration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let Some(entry) = self.repositories.get(repository_url) else {
+            return false;
+        };
+        let Some(repository_id) = entry.repository_id.as_deref() else {
+            return true;
+        };
+        let Some(policy) = managed
+            .envelope
+            .repository_policies
+            .iter()
+            .find(|policy| policy.repository_id == repository_id)
+        else {
+            return false;
+        };
+        let effective_from = chrono::DateTime::parse_from_rfc3339(&policy.effective_from)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc));
+        let effective_until = policy
+            .effective_until
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()
+            .ok()
+            .flatten()
+            .map(|value| value.with_timezone(&chrono::Utc));
+        let branch_allowed = if policy.branch_patterns.is_empty() {
+            true
+        } else if let Some(branch) = branch {
+            let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            policy.branch_patterns.iter().any(|pattern| {
+                pattern.strip_suffix("/*").map_or_else(
+                    || pattern == branch,
+                    |prefix| {
+                        branch.starts_with(prefix)
+                            && branch.as_bytes().get(prefix.len()) == Some(&b'/')
+                    },
+                )
             })
+        } else {
+            false
+        };
+        effective_from.is_some_and(|value| value <= now)
+            && effective_until.is_none_or(|value| value > now)
+            && branch_allowed
+    }
+}
+
+impl crate::fleet::BootstrapRepositories for DeliveryPolicyCache {
+    fn contains_repository_id(&self, repository_id: &str) -> bool {
+        self.repositories
+            .values()
+            .any(|entry| entry.repository_id.as_deref() == Some(repository_id))
+    }
+
+    fn repository_count(&self) -> usize {
+        self.repository_ids().len()
     }
 }
 
@@ -630,6 +856,121 @@ mod tests {
         assert_eq!(company_a.credential_key_id, "company-a-key-id");
         assert_eq!(company_b.tenant_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(company_b.credential_key_id, "company-b-key-id");
+    }
+
+    #[test]
+    fn managed_overlay_restricts_repository_and_branch_without_broadening_bootstrap() {
+        let policy = DeliveryPolicyCache::from_json(policy_json()).unwrap();
+        let keyring = MachineCredentialKeyring::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "credentials": [
+                    machine_token("company-a-key-id", 'A'),
+                    machine_token("company-b-key-id", 'B')
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut runtime = MetricDeliveryRuntime::new(policy, keyring);
+        runtime.managed = Some(crate::fleet::VerifiedConfiguration {
+            digest: "digest".to_string(),
+            envelope: crate::fleet::ConfigurationEnvelope {
+                schema_version: 1,
+                configuration_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+                epoch: 1,
+                issued_at: "2026-01-01T00:00:00Z".to_string(),
+                valid_until: None,
+                target_client_version: env!("CARGO_PKG_VERSION").to_string(),
+                channel: crate::fleet::FleetChannel::Latest,
+                ring: None,
+                repository_policies: vec![crate::fleet::RepositoryPolicy {
+                    repository_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                    enrollment_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string(),
+                    grant_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".to_string(),
+                    branch_patterns: vec!["main".to_string()],
+                    effective_from: "2026-01-01T00:00:00Z".to_string(),
+                    effective_until: None,
+                }],
+                security_activation: crate::fleet::SecurityActivation {
+                    mode: crate::fleet::SecurityMode::Monitor,
+                    version: 1,
+                },
+                verification: crate::fleet::VerificationMetadata {
+                    required: true,
+                    state: crate::fleet::VerificationState::Unavailable,
+                },
+            },
+        });
+
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("main")
+                ))
+                .is_ok()
+        );
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("dev")
+                ))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-b"),
+                    Some("main")
+                ))
+                .is_err()
+        );
+        runtime
+            .managed
+            .as_mut()
+            .unwrap()
+            .envelope
+            .repository_policies[0]
+            .branch_patterns = vec!["feature/[draft".to_string()];
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("feature/[draft")
+                ))
+                .is_ok()
+        );
+        runtime
+            .managed
+            .as_mut()
+            .unwrap()
+            .envelope
+            .repository_policies[0]
+            .branch_patterns
+            .clear();
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("dev")
+                ))
+                .is_ok()
+        );
+        assert!(
+            runtime
+                .bind_event(&event(Some("https://github.com/example/company-a"), None))
+                .is_ok()
+        );
+        assert_eq!(
+            runtime.managed_security_modes(),
+            vec![(
+                "https://github.com/example/company-a".to_string(),
+                crate::fleet::SecurityMode::Monitor,
+            )]
+        );
+        assert!(runtime.fleet_binding().is_err());
     }
 
     #[test]

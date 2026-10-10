@@ -10,6 +10,7 @@ pub mod diff;
 pub mod evidence;
 pub mod exchange_nonce;
 pub mod fetch_notes;
+pub mod fleet;
 pub mod flush_metrics_db;
 pub mod git_ai_handlers;
 pub mod git_handlers;

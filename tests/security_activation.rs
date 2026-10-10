@@ -1,5 +1,6 @@
 use git_ai::api::ApiContext;
 use git_ai::daemon::control_api::{ControlRequest, ControlResponse};
+use git_ai::fleet::SecurityMode;
 use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
 #[cfg(unix)]
 use git_ai::metrics::delivery::MetricDeliveryRuntime;
@@ -156,6 +157,37 @@ fn activation_registry_keeps_company_routes_separate() {
 
     registry.retain_routes([&company_b]);
     assert_eq!(registry.mode_for(&company_a, now + 1), MonitorMode::Off);
+}
+
+#[test]
+fn verified_managed_mode_takes_precedence_for_its_repository_only() {
+    let now = 1_790_762_400;
+    let company_a = binding("11111111-1111-4111-8111-111111111111", "credential-a");
+    let mut registry = SecurityActivationRegistry::default();
+    registry
+        .replace_from_json(
+            &company_a,
+            r#"{"schemaVersion":"trackai.security-activation/0.1","mode":"monitor","version":1,"issuedAt":"2026-09-30T10:00:00Z","refreshAfter":"2026-09-30T10:01:00Z","expiresAt":"2026-09-30T10:05:00Z"}"#,
+            now,
+        )
+        .unwrap();
+    registry.replace_repository_bindings([(
+        "https://github.com/example/company-a".to_string(),
+        company_a,
+    )]);
+    registry.replace_managed_modes([(
+        "git@github.com:example/company-a.git".to_string(),
+        SecurityMode::Off,
+    )]);
+
+    assert_eq!(
+        registry.mode_for_repository("https://github.com/example/company-a", now),
+        MonitorMode::Off
+    );
+    assert_eq!(
+        registry.mode_for_repository("https://github.com/example/company-b", now),
+        MonitorMode::Off
+    );
 }
 
 #[cfg(unix)]
