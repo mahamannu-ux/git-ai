@@ -708,9 +708,6 @@ impl DeliveryPolicyCache {
         else {
             return false;
         };
-        let Some(branch) = branch else {
-            return false;
-        };
         let effective_from = chrono::DateTime::parse_from_rfc3339(&policy.effective_from)
             .ok()
             .map(|value| value.with_timezone(&chrono::Utc));
@@ -722,11 +719,25 @@ impl DeliveryPolicyCache {
             .ok()
             .flatten()
             .map(|value| value.with_timezone(&chrono::Utc));
+        let branch_allowed = if policy.branch_patterns.is_empty() {
+            true
+        } else if let Some(branch) = branch {
+            let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            policy.branch_patterns.iter().any(|pattern| {
+                pattern.strip_suffix("/*").map_or_else(
+                    || pattern == branch,
+                    |prefix| {
+                        branch.starts_with(prefix)
+                            && branch.as_bytes().get(prefix.len()) == Some(&b'/')
+                    },
+                )
+            })
+        } else {
+            false
+        };
         effective_from.is_some_and(|value| value <= now)
             && effective_until.is_none_or(|value| value > now)
-            && policy.branch_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern).is_ok_and(|pattern| pattern.matches(branch))
-            })
+            && branch_allowed
     }
 }
 
@@ -915,6 +926,42 @@ mod tests {
                     Some("main")
                 ))
                 .is_err()
+        );
+        runtime
+            .managed
+            .as_mut()
+            .unwrap()
+            .envelope
+            .repository_policies[0]
+            .branch_patterns = vec!["feature/[draft".to_string()];
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("feature/[draft")
+                ))
+                .is_ok()
+        );
+        runtime
+            .managed
+            .as_mut()
+            .unwrap()
+            .envelope
+            .repository_policies[0]
+            .branch_patterns
+            .clear();
+        assert!(
+            runtime
+                .bind_event(&event(
+                    Some("https://github.com/example/company-a"),
+                    Some("dev")
+                ))
+                .is_ok()
+        );
+        assert!(
+            runtime
+                .bind_event(&event(Some("https://github.com/example/company-a"), None))
+                .is_ok()
         );
         assert_eq!(
             runtime.managed_security_modes(),

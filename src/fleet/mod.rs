@@ -297,13 +297,9 @@ pub fn parse_and_validate(
         if !valid_uuid(&policy.repository_id)
             || !valid_uuid(&policy.enrollment_id)
             || !valid_uuid(&policy.grant_id)
-            || policy.branch_patterns.is_empty()
             || policy.branch_patterns.len() > 64
             || policy.branch_patterns.iter().any(|pattern| {
-                pattern.is_empty()
-                    || pattern.len() > 255
-                    || glob::Pattern::new(pattern).is_err()
-                    || !branch_patterns.insert(pattern)
+                pattern.is_empty() || pattern.len() > 255 || !branch_patterns.insert(pattern)
             })
             || !bootstrap.contains_repository_id(&policy.repository_id)
             || !repositories.insert(&policy.repository_id)
@@ -604,6 +600,47 @@ mod tests {
         let state = load_state(&path).unwrap();
         assert_eq!(state.active.unwrap().envelope.epoch, 1);
         assert_eq!(state.previous.unwrap().envelope.epoch, 2);
+    }
+
+    #[test]
+    fn empty_branch_patterns_activate_as_all_branches() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")).unwrap();
+        value["repositoryPolicies"][0]["branchPatterns"] = serde_json::json!([]);
+
+        let outcome = process_configuration(
+            &serde_json::to_vec(&value).unwrap(),
+            "2026-10-10T01:00:00Z".parse().unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            &repositories(),
+            &Verifier(VerificationResult::Verified),
+            &path,
+        );
+
+        assert_eq!(outcome.result, AcknowledgementResult::Applied);
+        assert!(
+            load_state(&path)
+                .unwrap()
+                .active
+                .unwrap()
+                .envelope
+                .repository_policies[0]
+                .branch_patterns
+                .is_empty()
+        );
+
+        value["repositoryPolicies"][0]["branchPatterns"] = serde_json::json!(["feature/[draft"]);
+        assert!(
+            parse_and_validate(
+                &serde_json::to_vec(&value).unwrap(),
+                "2026-10-10T01:00:00Z".parse().unwrap(),
+                env!("CARGO_PKG_VERSION"),
+                &repositories()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
