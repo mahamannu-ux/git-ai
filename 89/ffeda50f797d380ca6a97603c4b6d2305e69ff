@@ -1,0 +1,21 @@
+src/fleet/mod.rs
+  s_173f1d16d443db::t_81241da91a63ab 302,605-645
+src/metrics/delivery.rs
+  s_173f1d16d443db::t_3cb56b1fe66aa1 722-737,740,930-965
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "89ffeda50f797d380ca6a97603c4b6d2305e69ff",
+  "prompts": {},
+  "sessions": {
+    "s_173f1d16d443db": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1234f-6f74-7ec1-85e2-e5fc6223d778",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
