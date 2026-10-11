@@ -58,8 +58,13 @@ pub fn handle_fleet(args: &[String]) {
                     &plan,
                     &home,
                     default_machine_credential_store().as_ref(),
+                    &crate::fleet::cleanup::PlatformLoginStart,
                 );
                 print_cleanup_steps(&steps);
+                if crate::fleet::cleanup::cleanup_apply_exit_code(&steps) != 0 {
+                    eprintln!("fleet_error code=cleanup_failed");
+                    std::process::exit(1);
+                }
             })
         }
         _ => Err("usage"),

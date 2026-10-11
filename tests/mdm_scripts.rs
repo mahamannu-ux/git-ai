@@ -325,3 +325,89 @@ fn cleanup_wrappers_are_dry_run_first_and_explicit() {
         "Task9d ships no Linux cleanup wrapper"
     );
 }
+
+#[test]
+fn cleanup_wrappers_propagate_uninstall_failure() {
+    let macos = macos_cleanup_script();
+    assert!(
+        !macos.contains("|| true"),
+        "macOS cleanup wrapper must not silence the uninstall step"
+    );
+    for marker in ["UNINSTALL_STATUS", "CLEANUP_STATUS", "exit 1"] {
+        assert!(
+            macos.contains(marker),
+            "macOS cleanup wrapper must propagate uninstall/cleanup failure ({marker})"
+        );
+    }
+
+    let windows = windows_cleanup_script();
+    assert!(
+        !windows.contains("catch { }"),
+        "Windows cleanup wrapper must not swallow uninstall failure"
+    );
+    for marker in ["$uninstallFailed", "$cleanupOk", "exit 1"] {
+        assert!(
+            windows.contains(marker),
+            "Windows cleanup wrapper must propagate uninstall/cleanup failure ({marker})"
+        );
+    }
+}
+
+/// Exercise the macOS cleanup wrapper end to end with stubbed siblings: the
+/// wrapper must still run `fleet cleanup --apply` when uninstall fails, and
+/// must exit nonzero when either half fails.
+#[cfg(unix)]
+#[test]
+fn macos_cleanup_wrapper_runs_cleanup_and_reports_each_half() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    std::fs::copy(
+        manifest.join("mdm/macos/cleanup-endpoint.sh"),
+        dir.join("cleanup-endpoint.sh"),
+    )
+    .unwrap();
+    // Fake git-ai: records its arguments and exits as directed.
+    write_executable(
+        &dir.join("git-ai"),
+        "#!/bin/sh\necho \"$@\" >> \"$FAKE_LOG\"\nexit \"${FAKE_GIT_AI_EXIT:-0}\"\n",
+    );
+
+    for (uninstall_exit, cleanup_exit, expected) in [(1, 0, 1), (0, 1, 1), (0, 0, 0)] {
+        write_executable(
+            &dir.join("install-login-start.sh"),
+            &format!("#!/bin/sh\nexit {uninstall_exit}\n"),
+        );
+        let _ = std::fs::remove_file(dir.join("calls.log"));
+        let output = std::process::Command::new("sh")
+            .arg(dir.join("cleanup-endpoint.sh"))
+            .arg("--apply")
+            .arg("--bin")
+            .arg(dir.join("git-ai"))
+            .env("HOME", dir)
+            .env("FAKE_LOG", dir.join("calls.log"))
+            .env("FAKE_GIT_AI_EXIT", cleanup_exit.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "uninstall={uninstall_exit} cleanup={cleanup_exit}"
+        );
+        // Cleanup always runs, even when uninstall fails.
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            calls.contains("fleet cleanup --apply"),
+            "cleanup must run despite uninstall failure: {calls}"
+        );
+    }
+}

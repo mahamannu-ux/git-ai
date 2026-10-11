@@ -69,7 +69,18 @@ if [ "$MODE" = "dry-run" ]; then
 fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# Propagate uninstall failure instead of masking it: a remaining LaunchAgent
+# with a successful cleanup report would be a false success. Cleanup still
+# runs so one failing half never blocks the other, and the exit code tells
+# MDM to retry.
+UNINSTALL_STATUS=0
+CLEANUP_STATUS=0
 if [ -x "$SCRIPT_DIR/install-login-start.sh" ]; then
-  "$SCRIPT_DIR/install-login-start.sh" --uninstall 2>/dev/null || true
+  "$SCRIPT_DIR/install-login-start.sh" --uninstall 2>/dev/null || UNINSTALL_STATUS=$?
 fi
-exec "$BIN" fleet cleanup --apply
+"$BIN" fleet cleanup --apply || CLEANUP_STATUS=$?
+if [ "$UNINSTALL_STATUS" -ne 0 ] || [ "$CLEANUP_STATUS" -ne 0 ]; then
+  echo "git-ai cleanup-endpoint: incomplete (uninstall=$UNINSTALL_STATUS cleanup=$CLEANUP_STATUS)" >&2
+  exit 1
+fi
+exit 0

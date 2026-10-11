@@ -75,9 +75,18 @@ if ($Mode -eq 'dry-run') {
     exit $LASTEXITCODE
 }
 
+$uninstallFailed = $false
 $uninstall = Join-Path $PSScriptRoot 'install-login-start.ps1'
 if (Test-Path -LiteralPath $uninstall -PathType Leaf) {
-    try { & $uninstall --uninstall } catch { }
+    # Run in a child process so the callee's `exit` cannot end this wrapper;
+    # propagate its failure instead of masking it.
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $uninstall --uninstall
+    if ($LASTEXITCODE -ne 0) { $uninstallFailed = $true }
 }
 & $Bin fleet cleanup --apply
-exit $LASTEXITCODE
+$cleanupOk = ($LASTEXITCODE -eq 0)
+if ($uninstallFailed -or -not $cleanupOk) {
+    [Console]::Error.WriteLine("git-ai cleanup-endpoint: incomplete (uninstall_failed=$uninstallFailed cleanup_ok=$cleanupOk)")
+    exit 1
+}
+exit 0

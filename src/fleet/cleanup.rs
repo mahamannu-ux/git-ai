@@ -47,10 +47,12 @@ pub struct CleanupStep {
 }
 
 /// Step results carry only fixed codes, never secrets or file contents.
+/// Deferred marks work intentionally retained for a later retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResult {
     Ok,
     Missing,
+    Deferred(&'static str),
     Failed(&'static str),
 }
 
@@ -59,8 +61,22 @@ impl StepResult {
         match self {
             Self::Ok => "ok",
             Self::Missing => "missing",
-            Self::Failed(code) => code,
+            Self::Deferred(code) | Self::Failed(code) => code,
         }
+    }
+
+    fn succeeded(self) -> bool {
+        matches!(self, Self::Ok | Self::Missing)
+    }
+}
+
+/// Exit code for `fleet cleanup --apply`: nonzero when any step failed or was
+/// deferred, so MDM and scripts can retry.
+pub fn cleanup_apply_exit_code(steps: &[CleanupStep]) -> i32 {
+    if steps.iter().all(|step| step.result.succeeded()) {
+        0
+    } else {
+        1
     }
 }
 
@@ -145,19 +161,126 @@ fn store_code(code: MachineCredentialStoreCode) -> &'static str {
     }
 }
 
+/// Login-start deregistration seam. The production implementation removes the
+/// registration file, unloads the platform registration best-effort, and then
+/// verifies absence; tests inject fakes.
+pub trait LoginStartDeregistrar {
+    fn deregister(&self, home: &Path) -> StepResult;
+    fn registration_absent(&self, home: &Path) -> bool;
+}
+
+/// Production login-start deregistration (macOS and Windows only).
+pub struct PlatformLoginStart;
+
+impl LoginStartDeregistrar for PlatformLoginStart {
+    fn deregister(&self, home: &Path) -> StepResult {
+        let Some(path) = login_start_path(home) else {
+            return StepResult::Missing;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StepResult::Missing;
+            }
+            Err(_) => return StepResult::Failed("remove_failed"),
+        }
+        // Best-effort platform unload; `registration_absent` below decides the
+        // step, so a no-op unload (nothing registered) is not a failure.
+        unload_login_start();
+        StepResult::Ok
+    }
+
+    fn registration_absent(&self, home: &Path) -> bool {
+        if login_start_path(home).is_some_and(|path| path.exists()) {
+            return false;
+        }
+        platform_registration_absent()
+    }
+}
+
+fn unload_login_start() {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|uid| uid.trim().to_string())
+            .unwrap_or_default();
+        if uid.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/com.usegitai.bg")])
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", r"\GitAI\Start bg at logon", "/F"])
+            .creation_flags(crate::utils::CREATE_NO_WINDOW)
+            .output();
+    }
+}
+
+/// True only when no platform registration remains. Query/spawn failures are
+/// strict: an unverifiable registration counts as present so cleanup reports
+/// failure instead of a false success.
+fn platform_registration_absent() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|uid| uid.trim().to_string())
+            .unwrap_or_default();
+        if uid.is_empty() {
+            return false;
+        }
+        !std::process::Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/com.usegitai.bg")])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        !std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", r"\GitAI\Start bg at logon"])
+            .creation_flags(crate::utils::CREATE_NO_WINDOW)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        true
+    }
+}
+
 /// Apply a plan built by [`plan_cleanup`]. Continues past missing items and
-/// per-step failures so partial cleanup still reports every safe step result.
+/// per-step failures so partial cleanup still reports every safe step result,
+/// but a failed credential deletion retains the policy file: it holds the key
+/// IDs required to find the orphaned secret on retry.
 pub fn apply_cleanup(
     plan: &CleanupPlan,
     home: &Path,
     store: &dyn MachineCredentialStore,
+    registrar: &dyn LoginStartDeregistrar,
 ) -> Vec<CleanupStep> {
     let mut steps = Vec::new();
+    let mut credential_failed = false;
     for key_id in &plan.credential_key_ids {
         let result = match store.delete(key_id) {
             Ok(()) => StepResult::Ok,
             Err(error) if error.code == MachineCredentialStoreCode::Missing => StepResult::Missing,
-            Err(error) => StepResult::Failed(store_code(error.code)),
+            Err(error) => {
+                credential_failed = true;
+                StepResult::Failed(store_code(error.code))
+            }
         };
         steps.push(CleanupStep {
             action: "delete-credential",
@@ -165,7 +288,16 @@ pub fn apply_cleanup(
             result,
         });
     }
+    let policy = policy_path(home);
     for path in &plan.remove_files {
+        if credential_failed && *path == policy {
+            steps.push(CleanupStep {
+                action: "remove-file",
+                target: path.to_string_lossy().into_owned(),
+                result: StepResult::Deferred("deferred_credential_cleanup"),
+            });
+            continue;
+        }
         let result = match std::fs::remove_file(path) {
             Ok(()) => StepResult::Ok,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => StepResult::Missing,
@@ -178,27 +310,25 @@ pub fn apply_cleanup(
         });
     }
     if plan.deregister_login_start {
-        match login_start_path(home) {
-            None => steps.push(CleanupStep {
-                action: "deregister-login-start",
-                target: "login-start-registration".to_string(),
-                result: StepResult::Missing,
-            }),
-            Some(path) => {
-                let result = match std::fs::remove_file(&path) {
-                    Ok(()) => StepResult::Ok,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        StepResult::Missing
-                    }
-                    Err(_) => StepResult::Failed("remove_failed"),
-                };
-                steps.push(CleanupStep {
-                    action: "deregister-login-start",
-                    target: path.to_string_lossy().into_owned(),
-                    result,
-                });
+        let removed = registrar.deregister(home);
+        let result = if registrar.registration_absent(home) {
+            removed
+        } else {
+            StepResult::Failed("deregistration_failed")
+        };
+        let target = match removed {
+            StepResult::Missing if result == StepResult::Missing => {
+                "login-start-registration".to_string()
             }
-        }
+            _ => login_start_path(home)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "login-start-registration".to_string()),
+        };
+        steps.push(CleanupStep {
+            action: "deregister-login-start",
+            target,
+            result,
+        });
     }
     steps
 }
@@ -206,8 +336,11 @@ pub fn apply_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::machine_credentials::MemoryMachineCredentialStore;
+    use crate::auth::machine_credentials::{
+        MachineCredentialError, MachineCredentialStore, MemoryMachineCredentialStore,
+    };
     use crate::fleet::{ConfigurationResponse, classify_configuration_response};
+    use std::cell::RefCell;
 
     fn home_with_policy(key_ids: &[&str]) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -229,6 +362,71 @@ mod tests {
         std::fs::write(policy_path(&home), serde_json::to_vec(&policy).unwrap()).unwrap();
         std::fs::write(state_path(&home), b"{}".to_vec()).unwrap();
         (temp, home)
+    }
+
+    /// Fake registrar for engineering-evidence unit tests only.
+    struct FakeRegistrar {
+        remove: StepResult,
+        absent: bool,
+        calls: RefCell<u32>,
+    }
+
+    impl FakeRegistrar {
+        fn success() -> Self {
+            Self {
+                remove: StepResult::Ok,
+                absent: true,
+                calls: RefCell::new(0),
+            }
+        }
+    }
+
+    impl LoginStartDeregistrar for FakeRegistrar {
+        fn deregister(&self, home: &Path) -> StepResult {
+            *self.calls.borrow_mut() += 1;
+            if login_start_path(home).is_none() {
+                return StepResult::Missing;
+            }
+            self.remove
+        }
+
+        fn registration_absent(&self, _home: &Path) -> bool {
+            self.absent
+        }
+    }
+
+    /// Store that always fails deletion, to prove recovery metadata survives.
+    struct LockedStore;
+
+    impl MachineCredentialStore for LockedStore {
+        fn store(
+            &self,
+            _credential: crate::auth::machine_credentials::MachineCredential,
+        ) -> Result<(), MachineCredentialError> {
+            Err(MachineCredentialError {
+                code: MachineCredentialStoreCode::Locked,
+            })
+        }
+
+        fn load(
+            &self,
+            _key_id: &str,
+        ) -> Result<crate::auth::machine_credentials::MachineCredential, MachineCredentialError>
+        {
+            Err(MachineCredentialError {
+                code: MachineCredentialStoreCode::Locked,
+            })
+        }
+
+        fn delete(&self, _key_id: &str) -> Result<(), MachineCredentialError> {
+            Err(MachineCredentialError {
+                code: MachineCredentialStoreCode::Locked,
+            })
+        }
+
+        fn status(&self) -> MachineCredentialStoreCode {
+            MachineCredentialStoreCode::Locked
+        }
     }
 
     #[test]
@@ -279,12 +477,21 @@ mod tests {
             .unwrap();
 
         let plan = plan_cleanup(&home);
-        let steps = apply_cleanup(&plan, &home, &store);
+        let registrar = FakeRegistrar::success();
+        let steps = apply_cleanup(&plan, &home, &store, &registrar);
         assert!(
             steps
                 .iter()
                 .any(|step| step.action == "delete-credential" && step.result == StepResult::Ok)
         );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.action == "deregister-login-start"
+                    && matches!(step.result, StepResult::Ok | StepResult::Missing))
+        );
+        assert_eq!(*registrar.calls.borrow(), 1);
+        assert_eq!(cleanup_apply_exit_code(&steps), 0);
         assert!(!policy_path(&home).exists());
         assert!(!state_path(&home).exists());
         for path in &preserved {
@@ -296,13 +503,122 @@ mod tests {
         );
 
         // Idempotent second apply: missing items succeed.
-        let again = apply_cleanup(&plan_cleanup(&home), &home, &store);
+        let again = apply_cleanup(&plan_cleanup(&home), &home, &store, &registrar);
         assert!(!again.is_empty());
         assert!(
             again
                 .iter()
                 .all(|step| matches!(step.result, StepResult::Ok | StepResult::Missing))
         );
+        assert_eq!(cleanup_apply_exit_code(&again), 0);
+    }
+
+    #[test]
+    fn credential_delete_failure_retains_policy_and_fails_the_command() {
+        let (_temp, home) = home_with_policy(&["ABCDEFGHIJKLMNOP"]);
+        let plan = plan_cleanup(&home);
+        let registrar = FakeRegistrar::success();
+        let steps = apply_cleanup(&plan, &home, &LockedStore, &registrar);
+        let delete = steps
+            .iter()
+            .find(|step| step.action == "delete-credential")
+            .unwrap();
+        assert_eq!(delete.result, StepResult::Failed("locked"));
+        // Recovery metadata survives: the policy file holding the key ID is
+        // retained and marked deferred, while unrelated state still cleans up.
+        assert!(policy_path(&home).exists());
+        assert!(!state_path(&home).exists());
+        let policy_step = steps
+            .iter()
+            .find(|step| {
+                step.action == "remove-file" && step.target == policy_path(&home).to_string_lossy()
+            })
+            .unwrap();
+        assert_eq!(
+            policy_step.result,
+            StepResult::Deferred("deferred_credential_cleanup")
+        );
+        assert_eq!(cleanup_apply_exit_code(&steps), 1);
+
+        // Retry after the store recovers completes and exits zero.
+        let store = MemoryMachineCredentialStore::default();
+        let retry = apply_cleanup(&plan_cleanup(&home), &home, &store, &registrar);
+        assert_eq!(cleanup_apply_exit_code(&retry), 0);
+        assert!(!policy_path(&home).exists());
+    }
+
+    #[test]
+    fn deregistration_failure_is_reported_and_fails_the_command() {
+        let (_temp, home) = home_with_policy(&["ABCDEFGHIJKLMNOP"]);
+        let plan = plan_cleanup(&home);
+        let store = MemoryMachineCredentialStore::default();
+        // Files removed but the platform registration remains: must fail.
+        let registrar = FakeRegistrar {
+            remove: StepResult::Ok,
+            absent: false,
+            calls: RefCell::new(0),
+        };
+        let steps = apply_cleanup(&plan, &home, &store, &registrar);
+        let deregister = steps
+            .iter()
+            .find(|step| step.action == "deregister-login-start")
+            .unwrap();
+        assert_eq!(
+            deregister.result,
+            StepResult::Failed("deregistration_failed")
+        );
+        assert_eq!(cleanup_apply_exit_code(&steps), 1);
+
+        // Registrar errors propagate the same way.
+        let failing = FakeRegistrar {
+            remove: StepResult::Failed("remove_failed"),
+            absent: false,
+            calls: RefCell::new(0),
+        };
+        let steps = apply_cleanup(&plan_cleanup(&home), &home, &store, &failing);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.action == "deregister-login-start"
+                    && step.result == StepResult::Failed("deregistration_failed"))
+        );
+        assert_eq!(cleanup_apply_exit_code(&steps), 1);
+    }
+
+    #[test]
+    fn cleanup_apply_exit_code_maps_results() {
+        let step = |result| CleanupStep {
+            action: "remove-file",
+            target: "target".to_string(),
+            result,
+        };
+        assert_eq!(
+            cleanup_apply_exit_code(&[step(StepResult::Ok), step(StepResult::Missing)]),
+            0
+        );
+        assert_eq!(cleanup_apply_exit_code(&[step(StepResult::Failed("x"))]), 1);
+        assert_eq!(
+            cleanup_apply_exit_code(&[step(StepResult::Deferred("x"))]),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn platform_registrar_verifies_real_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let registrar = PlatformLoginStart;
+        // Nothing registered under an empty home: absent.
+        assert!(registrar.registration_absent(&home));
+        // A leftover plist file counts as present until deregistered.
+        let plist = login_start_path(&home).unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"stale").unwrap();
+        assert!(!registrar.registration_absent(&home));
+        assert_eq!(registrar.deregister(&home), StepResult::Ok);
+        assert!(!plist.exists());
+        assert!(registrar.registration_absent(&home));
     }
 
     #[test]
@@ -313,13 +629,15 @@ mod tests {
         let plan = plan_cleanup(&home);
         assert!(plan.credential_key_ids.is_empty());
         let store = MemoryMachineCredentialStore::default();
-        let steps = apply_cleanup(&plan, &home, &store);
+        let registrar = FakeRegistrar::success();
+        let steps = apply_cleanup(&plan, &home, &store, &registrar);
         assert!(!steps.is_empty());
         assert!(
             steps
                 .iter()
                 .all(|step| matches!(step.result, StepResult::Ok | StepResult::Missing))
         );
+        assert_eq!(cleanup_apply_exit_code(&steps), 0);
     }
 
     #[test]
@@ -349,7 +667,8 @@ mod tests {
         assert!(!rendered.contains("trk_v1"));
         assert!(!rendered.contains("aaaaaaa"));
         let store = MemoryMachineCredentialStore::default();
-        for step in apply_cleanup(&plan, &home, &store) {
+        let registrar = FakeRegistrar::success();
+        for step in apply_cleanup(&plan, &home, &store, &registrar) {
             let rendered = format!("{step:?} {}", step.result.as_str());
             assert!(!rendered.contains("trk_v1"));
             assert!(!rendered.contains("aaaaaaa"));
