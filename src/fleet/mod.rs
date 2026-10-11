@@ -527,6 +527,10 @@ mod tests {
         format!(r#"{{"schemaVersion":1,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","targetClientVersion":"1.6.19","channel":"latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityActivation":{{"mode":"monitor","version":1}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
     }
 
+    fn v2_raw(epoch: u64, id: &str) -> Vec<u8> {
+        format!(r#"{{"schemaVersion":2,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","clientCompatibility":{{"minimumVersion":"1.6.18","maximumVersion":"1.6.20"}},"desiredRelease":{{"version":"9.8.7","releaseTag":"v9.8.7","manifestUrl":"https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"channel":"enterprise-latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityActivation":{{"mode":"monitor","version":1}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
+    }
+
     fn repositories() -> Repositories {
         Repositories(HashSet::from([
             "11111111-1111-4111-8111-111111111111".to_string()
@@ -781,5 +785,206 @@ mod tests {
         let state = load_state(&path).unwrap();
         assert_eq!(state.active.unwrap().envelope.epoch, 2);
         assert_eq!(state.previous.unwrap().envelope.epoch, 1);
+    }
+
+    #[test]
+    fn schema_v2_uses_inclusive_semver_compatibility_independent_of_desired_release() {
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let raw = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        assert!(parse_and_validate(&raw, now, "1.6.18", &repositories()).is_ok());
+        assert!(parse_and_validate(&raw, now, "1.6.20", &repositories()).is_ok());
+        assert_eq!(
+            parse_and_validate(&raw, now, "1.6.21", &repositories()),
+            Err(AcknowledgementResult::RejectedIncompatible)
+        );
+
+        for (path, replacement) in [
+            (
+                "/clientCompatibility/minimumVersion",
+                serde_json::json!("01.6.18"),
+            ),
+            (
+                "/clientCompatibility/maximumVersion",
+                serde_json::json!("1.6"),
+            ),
+            ("/desiredRelease/version", serde_json::json!("latest")),
+            ("/desiredRelease/releaseTag", serde_json::json!("../v9.8.7")),
+            (
+                "/desiredRelease/manifestSha256",
+                serde_json::json!("A".repeat(64)),
+            ),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            *value.pointer_mut(path).unwrap() = replacement;
+            assert_eq!(
+                parse_and_validate(
+                    &serde_json::to_vec(&value).unwrap(),
+                    now,
+                    "1.6.19",
+                    &repositories()
+                ),
+                Err(AcknowledgementResult::RejectedInvalid),
+                "accepted invalid {path}"
+            );
+        }
+
+        let invalid_urls = [
+            "https://github.com/mahamannu-ux/git-ai/releases/latest/download/SHA256SUMS",
+            "https://github.com/other/git-ai/releases/download/v9.8.7/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.6/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7%2fother/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS?x=1",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS#x",
+        ];
+        for manifest_url in invalid_urls {
+            let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            value["desiredRelease"]["manifestUrl"] = serde_json::json!(manifest_url);
+            assert_eq!(
+                parse_and_validate(
+                    &serde_json::to_vec(&value).unwrap(),
+                    now,
+                    "1.6.19",
+                    &repositories()
+                ),
+                Err(AcknowledgementResult::RejectedInvalid),
+                "accepted invalid URL {manifest_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_persisted_v2_bytes_are_reverified_for_active_and_retained_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let first = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let second = v2_raw(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        let verifier = Verifier(VerificationResult::Verified);
+        for raw in [&first, &second] {
+            assert_eq!(
+                process_configuration(raw, now, "1.6.19", &repositories(), &verifier, &path).result,
+                AcknowledgementResult::Applied
+            );
+        }
+        let state = load_state(&path).unwrap();
+        assert_eq!(
+            state.active.as_ref().unwrap().exact_json.as_deref(),
+            std::str::from_utf8(&second).ok()
+        );
+        assert_eq!(
+            state.previous.as_ref().unwrap().exact_json.as_deref(),
+            std::str::from_utf8(&first).ok()
+        );
+
+        let active = authorize_desired_release(
+            &path,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            2,
+            now,
+            "1.6.19",
+            &repositories(),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(active.desired_release.version, "9.8.7");
+        let previous = authorize_desired_release(
+            &path,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            1,
+            now,
+            "1.6.19",
+            &repositories(),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            previous.configuration_id,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn authorization_denials_preserve_active_and_previous_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let candidate = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        process_configuration(
+            &candidate,
+            now,
+            "1.6.19",
+            &repositories(),
+            &Verifier(VerificationResult::Verified),
+            &path,
+        );
+        let original = std::fs::read(&path).unwrap();
+
+        for verifier in [
+            Verifier(VerificationResult::Unavailable),
+            Verifier(VerificationResult::Rejected),
+        ] {
+            assert!(
+                authorize_desired_release(
+                    &path,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    1,
+                    now,
+                    "1.6.19",
+                    &repositories(),
+                    &verifier,
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        let mut state = load_state(&path).unwrap();
+        state.active.as_mut().unwrap().exact_json = None;
+        atomic_write_json(&path, &state).unwrap();
+        assert_eq!(
+            authorize_desired_release(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::MissingExactJson)
+        );
+
+        let legacy_path = temp.path().join("fleet/legacy.json");
+        let legacy = VerifiedConfiguration {
+            digest: hex_digest(&raw(1, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")),
+            envelope: parse_and_validate(
+                &raw(1, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+                now,
+                "1.6.19",
+                &repositories(),
+            )
+            .unwrap(),
+            exact_json: None,
+        };
+        atomic_write_json(
+            &legacy_path,
+            &FleetState {
+                active: Some(legacy),
+                previous: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            authorize_desired_release(
+                &legacy_path,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                1,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::MissingExactJson)
+        );
     }
 }
