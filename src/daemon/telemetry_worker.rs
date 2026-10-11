@@ -831,7 +831,43 @@ fn refresh_managed_fleet(runtime: &MetricDeliveryRuntime) -> Result<(), GitAiErr
             response.status_code
         )));
     }
+    apply_retained_managed_release_best_effort(runtime, now);
     Ok(())
+}
+
+/// Best-effort managed exact-release execution after a successful fleet
+/// refresh. Runs only from retained, reverified authorization; every denial or
+/// download/install failure leaves queue, state and authentication intact and
+/// only warns. Production still uses `UnavailableVerifier`, so this performs
+/// zero lifecycle side effects until Task15 supplies the real verifier.
+#[cfg(any(target_os = "macos", windows))]
+fn apply_retained_managed_release_best_effort(
+    runtime: &MetricDeliveryRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let state_path = match crate::fleet::default_state_path() {
+        Some(path) => path,
+        None => return,
+    };
+    let outcome = runtime.apply_retained_managed_release(
+        now,
+        &crate::fleet::UnavailableVerifier,
+        &state_path,
+        &crate::fleet::managed_update::ProductionManagedUpdateDeps,
+    );
+    match outcome {
+        Ok(crate::fleet::managed_update::ManagedApplyOutcome::Updated { version, tag }) => {
+            tracing::info!(
+                version = version.as_str(),
+                tag = tag.as_str(),
+                "managed fleet release installed"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "managed fleet release unavailable");
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", windows, test))]

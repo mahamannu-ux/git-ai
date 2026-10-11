@@ -607,6 +607,29 @@ impl MetricDeliveryRuntime {
         )
     }
 
+    /// Apply the retained active configuration's exact managed release, if
+    /// authorized. Denials skip safely; failures preserve queue and state.
+    pub fn apply_retained_managed_release(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        verifier: &dyn crate::fleet::ConfigurationVerifier,
+        state_path: &std::path::Path,
+        deps: &dyn crate::fleet::managed_update::ManagedUpdateDeps,
+    ) -> Result<
+        crate::fleet::managed_update::ManagedApplyOutcome,
+        crate::fleet::managed_update::ManagedUpdateError,
+    > {
+        crate::fleet::managed_update::apply_retained_release(
+            state_path,
+            now,
+            env!("CARGO_PKG_VERSION"),
+            &self.policy,
+            verifier,
+            env!("CARGO_PKG_VERSION"),
+            deps,
+        )
+    }
+
     pub fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
         self.policy.security_activation_bindings()
     }
