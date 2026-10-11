@@ -323,7 +323,7 @@ fn releases_endpoint() -> &'static str {
     "/worker/releases"
 }
 
-fn verify_sha256(content: &[u8], expected_hash: &str) -> Result<(), String> {
+pub(crate) fn verify_sha256(content: &[u8], expected_hash: &str) -> Result<(), String> {
     let mut hasher = Sha256::new();
     hasher.update(content);
     let actual_hash = format!("{:x}", hasher.finalize());
@@ -340,7 +340,7 @@ fn verify_sha256(content: &[u8], expected_hash: &str) -> Result<(), String> {
 
 /// Parse SHA256SUMS file content into a map of filename → hash.
 /// Format: `<hash>  <filename>` (two spaces between hash and filename)
-fn parse_checksums(content: &str) -> HashMap<String, String> {
+pub(crate) fn parse_checksums(content: &str) -> HashMap<String, String> {
     let mut checksums = HashMap::new();
 
     for line in content.lines() {
@@ -496,7 +496,11 @@ fn try_mock_releases(base: &str, channel: UpdateChannel) -> Option<Result<Channe
     )
 }
 
-fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(), String> {
+pub(crate) fn run_install_script(
+    script_content: &str,
+    tag: &str,
+    silent: bool,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         if let Ok(daemon_config) = crate::daemon::DaemonConfig::from_env_or_default_paths() {

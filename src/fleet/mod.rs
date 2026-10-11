@@ -1,5 +1,8 @@
 //! Verified TrackAI managed-fleet configuration.
 
+pub mod cleanup;
+pub mod managed_update;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
