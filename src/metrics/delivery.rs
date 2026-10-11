@@ -622,13 +622,13 @@ impl MetricDeliveryRuntime {
                 let repository_id = entry.repository_id.as_deref()?;
                 managed
                     .envelope
-                    .repository_policies
+                    .repository_policies()
                     .iter()
                     .any(|policy| policy.repository_id == repository_id)
                     .then(|| {
                         (
                             entry.repository_url.clone(),
-                            managed.envelope.security_activation.mode,
+                            managed.envelope.security_activation().mode,
                         )
                     })
             })
@@ -646,7 +646,7 @@ impl MetricDeliveryRuntime {
         if let Some(managed) = &self.managed
             && !managed
                 .envelope
-                .repository_policies
+                .repository_policies()
                 .iter()
                 .any(|policy| policy.repository_id == binding.repository_id)
         {
@@ -702,7 +702,7 @@ impl DeliveryPolicyCache {
         };
         let Some(policy) = managed
             .envelope
-            .repository_policies
+            .repository_policies()
             .iter()
             .find(|policy| policy.repository_id == repository_id)
         else {
@@ -875,32 +875,35 @@ mod tests {
         let mut runtime = MetricDeliveryRuntime::new(policy, keyring);
         runtime.managed = Some(crate::fleet::VerifiedConfiguration {
             digest: "digest".to_string(),
-            envelope: crate::fleet::ConfigurationEnvelope {
-                schema_version: 1,
-                configuration_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
-                epoch: 1,
-                issued_at: "2026-01-01T00:00:00Z".to_string(),
-                valid_until: None,
-                target_client_version: env!("CARGO_PKG_VERSION").to_string(),
-                channel: crate::fleet::FleetChannel::Latest,
-                ring: None,
-                repository_policies: vec![crate::fleet::RepositoryPolicy {
-                    repository_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
-                    enrollment_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string(),
-                    grant_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".to_string(),
-                    branch_patterns: vec!["main".to_string()],
-                    effective_from: "2026-01-01T00:00:00Z".to_string(),
-                    effective_until: None,
-                }],
-                security_activation: crate::fleet::SecurityActivation {
-                    mode: crate::fleet::SecurityMode::Monitor,
-                    version: 1,
+            exact_json: None,
+            envelope: crate::fleet::ConfigurationEnvelope::V1(
+                crate::fleet::ConfigurationEnvelopeV1 {
+                    schema_version: 1,
+                    configuration_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+                    epoch: 1,
+                    issued_at: "2026-01-01T00:00:00Z".to_string(),
+                    valid_until: None,
+                    target_client_version: env!("CARGO_PKG_VERSION").to_string(),
+                    channel: crate::fleet::FleetChannel::Latest,
+                    ring: None,
+                    repository_policies: vec![crate::fleet::RepositoryPolicy {
+                        repository_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                        enrollment_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string(),
+                        grant_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".to_string(),
+                        branch_patterns: vec!["main".to_string()],
+                        effective_from: "2026-01-01T00:00:00Z".to_string(),
+                        effective_until: None,
+                    }],
+                    security_activation: crate::fleet::SecurityActivation {
+                        mode: crate::fleet::SecurityMode::Monitor,
+                        version: 1,
+                    },
+                    verification: crate::fleet::VerificationMetadata {
+                        required: true,
+                        state: crate::fleet::VerificationState::Unavailable,
+                    },
                 },
-                verification: crate::fleet::VerificationMetadata {
-                    required: true,
-                    state: crate::fleet::VerificationState::Unavailable,
-                },
-            },
+            ),
         });
 
         assert!(
@@ -932,7 +935,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .envelope
-            .repository_policies[0]
+            .repository_policies_mut()[0]
             .branch_patterns = vec!["feature/[draft".to_string()];
         assert!(
             runtime
@@ -947,7 +950,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .envelope
-            .repository_policies[0]
+            .repository_policies_mut()[0]
             .branch_patterns
             .clear();
         assert!(

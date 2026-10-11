@@ -75,7 +75,7 @@ pub enum FleetChannel {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConfigurationEnvelope {
+pub struct ConfigurationEnvelopeV1 {
     pub schema_version: u8,
     pub configuration_id: String,
     pub epoch: u64,
@@ -87,6 +87,125 @@ pub struct ConfigurationEnvelope {
     pub repository_policies: Vec<RepositoryPolicy>,
     pub security_activation: SecurityActivation,
     pub verification: VerificationMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientCompatibility {
+    pub minimum_version: String,
+    pub maximum_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesiredRelease {
+    pub version: String,
+    pub release_tag: String,
+    pub manifest_url: String,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigurationEnvelopeV2 {
+    pub schema_version: u8,
+    pub configuration_id: String,
+    pub epoch: u64,
+    pub issued_at: String,
+    pub valid_until: Option<String>,
+    pub client_compatibility: ClientCompatibility,
+    pub desired_release: DesiredRelease,
+    pub channel: FleetChannel,
+    pub ring: Option<String>,
+    pub repository_policies: Vec<RepositoryPolicy>,
+    pub security_activation: SecurityActivation,
+    pub verification: VerificationMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigurationEnvelope {
+    V1(ConfigurationEnvelopeV1),
+    V2(ConfigurationEnvelopeV2),
+}
+
+impl ConfigurationEnvelope {
+    pub fn schema_version(&self) -> u8 {
+        match self {
+            Self::V1(value) => value.schema_version,
+            Self::V2(value) => value.schema_version,
+        }
+    }
+
+    pub fn configuration_id(&self) -> &str {
+        match self {
+            Self::V1(value) => &value.configuration_id,
+            Self::V2(value) => &value.configuration_id,
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        match self {
+            Self::V1(value) => value.epoch,
+            Self::V2(value) => value.epoch,
+        }
+    }
+
+    fn issued_at(&self) -> &str {
+        match self {
+            Self::V1(value) => &value.issued_at,
+            Self::V2(value) => &value.issued_at,
+        }
+    }
+
+    fn valid_until(&self) -> Option<&str> {
+        match self {
+            Self::V1(value) => value.valid_until.as_deref(),
+            Self::V2(value) => value.valid_until.as_deref(),
+        }
+    }
+
+    pub fn repository_policies(&self) -> &[RepositoryPolicy] {
+        match self {
+            Self::V1(value) => &value.repository_policies,
+            Self::V2(value) => &value.repository_policies,
+        }
+    }
+
+    pub fn repository_policies_mut(&mut self) -> &mut Vec<RepositoryPolicy> {
+        match self {
+            Self::V1(value) => &mut value.repository_policies,
+            Self::V2(value) => &mut value.repository_policies,
+        }
+    }
+
+    pub fn security_activation(&self) -> &SecurityActivation {
+        match self {
+            Self::V1(value) => &value.security_activation,
+            Self::V2(value) => &value.security_activation,
+        }
+    }
+
+    fn ring(&self) -> Option<&str> {
+        match self {
+            Self::V1(value) => value.ring.as_deref(),
+            Self::V2(value) => value.ring.as_deref(),
+        }
+    }
+
+    fn verification(&self) -> &VerificationMetadata {
+        match self {
+            Self::V1(value) => &value.verification,
+            Self::V2(value) => &value.verification,
+        }
+    }
+
+    fn desired_release(&self) -> Option<&DesiredRelease> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(value) => Some(&value.desired_release),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +232,8 @@ impl ConfigurationVerifier for UnavailableVerifier {
 pub struct VerifiedConfiguration {
     pub digest: String,
     pub envelope: ConfigurationEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +248,28 @@ pub struct ProcessOutcome {
     pub configuration_id: Option<String>,
     pub epoch: Option<u64>,
     pub result: AcknowledgementResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredReleaseAuthorization {
+    pub configuration_id: String,
+    pub epoch: u64,
+    pub desired_release: DesiredRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseAuthorizationDenial {
+    StateUnavailable,
+    NotRetained,
+    MissingExactJson,
+    DigestMismatch,
+    RejectedInvalid,
+    RejectedExpired,
+    RejectedIncompatible,
+    EnvelopeMismatch,
+    VerificationRejected,
+    VerificationUnavailable,
+    SchemaV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -220,8 +363,11 @@ pub fn process_configuration(
             };
         }
     };
-    let identity = (Some(parsed.configuration_id.clone()), Some(parsed.epoch));
-    match verifier.verify(raw, &parsed.verification) {
+    let identity = (
+        Some(parsed.configuration_id().to_string()),
+        Some(parsed.epoch()),
+    );
+    match verifier.verify(raw, parsed.verification()) {
         VerificationResult::Unavailable => ProcessOutcome {
             configuration_id: identity.0,
             epoch: identity.1,
@@ -236,6 +382,7 @@ pub fn process_configuration(
             let verified = VerifiedConfiguration {
                 digest: hex_digest(raw),
                 envelope: parsed,
+                exact_json: String::from_utf8(raw.to_vec()).ok(),
             };
             let result = activate_verified(state_path, verified)
                 .unwrap_or(AcknowledgementResult::ActivationFailed);
@@ -259,28 +406,50 @@ pub fn parse_and_validate(
     }
     let envelope: ConfigurationEnvelope =
         serde_json::from_slice(raw).map_err(|_| AcknowledgementResult::RejectedInvalid)?;
-    if envelope.schema_version != 1
-        || envelope.epoch == 0
-        || !valid_uuid(&envelope.configuration_id)
-        || envelope.target_client_version.len() > 64
+    if !matches!(envelope.schema_version(), 1 | 2)
+        || envelope.epoch() == 0
+        || !valid_uuid(envelope.configuration_id())
         || envelope
-            .ring
-            .as_ref()
+            .ring()
             .is_some_and(|ring| ring.is_empty() || ring.len() > 64)
-        || !envelope.verification.required
-        || envelope.repository_policies.len() > 1_000
+        || !envelope.verification().required
+        || envelope.repository_policies().len() > 1_000
     {
         return Err(AcknowledgementResult::RejectedInvalid);
     }
-    if envelope.target_client_version != client_version {
-        return Err(AcknowledgementResult::RejectedIncompatible);
+    match &envelope {
+        ConfigurationEnvelope::V1(value) => {
+            if value.schema_version != 1 || value.target_client_version.len() > 64 {
+                return Err(AcknowledgementResult::RejectedInvalid);
+            }
+            if value.target_client_version != client_version {
+                return Err(AcknowledgementResult::RejectedIncompatible);
+            }
+        }
+        ConfigurationEnvelope::V2(value) => {
+            if value.schema_version != 2 || !valid_desired_release(&value.desired_release) {
+                return Err(AcknowledgementResult::RejectedInvalid);
+            }
+            let minimum = canonical_version(&value.client_compatibility.minimum_version)
+                .ok_or(AcknowledgementResult::RejectedInvalid)?;
+            let maximum = canonical_version(&value.client_compatibility.maximum_version)
+                .ok_or(AcknowledgementResult::RejectedInvalid)?;
+            let client = canonical_version(client_version)
+                .ok_or(AcknowledgementResult::RejectedIncompatible)?;
+            if minimum > maximum {
+                return Err(AcknowledgementResult::RejectedInvalid);
+            }
+            if client < minimum || client > maximum {
+                return Err(AcknowledgementResult::RejectedIncompatible);
+            }
+        }
     }
     let issued_at =
-        parse_time(&envelope.issued_at).ok_or(AcknowledgementResult::RejectedInvalid)?;
+        parse_time(envelope.issued_at()).ok_or(AcknowledgementResult::RejectedInvalid)?;
     if issued_at > now + chrono::Duration::minutes(5) {
         return Err(AcknowledgementResult::RejectedInvalid);
     }
-    if let Some(valid_until) = envelope.valid_until.as_deref() {
+    if let Some(valid_until) = envelope.valid_until() {
         let valid_until = parse_time(valid_until).ok_or(AcknowledgementResult::RejectedInvalid)?;
         if valid_until <= issued_at {
             return Err(AcknowledgementResult::RejectedInvalid);
@@ -292,7 +461,7 @@ pub fn parse_and_validate(
 
     let mut repositories = HashSet::new();
     let mut grants = HashSet::new();
-    for policy in &envelope.repository_policies {
+    for policy in envelope.repository_policies() {
         let mut branch_patterns = HashSet::new();
         if !valid_uuid(&policy.repository_id)
             || !valid_uuid(&policy.enrollment_id)
@@ -317,10 +486,72 @@ pub fn parse_and_validate(
             }
         }
     }
-    if bootstrap.repository_count() < envelope.repository_policies.len() {
+    if bootstrap.repository_count() < envelope.repository_policies().len() {
         return Err(AcknowledgementResult::RejectedInvalid);
     }
     Ok(envelope)
+}
+
+pub fn authorize_desired_release(
+    state_path: &Path,
+    configuration_id: &str,
+    epoch: u64,
+    now: DateTime<Utc>,
+    client_version: &str,
+    bootstrap: &dyn BootstrapRepositories,
+    verifier: &dyn ConfigurationVerifier,
+) -> Result<DesiredReleaseAuthorization, ReleaseAuthorizationDenial> {
+    let state = load_state(state_path).map_err(|_| ReleaseAuthorizationDenial::StateUnavailable)?;
+    let retained = [state.active.as_ref(), state.previous.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            candidate.envelope.configuration_id() == configuration_id
+                && candidate.envelope.epoch() == epoch
+        })
+        .ok_or(ReleaseAuthorizationDenial::NotRetained)?;
+    let exact_json = retained
+        .exact_json
+        .as_deref()
+        .ok_or(ReleaseAuthorizationDenial::MissingExactJson)?;
+    if hex_digest(exact_json.as_bytes()) != retained.digest {
+        return Err(ReleaseAuthorizationDenial::DigestMismatch);
+    }
+    let parsed = parse_and_validate(exact_json.as_bytes(), now, client_version, bootstrap)
+        .map_err(map_authorization_validation_denial)?;
+    if parsed != retained.envelope {
+        return Err(ReleaseAuthorizationDenial::EnvelopeMismatch);
+    }
+    match verifier.verify(exact_json.as_bytes(), parsed.verification()) {
+        VerificationResult::Rejected => {
+            return Err(ReleaseAuthorizationDenial::VerificationRejected);
+        }
+        VerificationResult::Unavailable => {
+            return Err(ReleaseAuthorizationDenial::VerificationUnavailable);
+        }
+        VerificationResult::Verified => {}
+    }
+    let desired_release = parsed
+        .desired_release()
+        .cloned()
+        .ok_or(ReleaseAuthorizationDenial::SchemaV1)?;
+    Ok(DesiredReleaseAuthorization {
+        configuration_id: configuration_id.to_string(),
+        epoch,
+        desired_release,
+    })
+}
+
+fn map_authorization_validation_denial(
+    result: AcknowledgementResult,
+) -> ReleaseAuthorizationDenial {
+    match result {
+        AcknowledgementResult::RejectedExpired => ReleaseAuthorizationDenial::RejectedExpired,
+        AcknowledgementResult::RejectedIncompatible => {
+            ReleaseAuthorizationDenial::RejectedIncompatible
+        }
+        _ => ReleaseAuthorizationDenial::RejectedInvalid,
+    }
 }
 
 pub fn load_state(path: &Path) -> Result<FleetState, std::io::Error> {
@@ -343,20 +574,23 @@ fn activate_verified(
             previous: None,
         },
         Some(active)
-            if candidate.envelope.epoch == active.envelope.epoch
-                && candidate.envelope.configuration_id == active.envelope.configuration_id
+            if candidate.envelope.epoch() == active.envelope.epoch()
+                && candidate.envelope.configuration_id() == active.envelope.configuration_id()
                 && candidate.digest == active.digest =>
         {
-            current.clone()
+            FleetState {
+                active: Some(candidate),
+                previous: current.previous.clone(),
+            }
         }
-        Some(active) if candidate.envelope.epoch > active.envelope.epoch => FleetState {
+        Some(active) if candidate.envelope.epoch() > active.envelope.epoch() => FleetState {
             active: Some(candidate),
             previous: Some(active.clone()),
         },
         Some(active)
             if current.previous.as_ref().is_some_and(|previous| {
-                previous.envelope.epoch == candidate.envelope.epoch
-                    && previous.envelope.configuration_id == candidate.envelope.configuration_id
+                previous.envelope.epoch() == candidate.envelope.epoch()
+                    && previous.envelope.configuration_id() == candidate.envelope.configuration_id()
                     && previous.digest == candidate.digest
             }) =>
         {
@@ -487,6 +721,49 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn canonical_version(value: &str) -> Option<semver::Version> {
+    if value.is_empty() || value.len() > 64 {
+        return None;
+    }
+    let parsed = semver::Version::parse(value).ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn valid_desired_release(release: &DesiredRelease) -> bool {
+    if canonical_version(&release.version).is_none()
+        || release.release_tag.is_empty()
+        || release.release_tag.len() > 128
+        || release.release_tag.contains("..")
+        || !release
+            .release_tag
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+            })
+        || release.manifest_sha256.len() != 64
+        || !release
+            .manifest_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    let expected = format!(
+        "https://github.com/mahamannu-ux/git-ai/releases/download/{}/SHA256SUMS",
+        release.release_tag
+    );
+    release.manifest_url == expected
+        && url::Url::parse(&release.manifest_url).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("github.com")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+}
+
 fn valid_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
@@ -525,6 +802,10 @@ mod tests {
 
     fn raw(epoch: u64, id: &str) -> Vec<u8> {
         format!(r#"{{"schemaVersion":1,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","targetClientVersion":"1.6.19","channel":"latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityActivation":{{"mode":"monitor","version":1}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
+    }
+
+    fn v2_raw(epoch: u64, id: &str) -> Vec<u8> {
+        format!(r#"{{"schemaVersion":2,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","clientCompatibility":{{"minimumVersion":"1.6.18","maximumVersion":"1.6.20"}},"desiredRelease":{{"version":"9.8.7","releaseTag":"v9.8.7","manifestUrl":"https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"channel":"enterprise-latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityActivation":{{"mode":"monitor","version":1}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
     }
 
     fn repositories() -> Repositories {
@@ -598,8 +879,8 @@ mod tests {
             AcknowledgementResult::Applied
         );
         let state = load_state(&path).unwrap();
-        assert_eq!(state.active.unwrap().envelope.epoch, 1);
-        assert_eq!(state.previous.unwrap().envelope.epoch, 2);
+        assert_eq!(state.active.unwrap().envelope.epoch(), 1);
+        assert_eq!(state.previous.unwrap().envelope.epoch(), 2);
     }
 
     #[test]
@@ -626,7 +907,7 @@ mod tests {
                 .active
                 .unwrap()
                 .envelope
-                .repository_policies[0]
+                .repository_policies()[0]
                 .branch_patterns
                 .is_empty()
         );
@@ -779,7 +1060,309 @@ mod tests {
             AcknowledgementResult::ActivationFailed
         );
         let state = load_state(&path).unwrap();
-        assert_eq!(state.active.unwrap().envelope.epoch, 2);
-        assert_eq!(state.previous.unwrap().envelope.epoch, 1);
+        assert_eq!(state.active.unwrap().envelope.epoch(), 2);
+        assert_eq!(state.previous.unwrap().envelope.epoch(), 1);
+    }
+
+    #[test]
+    fn schema_v2_uses_inclusive_semver_compatibility_independent_of_desired_release() {
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let raw = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        assert!(parse_and_validate(&raw, now, "1.6.18", &repositories()).is_ok());
+        assert!(parse_and_validate(&raw, now, "1.6.20", &repositories()).is_ok());
+        assert_eq!(
+            parse_and_validate(&raw, now, "1.6.21", &repositories()),
+            Err(AcknowledgementResult::RejectedIncompatible)
+        );
+
+        for (path, replacement) in [
+            (
+                "/clientCompatibility/minimumVersion",
+                serde_json::json!("01.6.18"),
+            ),
+            (
+                "/clientCompatibility/maximumVersion",
+                serde_json::json!("1.6"),
+            ),
+            ("/desiredRelease/version", serde_json::json!("latest")),
+            ("/desiredRelease/releaseTag", serde_json::json!("../v9.8.7")),
+            (
+                "/desiredRelease/manifestSha256",
+                serde_json::json!("A".repeat(64)),
+            ),
+            (
+                "/clientCompatibility/minimumVersion",
+                serde_json::json!("1.6.21"),
+            ),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            *value.pointer_mut(path).unwrap() = replacement;
+            if path == "/clientCompatibility/minimumVersion"
+                && value["clientCompatibility"]["minimumVersion"] == "1.6.21"
+            {
+                value["clientCompatibility"]["maximumVersion"] = serde_json::json!("1.6.20");
+            }
+            assert_eq!(
+                parse_and_validate(
+                    &serde_json::to_vec(&value).unwrap(),
+                    now,
+                    "1.6.19",
+                    &repositories()
+                ),
+                Err(AcknowledgementResult::RejectedInvalid),
+                "accepted invalid {path}"
+            );
+        }
+
+        let invalid_urls = [
+            "https://github.com/mahamannu-ux/git-ai/releases/latest/download/SHA256SUMS",
+            "https://github.com/other/git-ai/releases/download/v9.8.7/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.6/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7%2fother/SHA256SUMS",
+            "https://user@github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/../v9.8.7/SHA256SUMS",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS?x=1",
+            "https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS#x",
+        ];
+        for manifest_url in invalid_urls {
+            let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            value["desiredRelease"]["manifestUrl"] = serde_json::json!(manifest_url);
+            assert_eq!(
+                parse_and_validate(
+                    &serde_json::to_vec(&value).unwrap(),
+                    now,
+                    "1.6.19",
+                    &repositories()
+                ),
+                Err(AcknowledgementResult::RejectedInvalid),
+                "accepted invalid URL {manifest_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_persisted_v2_bytes_are_reverified_for_active_and_retained_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let first = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let second = v2_raw(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        let verifier = Verifier(VerificationResult::Verified);
+        for raw in [&first, &second] {
+            assert_eq!(
+                process_configuration(raw, now, "1.6.19", &repositories(), &verifier, &path).result,
+                AcknowledgementResult::Applied
+            );
+        }
+        let state = load_state(&path).unwrap();
+        assert_eq!(
+            state.active.as_ref().unwrap().exact_json.as_deref(),
+            std::str::from_utf8(&second).ok()
+        );
+        assert_eq!(
+            state.previous.as_ref().unwrap().exact_json.as_deref(),
+            std::str::from_utf8(&first).ok()
+        );
+
+        let active = authorize_desired_release(
+            &path,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            2,
+            now,
+            "1.6.19",
+            &repositories(),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(active.desired_release.version, "9.8.7");
+        let previous = authorize_desired_release(
+            &path,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            1,
+            now,
+            "1.6.19",
+            &repositories(),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            previous.configuration_id,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn authorization_denials_preserve_active_and_previous_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let candidate = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        process_configuration(
+            &candidate,
+            now,
+            "1.6.19",
+            &repositories(),
+            &Verifier(VerificationResult::Verified),
+            &path,
+        );
+        let original = std::fs::read(&path).unwrap();
+
+        for verifier in [
+            Verifier(VerificationResult::Unavailable),
+            Verifier(VerificationResult::Rejected),
+        ] {
+            assert!(
+                authorize_desired_release(
+                    &path,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    1,
+                    now,
+                    "1.6.19",
+                    &repositories(),
+                    &verifier,
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        let mut state = load_state(&path).unwrap();
+        state.active.as_mut().unwrap().exact_json = None;
+        atomic_write_json(&path, &state).unwrap();
+        assert_eq!(
+            authorize_desired_release(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::MissingExactJson)
+        );
+
+        let legacy_path = temp.path().join("fleet/legacy.json");
+        let legacy = VerifiedConfiguration {
+            digest: hex_digest(&raw(1, "cccccccc-cccc-4ccc-8ccc-cccccccccccc")),
+            envelope: parse_and_validate(
+                &raw(1, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+                now,
+                "1.6.19",
+                &repositories(),
+            )
+            .unwrap(),
+            exact_json: None,
+        };
+        atomic_write_json(
+            &legacy_path,
+            &FleetState {
+                active: Some(legacy),
+                previous: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            authorize_desired_release(
+                &legacy_path,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                1,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::MissingExactJson)
+        );
+    }
+
+    #[test]
+    fn tamper_expiry_incompatibility_schema_v1_and_unretained_requests_are_denied() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let candidate = v2_raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        process_configuration(
+            &candidate,
+            now,
+            "1.6.19",
+            &repositories(),
+            &Verifier(VerificationResult::Verified),
+            &path,
+        );
+
+        let authorize = |path: &Path, now, client_version| {
+            authorize_desired_release(
+                path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                now,
+                client_version,
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            )
+        };
+        assert_eq!(
+            authorize(&path, "2026-10-13T01:00:00Z".parse().unwrap(), "1.6.19"),
+            Err(ReleaseAuthorizationDenial::RejectedExpired)
+        );
+        assert_eq!(
+            authorize(&path, now, "1.6.21"),
+            Err(ReleaseAuthorizationDenial::RejectedIncompatible)
+        );
+        assert_eq!(
+            authorize_desired_release(
+                &path,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                0,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::NotRetained)
+        );
+
+        let mut state = load_state(&path).unwrap();
+        state.active.as_mut().unwrap().digest = "b".repeat(64);
+        atomic_write_json(&path, &state).unwrap();
+        assert_eq!(
+            authorize(&path, now, "1.6.19"),
+            Err(ReleaseAuthorizationDenial::DigestMismatch)
+        );
+
+        let mut state = load_state(&path).unwrap();
+        let exact = state.active.as_ref().unwrap().exact_json.as_ref().unwrap();
+        let changed = exact.replace("\"ring\":null", "\"ring\":\"changed\"");
+        state.active.as_mut().unwrap().digest = hex_digest(changed.as_bytes());
+        state.active.as_mut().unwrap().exact_json = Some(changed);
+        atomic_write_json(&path, &state).unwrap();
+        assert_eq!(
+            authorize(&path, now, "1.6.19"),
+            Err(ReleaseAuthorizationDenial::EnvelopeMismatch)
+        );
+
+        let v1_path = temp.path().join("fleet/v1.json");
+        let v1 = raw(1, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        process_configuration(
+            &v1,
+            now,
+            "1.6.19",
+            &repositories(),
+            &Verifier(VerificationResult::Verified),
+            &v1_path,
+        );
+        assert_eq!(
+            authorize_desired_release(
+                &v1_path,
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                1,
+                now,
+                "1.6.19",
+                &repositories(),
+                &Verifier(VerificationResult::Verified),
+            ),
+            Err(ReleaseAuthorizationDenial::SchemaV1)
+        );
     }
 }
