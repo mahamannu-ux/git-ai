@@ -34,6 +34,14 @@ fn windows_script() -> String {
     mdm_file("windows/install-login-start.ps1")
 }
 
+fn macos_cleanup_script() -> String {
+    mdm_file("macos/cleanup-endpoint.sh")
+}
+
+fn windows_cleanup_script() -> String {
+    mdm_file("windows/cleanup-endpoint.ps1")
+}
+
 /// Asserts that the plist `<key>` is immediately followed by `<value/>`,
 /// ignoring the whitespace between them.
 fn plist_key_has_value(plist: &str, key: &str, value: &str) -> bool {
@@ -243,5 +251,77 @@ fn release_workflow_publishes_the_scripts_as_assets() {
     assert!(
         release.contains("sha256sum install.sh install.ps1 git-ai-login-start-*"),
         "login-start assets must be covered by SHA256SUMS"
+    );
+}
+
+#[test]
+fn cleanup_wrappers_are_dry_run_first_and_explicit() {
+    for (name, script) in [
+        ("macos", macos_cleanup_script()),
+        ("windows", windows_cleanup_script()),
+    ] {
+        assert!(
+            script.contains("--dry-run") && script.contains("--apply"),
+            "{name} cleanup wrapper must support --dry-run and --apply"
+        );
+        assert!(
+            script.contains("--bin"),
+            "{name} cleanup wrapper must support --bin like the login-start scripts"
+        );
+        assert!(
+            script.contains("fleet cleanup"),
+            "{name} cleanup wrapper must reuse the fleet cleanup command surface"
+        );
+        assert!(
+            script.contains("--uninstall"),
+            "{name} cleanup wrapper must deregister login-start via the existing --uninstall scripts"
+        );
+        assert!(
+            !script.contains("rm -rf \"$HOME/.git-ai\"")
+                && !script.contains("Remove-Item -Recurse"),
+            "{name} cleanup wrapper must never erase ~/.git-ai wholesale"
+        );
+        for forbidden in ["trk_v1", "API_KEY", "API_BASE", "api-key"] {
+            assert!(
+                !script.contains(forbidden),
+                "{name} cleanup wrapper must not transport credentials ({forbidden})"
+            );
+        }
+        assert!(
+            !script.contains("--env") && !script.contains("--system"),
+            "{name} cleanup wrapper is per-user only with no config transport"
+        );
+    }
+    assert!(
+        macos_cleanup_script().contains("MODE=\"dry-run\""),
+        "macOS cleanup wrapper must default to dry-run"
+    );
+    assert!(
+        windows_cleanup_script().contains("$Mode = 'dry-run'"),
+        "Windows cleanup wrapper must default to dry-run"
+    );
+    assert!(
+        macos_cleanup_script().contains("not as root"),
+        "macOS cleanup wrapper must stay per-user like its login-start sibling"
+    );
+    assert!(
+        !windows_cleanup_script().contains("-RunLevel Highest"),
+        "Windows cleanup wrapper must stay unelevated"
+    );
+    assert!(
+        macos_cleanup_script().contains("must be an absolute path")
+            && macos_cleanup_script().contains("carriage return"),
+        "macOS cleanup wrapper must validate --bin paths"
+    );
+    assert!(
+        windows_cleanup_script().contains("must be an absolute path")
+            && windows_cleanup_script().contains("[a-zA-Z]:[\\\\/]"),
+        "Windows cleanup wrapper must require fully-qualified --bin paths"
+    );
+    let linux_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mdm/linux/cleanup-endpoint.sh");
+    assert!(
+        !linux_path.exists(),
+        "Task9d ships no Linux cleanup wrapper"
     );
 }
