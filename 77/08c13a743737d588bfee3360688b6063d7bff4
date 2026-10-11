@@ -1,0 +1,19 @@
+src/daemon.rs
+  s_a32c1db8890c86::t_4fb680826a3b0a 50,8331-8372,8448-8451,8456-8477,8584-8585,9792-9818
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "7708c13a743737d588bfee3360688b6063d7bff4",
+  "prompts": {},
+  "sessions": {
+    "s_a32c1db8890c86": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ed3eb5761ffe859IsiLABPeFLG",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
