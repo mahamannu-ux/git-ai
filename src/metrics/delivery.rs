@@ -607,26 +607,29 @@ impl MetricDeliveryRuntime {
         )
     }
 
-    /// Apply the retained active configuration's exact managed release, if
-    /// authorized. Denials skip safely; failures preserve queue and state.
-    pub fn apply_retained_managed_release(
+    /// Stage the retained active configuration's exact managed release, if
+    /// authorized. Verifies and stages bytes only; installation happens
+    /// post-shutdown via the coordinated restart path. Denials skip safely.
+    pub fn stage_retained_managed_release(
         &self,
         now: chrono::DateTime<chrono::Utc>,
         verifier: &dyn crate::fleet::ConfigurationVerifier,
         state_path: &std::path::Path,
-        deps: &dyn crate::fleet::managed_update::ManagedUpdateDeps,
+        fetch: &dyn crate::fleet::managed_update::BundleFetch,
+        staging_dir: &std::path::Path,
     ) -> Result<
-        crate::fleet::managed_update::ManagedApplyOutcome,
+        crate::fleet::managed_update::StageOutcome,
         crate::fleet::managed_update::ManagedUpdateError,
     > {
-        crate::fleet::managed_update::apply_retained_release(
+        crate::fleet::managed_update::stage_retained_release(
             state_path,
             now,
             env!("CARGO_PKG_VERSION"),
             &self.policy,
             verifier,
             env!("CARGO_PKG_VERSION"),
-            deps,
+            fetch,
+            staging_dir,
         )
     }
 
