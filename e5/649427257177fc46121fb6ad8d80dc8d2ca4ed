@@ -1,0 +1,19 @@
+src/fleet/mod.rs
+  s_6fb037dd3f4761::t_cd1b3fcbe591f6 530-533,789-989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "e5649427257177fc46121fb6ad8d80dc8d2ca4ed",
+  "prompts": {},
+  "sessions": {
+    "s_6fb037dd3f4761": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12b14-62dd-71e1-89a0-24fc63c3b879",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
