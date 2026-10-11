@@ -1,0 +1,21 @@
+mdm/macos/cleanup-endpoint.sh
+  s_a32c1db8890c86::t_40e604a8b68c32 1-75
+src/commands/fleet.rs
+  s_a32c1db8890c86::t_e9157f7b3f2790 51-64,150-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "5bac85220cfb5c742b46560d3822f159abf7496d",
+  "prompts": {},
+  "sessions": {
+    "s_a32c1db8890c86": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ed3eb5761ffe859IsiLABPeFLG",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
