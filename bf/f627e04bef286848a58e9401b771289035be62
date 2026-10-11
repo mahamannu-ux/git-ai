@@ -1,0 +1,21 @@
+src/commands/upgrade.rs
+  s_a32c1db8890c86::t_74e4f5b4a06b0a 326,343,499-503
+src/fleet/managed_update.rs
+  s_a32c1db8890c86::t_f24c09d72b188c 1-800
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "bff627e04bef286848a58e9401b771289035be62",
+  "prompts": {},
+  "sessions": {
+    "s_a32c1db8890c86": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ed3eb5761ffe859IsiLABPeFLG",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
