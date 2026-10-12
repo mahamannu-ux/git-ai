@@ -48,6 +48,25 @@ pub fn handle_fleet(args: &[String]) {
                 .map_err(|error| status_code(error.code))
                 .map(|()| println!("fleet_credential_deleted key_id={key_id}"))
         }
+        [scope, flag] if scope == "cleanup" && flag == "--dry-run" => dirs::home_dir()
+            .ok_or("home_unavailable")
+            .map(|home| print_cleanup_plan(&crate::fleet::cleanup::plan_cleanup(&home))),
+        [scope, flag] if scope == "cleanup" && flag == "--apply" => {
+            dirs::home_dir().ok_or("home_unavailable").map(|home| {
+                let plan = crate::fleet::cleanup::plan_cleanup(&home);
+                let steps = crate::fleet::cleanup::apply_cleanup(
+                    &plan,
+                    &home,
+                    default_machine_credential_store().as_ref(),
+                    &crate::fleet::cleanup::PlatformLoginStart,
+                );
+                print_cleanup_steps(&steps);
+                if crate::fleet::cleanup::cleanup_apply_exit_code(&steps) != 0 {
+                    eprintln!("fleet_error code=cleanup_failed");
+                    std::process::exit(1);
+                }
+            })
+        }
         _ => Err("usage"),
     };
     if let Err(code) = result {
@@ -131,6 +150,43 @@ fn read_bounded(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, &'stat
 
 fn default_policy_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".git-ai").join(TRACKAI_DELIVERY_POLICY_FILE))
+}
+
+/// Dry-run prints only bounded safe metadata: planned actions, paths and
+/// credential key IDs. It performs no mutation.
+fn print_cleanup_plan(plan: &crate::fleet::cleanup::CleanupPlan) {
+    for key_id in &plan.credential_key_ids {
+        println!("fleet_cleanup_plan action=delete-credential target=key_id={key_id}");
+    }
+    for path in &plan.remove_files {
+        println!(
+            "fleet_cleanup_plan action=remove-file target={}",
+            path.to_string_lossy()
+        );
+    }
+    for dir in &plan.remove_dirs {
+        println!(
+            "fleet_cleanup_plan action=remove-dir target={}",
+            dir.to_string_lossy()
+        );
+    }
+    if plan.deregister_login_start {
+        println!(
+            "fleet_cleanup_plan action=deregister-login-start target=login-start-registration"
+        );
+    }
+}
+
+/// Apply reports safe per-step results without secrets.
+fn print_cleanup_steps(steps: &[crate::fleet::cleanup::CleanupStep]) {
+    for step in steps {
+        println!(
+            "fleet_cleanup_step action={} target={} result={}",
+            step.action,
+            step.target,
+            step.result.as_str()
+        );
+    }
 }
 
 fn status_code(code: MachineCredentialStoreCode) -> &'static str {

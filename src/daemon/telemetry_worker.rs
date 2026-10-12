@@ -831,7 +831,49 @@ fn refresh_managed_fleet(runtime: &MetricDeliveryRuntime) -> Result<(), GitAiErr
             response.status_code
         )));
     }
+    stage_retained_managed_release_best_effort(runtime, now);
     Ok(())
+}
+
+/// Best-effort managed exact-release staging after a successful fleet report.
+/// Verifies and stages bytes only, then requests the existing coordinated
+/// `RestartAfterUpdate` path so installation runs after graceful shutdown with
+/// checkpoint draining. Never installs or restarts here. Production still uses
+/// `UnavailableVerifier`, so this performs zero lifecycle side effects until
+/// Task15 supplies the real verifier.
+#[cfg(any(target_os = "macos", windows))]
+fn stage_retained_managed_release_best_effort(
+    runtime: &MetricDeliveryRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let (state_path, staging_dir) = match (
+        crate::fleet::default_state_path(),
+        crate::fleet::managed_update::default_staging_dir(),
+    ) {
+        (Some(state_path), Some(staging_dir)) => (state_path, staging_dir),
+        _ => return,
+    };
+    let outcome = runtime.stage_retained_managed_release(
+        now,
+        &crate::fleet::UnavailableVerifier,
+        &state_path,
+        &crate::fleet::managed_update::ProductionBundleFetch,
+        &staging_dir,
+    );
+    match outcome {
+        Ok(crate::fleet::managed_update::StageOutcome::Staged { version, tag }) => {
+            tracing::info!(
+                version = version.as_str(),
+                tag = tag.as_str(),
+                "managed fleet release staged"
+            );
+            crate::daemon::request_managed_restart_after_update();
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "managed fleet release unavailable");
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", windows, test))]

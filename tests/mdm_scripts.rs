@@ -34,6 +34,14 @@ fn windows_script() -> String {
     mdm_file("windows/install-login-start.ps1")
 }
 
+fn macos_cleanup_script() -> String {
+    mdm_file("macos/cleanup-endpoint.sh")
+}
+
+fn windows_cleanup_script() -> String {
+    mdm_file("windows/cleanup-endpoint.ps1")
+}
+
 /// Asserts that the plist `<key>` is immediately followed by `<value/>`,
 /// ignoring the whitespace between them.
 fn plist_key_has_value(plist: &str, key: &str, value: &str) -> bool {
@@ -244,4 +252,162 @@ fn release_workflow_publishes_the_scripts_as_assets() {
         release.contains("sha256sum install.sh install.ps1 git-ai-login-start-*"),
         "login-start assets must be covered by SHA256SUMS"
     );
+}
+
+#[test]
+fn cleanup_wrappers_are_dry_run_first_and_explicit() {
+    for (name, script) in [
+        ("macos", macos_cleanup_script()),
+        ("windows", windows_cleanup_script()),
+    ] {
+        assert!(
+            script.contains("--dry-run") && script.contains("--apply"),
+            "{name} cleanup wrapper must support --dry-run and --apply"
+        );
+        assert!(
+            script.contains("--bin"),
+            "{name} cleanup wrapper must support --bin like the login-start scripts"
+        );
+        assert!(
+            script.contains("fleet cleanup"),
+            "{name} cleanup wrapper must reuse the fleet cleanup command surface"
+        );
+        assert!(
+            script.contains("--uninstall"),
+            "{name} cleanup wrapper must deregister login-start via the existing --uninstall scripts"
+        );
+        assert!(
+            !script.contains("rm -rf \"$HOME/.git-ai\"")
+                && !script.contains("Remove-Item -Recurse"),
+            "{name} cleanup wrapper must never erase ~/.git-ai wholesale"
+        );
+        for forbidden in ["trk_v1", "API_KEY", "API_BASE", "api-key"] {
+            assert!(
+                !script.contains(forbidden),
+                "{name} cleanup wrapper must not transport credentials ({forbidden})"
+            );
+        }
+        assert!(
+            !script.contains("--env") && !script.contains("--system"),
+            "{name} cleanup wrapper is per-user only with no config transport"
+        );
+    }
+    assert!(
+        macos_cleanup_script().contains("MODE=\"dry-run\""),
+        "macOS cleanup wrapper must default to dry-run"
+    );
+    assert!(
+        windows_cleanup_script().contains("$Mode = 'dry-run'"),
+        "Windows cleanup wrapper must default to dry-run"
+    );
+    assert!(
+        macos_cleanup_script().contains("not as root"),
+        "macOS cleanup wrapper must stay per-user like its login-start sibling"
+    );
+    assert!(
+        !windows_cleanup_script().contains("-RunLevel Highest"),
+        "Windows cleanup wrapper must stay unelevated"
+    );
+    assert!(
+        macos_cleanup_script().contains("must be an absolute path")
+            && macos_cleanup_script().contains("carriage return"),
+        "macOS cleanup wrapper must validate --bin paths"
+    );
+    assert!(
+        windows_cleanup_script().contains("must be an absolute path")
+            && windows_cleanup_script().contains("[a-zA-Z]:[\\\\/]"),
+        "Windows cleanup wrapper must require fully-qualified --bin paths"
+    );
+    let linux_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mdm/linux/cleanup-endpoint.sh");
+    assert!(
+        !linux_path.exists(),
+        "Task9d ships no Linux cleanup wrapper"
+    );
+}
+
+#[test]
+fn cleanup_wrappers_propagate_uninstall_failure() {
+    let macos = macos_cleanup_script();
+    assert!(
+        !macos.contains("|| true"),
+        "macOS cleanup wrapper must not silence the uninstall step"
+    );
+    for marker in ["UNINSTALL_STATUS", "CLEANUP_STATUS", "exit 1"] {
+        assert!(
+            macos.contains(marker),
+            "macOS cleanup wrapper must propagate uninstall/cleanup failure ({marker})"
+        );
+    }
+
+    let windows = windows_cleanup_script();
+    assert!(
+        !windows.contains("catch { }"),
+        "Windows cleanup wrapper must not swallow uninstall failure"
+    );
+    for marker in ["$uninstallFailed", "$cleanupOk", "exit 1"] {
+        assert!(
+            windows.contains(marker),
+            "Windows cleanup wrapper must propagate uninstall/cleanup failure ({marker})"
+        );
+    }
+}
+
+/// Exercise the macOS cleanup wrapper end to end with stubbed siblings: the
+/// wrapper must still run `fleet cleanup --apply` when uninstall fails, and
+/// must exit nonzero when either half fails.
+#[cfg(unix)]
+#[test]
+fn macos_cleanup_wrapper_runs_cleanup_and_reports_each_half() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    std::fs::copy(
+        manifest.join("mdm/macos/cleanup-endpoint.sh"),
+        dir.join("cleanup-endpoint.sh"),
+    )
+    .unwrap();
+    // Fake git-ai: records its arguments and exits as directed.
+    write_executable(
+        &dir.join("git-ai"),
+        "#!/bin/sh\necho \"$@\" >> \"$FAKE_LOG\"\nexit \"${FAKE_GIT_AI_EXIT:-0}\"\n",
+    );
+
+    for (uninstall_exit, cleanup_exit, expected) in [(1, 0, 1), (0, 1, 1), (0, 0, 0)] {
+        write_executable(
+            &dir.join("install-login-start.sh"),
+            &format!("#!/bin/sh\nexit {uninstall_exit}\n"),
+        );
+        let _ = std::fs::remove_file(dir.join("calls.log"));
+        let output = std::process::Command::new("sh")
+            .arg(dir.join("cleanup-endpoint.sh"))
+            .arg("--apply")
+            .arg("--bin")
+            .arg(dir.join("git-ai"))
+            .env("HOME", dir)
+            .env("FAKE_LOG", dir.join("calls.log"))
+            .env("FAKE_GIT_AI_EXIT", cleanup_exit.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "uninstall={uninstall_exit} cleanup={cleanup_exit}"
+        );
+        // Cleanup always runs, even when uninstall fails.
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(
+            calls.contains("fleet cleanup --apply"),
+            "cleanup must run despite uninstall failure: {calls}"
+        );
+    }
 }

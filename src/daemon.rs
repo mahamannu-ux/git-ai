@@ -47,7 +47,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
@@ -8328,6 +8328,48 @@ fn daemon_socket_health_check_loop(
     }
 }
 
+/// Weak handle to the running daemon's coordinator, registered once at startup
+/// so the telemetry worker can request a coordinated restart-after-update for
+/// a staged managed release without threading handles through the flush path.
+#[cfg(any(target_os = "macos", windows))]
+static MANAGED_UPDATE_COORDINATOR: OnceLock<Weak<ActorDaemonCoordinator>> = OnceLock::new();
+
+/// Request a graceful restart-after-update for a staged managed release.
+/// Mirrors the update loop's checkpoint-drain deferral: while accepted
+/// checkpoints remain outstanding the request is deferred (telemetry retries
+/// on its next refresh) and no shutdown is requested. Returns true when the
+/// restart was requested. Installation itself runs post-shutdown in
+/// `daemon_run_pending_self_update`.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn request_managed_restart_after_update() -> bool {
+    let Some(coordinator) = MANAGED_UPDATE_COORDINATOR.get().and_then(Weak::upgrade) else {
+        return false;
+    };
+    request_managed_restart_after_update_with(&coordinator)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn request_managed_restart_after_update_with(
+    coordinator: &ActorDaemonCoordinator,
+) -> bool {
+    if coordinator.is_shutting_down() {
+        return false;
+    }
+    let (outstanding_checkpoints, retained_checkpoint_bytes) =
+        coordinator.outstanding_checkpoint_state();
+    if outstanding_checkpoints > 0 {
+        tracing::info!(
+            outstanding_checkpoints,
+            retained_checkpoint_bytes,
+            "managed update restart deferred while accepted checkpoints remain"
+        );
+        return false;
+    }
+    tracing::info!("managed update staged, requesting shutdown");
+    coordinator.request_restart_after_update();
+    true
+}
+
 /// Background loop that periodically checks for available updates.
 ///
 /// Sleeps in short increments so it can exit promptly when the coordinator
@@ -8403,10 +8445,52 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 
 /// After the daemon has fully shut down, attempt to install any pending update.
 ///
+/// A staged managed release installs first: it carries an explicit fleet
+/// authorization, while the channel path below is advisory. Managed staging is
+/// cleared on success and on failure, so a failed install never restart-loops.
+///
 /// On Unix the installer atomically replaces the binary via `mv`; on Windows
 /// the installer is spawned as a detached process that polls until the exe is
 /// unlocked.
 pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
+    use crate::fleet::managed_update::{
+        ProductionBundleInstaller, StagedInstallOutcome, install_managed_update_post_shutdown,
+    };
+
+    let managed_paths = (|| {
+        Some((
+            crate::fleet::default_state_path()?,
+            crate::fleet::managed_update::default_staging_dir()?,
+            crate::metrics::delivery::MetricDeliveryRuntime::load_managed_bootstrap()?,
+        ))
+    })();
+    if let Some((state_path, staging_dir, bootstrap)) = managed_paths {
+        match install_managed_update_post_shutdown(
+            &state_path,
+            chrono::Utc::now(),
+            env!("CARGO_PKG_VERSION"),
+            &bootstrap,
+            &crate::fleet::UnavailableVerifier,
+            env!("CARGO_PKG_VERSION"),
+            &ProductionBundleInstaller,
+            &staging_dir,
+        ) {
+            Ok(StagedInstallOutcome::Installed { version, tag }) => {
+                tracing::info!(
+                    version = version.as_str(),
+                    tag = tag.as_str(),
+                    "self-update: managed release installed successfully"
+                );
+                return DaemonSelfUpdateOutcome::Installed;
+            }
+            Ok(StagedInstallOutcome::NoStagedBundle) => {}
+            Err(error) => {
+                tracing::warn!(%error, "self-update: managed release installation failed");
+                return DaemonSelfUpdateOutcome::Failed;
+            }
+        }
+    }
+
     use crate::commands::upgrade::{
         DaemonUpdateCheckResult, check_and_install_update_if_available,
     };
@@ -8513,6 +8597,8 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     }
 
     let coordinator = Arc::new(coordinator_inner);
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = MANAGED_UPDATE_COORDINATOR.set(Arc::downgrade(&coordinator));
     coordinator.start_trace_ingest_worker()?;
     coordinator.start_checkpoint_ingress_worker()?;
     let rt_handle = tokio::runtime::Handle::current();
@@ -9716,6 +9802,33 @@ mod tests {
 
             assert!(coordinator.is_shutting_down());
             assert_eq!(coordinator.shutdown_action(), DaemonExitAction::Stop);
+        });
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn managed_restart_request_uses_coordinated_shutdown_not_direct_install() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            // A staged managed release requests the coordinated
+            // RestartAfterUpdate path (drained shutdown, install after death).
+            let coordinator = ActorDaemonCoordinator::new();
+            assert!(request_managed_restart_after_update_with(&coordinator));
+            assert!(coordinator.is_shutting_down());
+            assert_eq!(
+                coordinator.shutdown_action(),
+                DaemonExitAction::RestartAfterUpdate
+            );
+
+            // An explicit stop wins: no restart is requested over it.
+            let stopping = ActorDaemonCoordinator::new();
+            stopping.request_stop();
+            assert!(!request_managed_restart_after_update_with(&stopping));
+            assert_eq!(stopping.shutdown_action(), DaemonExitAction::Stop);
         });
     }
 
