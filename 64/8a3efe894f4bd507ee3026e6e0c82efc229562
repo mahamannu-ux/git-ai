@@ -1,0 +1,19 @@
+src/fleet/managed_update.rs
+  s_a32c1db8890c86::t_eabb18df4990b0 44-45,238-243,271-272,278-334,352-361,373-377,401-404,406-438,482-543,765-782,953-955,958-965,967-982,985,995-996,998,1004-1114,1310,1312-1326,1333,1338,1351,1363,1374,1376-1403,1407,1412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.16",
+  "base_commit_sha": "648a3efe894f4bd507ee3026e6e0c82efc229562",
+  "prompts": {},
+  "sessions": {
+    "s_a32c1db8890c86": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ed3eb5761ffe859IsiLABPeFLG",
+        "model": "muse-spark-1.3-contributor-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
