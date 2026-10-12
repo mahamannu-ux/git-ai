@@ -41,6 +41,8 @@ const VERSION_FILE: &str = "version";
 const MANIFEST_SHA_FILE: &str = "manifest.sha256";
 const MANIFEST_FILE: &str = "manifest";
 const SCRIPT_FILE: &str = "script";
+const BINDING_ID_FILE: &str = "config.id";
+const BINDING_EPOCH_FILE: &str = "config.epoch";
 const MAX_STAGED_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_STAGED_SCRIPT_BYTES: usize = 1024 * 1024;
 
@@ -233,7 +235,12 @@ pub fn fetch_and_verify_bundle(
 
 /// Default staging directory (`~/.git-ai/fleet/pending-update/`).
 pub fn default_staging_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".git-ai").join(PENDING_UPDATE_REL))
+    dirs::home_dir().map(|home| staging_dir_for_home(&home))
+}
+
+/// Staging directory for an explicit home (used by endpoint cleanup).
+pub fn staging_dir_for_home(home: &Path) -> PathBuf {
+    home.join(".git-ai").join(PENDING_UPDATE_REL)
 }
 
 fn write_staged_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ManagedUpdateError> {
@@ -261,9 +268,68 @@ fn clear_staging_dir(dir: &Path) {
         MANIFEST_SHA_FILE,
         MANIFEST_FILE,
         SCRIPT_FILE,
+        BINDING_ID_FILE,
+        BINDING_EPOCH_FILE,
     ] {
         let _ = std::fs::remove_file(dir.join(name));
     }
+}
+
+/// Authorization binding recorded alongside staged bytes. A staged bundle may
+/// only install while this binding still matches the retained active
+/// authorization; anything else is cleared, never installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedBinding {
+    configuration_id: String,
+    epoch: u64,
+    tag: String,
+    version: String,
+    manifest_sha256: String,
+}
+
+fn read_bounded_string(dir: &Path, name: &str, maximum: usize) -> Option<String> {
+    let bytes = std::fs::read(dir.join(name)).ok()?;
+    if bytes.is_empty() || bytes.len() > maximum {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn read_staged_binding(dir: &Path) -> Option<StagedBinding> {
+    let configuration_id = read_bounded_string(dir, BINDING_ID_FILE, 128)?;
+    let epoch = read_bounded_string(dir, BINDING_EPOCH_FILE, 32)?
+        .parse::<u64>()
+        .ok()?;
+    if epoch == 0 {
+        return None;
+    }
+    let tag = read_bounded_string(dir, TAG_FILE, 128)?;
+    if !valid_staged_tag(&tag) {
+        return None;
+    }
+    let version = read_bounded_string(dir, VERSION_FILE, 64)?;
+    if version.is_empty() {
+        return None;
+    }
+    let manifest_sha256 = read_bounded_string(dir, MANIFEST_SHA_FILE, 128)?;
+    if manifest_sha256.len() != 64 {
+        return None;
+    }
+    Some(StagedBinding {
+        configuration_id,
+        epoch,
+        tag,
+        version,
+        manifest_sha256,
+    })
+}
+
+fn binding_matches(authorization: &DesiredReleaseAuthorization, binding: &StagedBinding) -> bool {
+    binding.configuration_id == authorization.configuration_id
+        && binding.epoch == authorization.epoch
+        && binding.tag == authorization.desired_release.release_tag
+        && binding.version == authorization.desired_release.version
+        && binding.manifest_sha256 == authorization.desired_release.manifest_sha256
 }
 
 /// Stage a verified bundle for post-shutdown installation. The exact
@@ -285,6 +351,16 @@ pub fn stage_verified_bundle(
     write_staged_file(staging_dir, VERSION_FILE, bundle.version.as_bytes())?;
     write_staged_file(
         staging_dir,
+        BINDING_ID_FILE,
+        authorization.configuration_id.as_bytes(),
+    )?;
+    write_staged_file(
+        staging_dir,
+        BINDING_EPOCH_FILE,
+        authorization.epoch.to_string().as_bytes(),
+    )?;
+    write_staged_file(
+        staging_dir,
         MANIFEST_SHA_FILE,
         authorization.desired_release.manifest_sha256.as_bytes(),
     )?;
@@ -294,7 +370,11 @@ pub fn stage_verified_bundle(
 }
 
 /// Authorize one retained configuration, verify its exact release and stage it.
-/// Every denial returns a safe skip with zero side effects.
+/// Skips, no-ops and failures clear any existing staging: a bundle from a
+/// superseded authorization must never survive to a later install. When the
+/// retained authorization still matches the staged binding byte-for-byte, the
+/// existing staging is kept without re-downloading (installation re-verifies
+/// the bytes).
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_and_stage(
     state_path: &Path,
@@ -318,16 +398,44 @@ pub fn authorize_and_stage(
         verifier,
     ) {
         Ok(authorization) => authorization,
-        Err(denial) => return Ok(StageOutcome::SkippedNotAuthorized { denial }),
+        Err(denial) => {
+            clear_staging_dir(staging_dir);
+            return Ok(StageOutcome::SkippedNotAuthorized { denial });
+        }
     };
-    match fetch_and_verify_bundle(&authorization, current_version, fetch)? {
-        FetchOutcome::NoopAlreadyAtVersion => Ok(StageOutcome::NoopAlreadyAtVersion),
-        FetchOutcome::Verified(bundle) => {
-            stage_verified_bundle(staging_dir, &authorization, &bundle)?;
-            Ok(StageOutcome::Staged {
-                version: bundle.version,
-                tag: bundle.tag,
-            })
+    if authorization.desired_release.version == current_version {
+        clear_staging_dir(staging_dir);
+        return Ok(StageOutcome::NoopAlreadyAtVersion);
+    }
+    if let Some(binding) = read_staged_binding(staging_dir)
+        && binding_matches(&authorization, &binding)
+        && staging_dir.join(MANIFEST_FILE).is_file()
+        && staging_dir.join(SCRIPT_FILE).is_file()
+    {
+        return Ok(StageOutcome::Staged {
+            version: binding.version,
+            tag: binding.tag,
+        });
+    }
+    match fetch_and_verify_bundle(&authorization, current_version, fetch) {
+        Ok(FetchOutcome::NoopAlreadyAtVersion) => {
+            clear_staging_dir(staging_dir);
+            Ok(StageOutcome::NoopAlreadyAtVersion)
+        }
+        Ok(FetchOutcome::Verified(bundle)) => {
+            let staged = StageOutcome::Staged {
+                version: bundle.version.clone(),
+                tag: bundle.tag.clone(),
+            };
+            if let Err(error) = stage_verified_bundle(staging_dir, &authorization, &bundle) {
+                clear_staging_dir(staging_dir);
+                return Err(error);
+            }
+            Ok(staged)
+        }
+        Err(error) => {
+            clear_staging_dir(staging_dir);
+            Err(error)
         }
     }
 }
@@ -369,6 +477,68 @@ pub fn stage_retained_release(
         fetch,
         staging_dir,
     )
+}
+
+/// Install the managed release after the daemon is fully shut down. The staged
+/// bundle installs only while its binding still matches the retained active
+/// authorization; a superseded, denied or missing authorization clears the
+/// staging and installs nothing, so a deferred restart can never install a
+/// release the fleet no longer authorizes. Only a staged, still-authorized
+/// bundle installs here: there is no post-shutdown fetching, so explicit
+/// cleanup that removed the staging stays authoritative.
+#[allow(clippy::too_many_arguments)]
+pub fn install_managed_update_post_shutdown(
+    state_path: &Path,
+    now: DateTime<Utc>,
+    client_version: &str,
+    bootstrap: &dyn BootstrapRepositories,
+    verifier: &dyn ConfigurationVerifier,
+    current_version: &str,
+    installer: &dyn BundleInstall,
+    staging_dir: &Path,
+) -> Result<StagedInstallOutcome, ManagedUpdateError> {
+    let state = super::load_state(state_path).map_err(|_| ManagedUpdateError::DownloadFailed)?;
+    let Some(active) = state.active.as_ref() else {
+        clear_staging_dir(staging_dir);
+        return Ok(StagedInstallOutcome::NoStagedBundle);
+    };
+    let authorization = match authorize_desired_release(
+        state_path,
+        active.envelope.configuration_id(),
+        active.envelope.epoch(),
+        now,
+        client_version,
+        bootstrap,
+        verifier,
+    ) {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            clear_staging_dir(staging_dir);
+            return Ok(StagedInstallOutcome::NoStagedBundle);
+        }
+    };
+    if authorization.desired_release.version == current_version {
+        clear_staging_dir(staging_dir);
+        return Ok(StagedInstallOutcome::NoStagedBundle);
+    }
+    let staged_matches = match read_staged_binding(staging_dir) {
+        Some(binding) => {
+            binding_matches(&authorization, &binding)
+                && staging_dir.join(MANIFEST_FILE).is_file()
+                && staging_dir.join(SCRIPT_FILE).is_file()
+        }
+        None => false,
+    };
+    if !staged_matches {
+        clear_staging_dir(staging_dir);
+        return Ok(StagedInstallOutcome::NoStagedBundle);
+    }
+    let tag = authorization.desired_release.release_tag.clone();
+    let outcome = install_staged_files(staging_dir, installer, &tag);
+    // Terminal either way: a failed install must not restart-loop. Retry
+    // re-stages from the retained authorization.
+    clear_staging_dir(staging_dir);
+    outcome
 }
 
 /// Install a staged bundle after the daemon is fully shut down. Re-verifies
@@ -592,6 +762,24 @@ mod tests {
         )
     }
 
+    fn post_shutdown(
+        path: &Path,
+        staging: &Path,
+        installer: &dyn BundleInstall,
+        verifier: &dyn ConfigurationVerifier,
+    ) -> Result<StagedInstallOutcome, ManagedUpdateError> {
+        install_managed_update_post_shutdown(
+            path,
+            "2026-10-10T01:00:00Z".parse().unwrap(),
+            "1.6.19",
+            &repositories(),
+            verifier,
+            "1.6.19",
+            installer,
+            staging,
+        )
+    }
+
     #[test]
     fn no_authorization_means_zero_network_calls() {
         let temp = tempfile::tempdir().unwrap();
@@ -762,21 +950,39 @@ mod tests {
 
     #[test]
     fn staged_bundle_installs_exact_tag_post_shutdown_and_clears_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let staging = temp.path().join("pending");
         let asset = b"#!/bin/sh\necho managed\n".to_vec();
         let manifest = format!("{}  {}\n", sha_hex(&asset), platform_script_name()).into_bytes();
-        let auth = auth_for_test("9.8.7", "v9.8.7", &sha_hex(&manifest));
+        let candidate = v2_config(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            1,
+            "9.8.7",
+            "v9.8.7",
+            &sha_hex(&manifest),
+        );
+        persist(&path, &candidate);
         let fetch = FakeFetch::success(manifest, asset);
-        let FetchOutcome::Verified(bundle) =
-            fetch_and_verify_bundle(&auth, "1.6.19", &fetch).unwrap()
-        else {
-            panic!("expected verified bundle");
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let staging = temp.path().join("pending");
-        stage_verified_bundle(&staging, &auth, &bundle).unwrap();
+        let verifier = Verifier(VerificationResult::Verified);
+        assert_eq!(
+            stage_outcome(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                &staging,
+                &fetch,
+                &verifier
+            )
+            .unwrap(),
+            StageOutcome::Staged {
+                version: "9.8.7".to_string(),
+                tag: "v9.8.7".to_string(),
+            }
+        );
 
         let installer = FakeInstaller::success();
-        let outcome = install_staged_bundle(&staging, &installer).unwrap();
+        let outcome = post_shutdown(&path, &staging, &installer, &verifier).unwrap();
         assert_eq!(
             outcome,
             StagedInstallOutcome::Installed {
@@ -786,12 +992,124 @@ mod tests {
         );
         assert_eq!(*installer.install_tag.borrow(), Some("v9.8.7".to_string()));
         assert_eq!(*installer.installs.borrow(), 1);
-        // Staging cleared: a second post-shutdown pass is an idempotent no-op.
+        // Staging cleared: a second post-shutdown pass is an idempotent no-op
+        // that performs no second install.
         assert_eq!(
-            install_staged_bundle(&staging, &installer).unwrap(),
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
             StagedInstallOutcome::NoStagedBundle
         );
         assert_eq!(*installer.installs.borrow(), 1);
+    }
+
+    #[test]
+    fn superseded_denied_or_removed_authorization_never_installs_staged_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
+        let staging = temp.path().join("pending");
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let verifier = Verifier(VerificationResult::Verified);
+
+        let asset_a = b"#!/bin/sh\necho a\n".to_vec();
+        let manifest_a =
+            format!("{}  {}\n", sha_hex(&asset_a), platform_script_name()).into_bytes();
+        persist(
+            &path,
+            &v2_config(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                "9.8.7",
+                "v9.8.7",
+                &sha_hex(&manifest_a),
+            ),
+        );
+        // Stage A, then the restart is deferred.
+        let fetch = FakeFetch::success(manifest_a, asset_a);
+        assert!(matches!(
+            stage_outcome(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                &staging,
+                &fetch,
+                &verifier
+            )
+            .unwrap(),
+            StageOutcome::Staged { .. }
+        ));
+
+        // Active becomes an unauthorized v1 configuration: the later
+        // RestartAfterUpdate must not install A, and must clear the staging.
+        let v1 = v1_config("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2);
+        assert_eq!(
+            process_configuration(&v1, now, "1.6.19", &repositories(), &verifier, &path).result,
+            super::super::AcknowledgementResult::Applied
+        );
+        let installer = FakeInstaller::success();
+        assert_eq!(
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
+            StagedInstallOutcome::NoStagedBundle
+        );
+        assert_eq!(*installer.installs.borrow(), 0);
+        assert!(!staging.join(TAG_FILE).exists());
+
+        // Active reassigned to B: the stale A bundle is cleared, never installed.
+        let asset_b = b"#!/bin/sh\necho b\n".to_vec();
+        let manifest_b =
+            format!("{}  {}\n", sha_hex(&asset_b), platform_script_name()).into_bytes();
+        persist(
+            &path,
+            &v2_config(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                3,
+                "9.8.7",
+                "v9.8.7",
+                &sha_hex(&manifest_b),
+            ),
+        );
+        let fetch = FakeFetch::success(manifest_b, asset_b);
+        assert!(matches!(
+            stage_outcome(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                3,
+                &staging,
+                &fetch,
+                &verifier
+            )
+            .unwrap(),
+            StageOutcome::Staged { .. }
+        ));
+        let asset_c = b"#!/bin/sh\necho c\n".to_vec();
+        let manifest_c =
+            format!("{}  {}\n", sha_hex(&asset_c), platform_script_name()).into_bytes();
+        persist(
+            &path,
+            &v2_config(
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                4,
+                "9.8.8",
+                "v9.8.8",
+                &sha_hex(&manifest_c),
+            ),
+        );
+        let installer = FakeInstaller::success();
+        assert_eq!(
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
+            StagedInstallOutcome::NoStagedBundle
+        );
+        assert_eq!(*installer.installs.borrow(), 0);
+        assert!(!staging.join(TAG_FILE).exists());
+
+        // Active removed entirely (offboarded): nothing installs.
+        super::super::atomic_write_json(&path, &super::super::FleetState::default()).unwrap();
+        let fetch = FakeFetch::success(b"m".to_vec(), b"a".to_vec());
+        let installer = FakeInstaller::success();
+        assert_eq!(
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
+            StagedInstallOutcome::NoStagedBundle
+        );
+        assert_eq!(*installer.installs.borrow(), 0);
+        assert!(fetch.urls.borrow().is_empty());
     }
 
     #[test]
@@ -989,39 +1307,35 @@ mod tests {
         );
         persist(&path, &candidate);
         let before = std::fs::read(&path).unwrap();
+        let verifier = Verifier(VerificationResult::Verified);
 
-        let failing = FakeFetch {
-            manifest: Ok(manifest.clone()),
-            asset: Ok(asset.clone()),
-            urls: RefCell::new(Vec::new()),
-        };
-        // Install failure post-shutdown clears staging instead of looping.
-        let FetchOutcome::Verified(bundle) = fetch_and_verify_bundle(
-            &auth_for_test("9.8.7", "v9.8.7", &sha_hex(&manifest)),
-            "1.6.19",
-            &failing,
-        )
-        .unwrap() else {
-            panic!("expected verified bundle");
-        };
-        stage_verified_bundle(
-            &staging,
-            &auth_for_test("9.8.7", "v9.8.7", &sha_hex(&manifest)),
-            &bundle,
-        )
-        .unwrap();
+        // Stage through the real entry point, then fail the post-shutdown
+        // install: staging clears instead of looping, state is preserved.
+        let stager = FakeFetch::success(manifest.clone(), asset.clone());
+        assert!(matches!(
+            stage_outcome(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                &staging,
+                &stager,
+                &verifier
+            )
+            .unwrap(),
+            StageOutcome::Staged { .. }
+        ));
         let installer = FakeInstaller {
             fail: true,
             install_tag: RefCell::new(None),
             installs: RefCell::new(0),
         };
         assert_eq!(
-            install_staged_bundle(&staging, &installer),
+            post_shutdown(&path, &staging, &installer, &verifier),
             Err(ManagedUpdateError::InstallFailed)
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
-            install_staged_bundle(&staging, &installer).unwrap(),
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
             StagedInstallOutcome::NoStagedBundle
         );
         assert_eq!(*installer.installs.borrow(), 1);
@@ -1034,7 +1348,7 @@ mod tests {
             1,
             &staging,
             &retry,
-            &Verifier(VerificationResult::Verified),
+            &verifier,
         )
         .unwrap();
         assert_eq!(
@@ -1046,7 +1360,7 @@ mod tests {
         );
         let installer = FakeInstaller::success();
         assert_eq!(
-            install_staged_bundle(&staging, &installer).unwrap(),
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
             StagedInstallOutcome::Installed {
                 version: "9.8.7".to_string(),
                 tag: "v9.8.7".to_string(),
@@ -1057,21 +1371,45 @@ mod tests {
     #[test]
     fn tampered_staging_fails_closed_and_clears() {
         let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet/state.json");
         let staging = temp.path().join("pending");
-        std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join(TAG_FILE), b"v9.8.7").unwrap();
-        std::fs::write(staging.join(VERSION_FILE), b"9.8.7").unwrap();
-        std::fs::write(staging.join(MANIFEST_SHA_FILE), "d".repeat(64)).unwrap();
+        let asset = b"#!/bin/sh\necho managed\n".to_vec();
+        let manifest = format!("{}  {}\n", sha_hex(&asset), platform_script_name()).into_bytes();
+        persist(
+            &path,
+            &v2_config(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                "9.8.7",
+                "v9.8.7",
+                &sha_hex(&manifest),
+            ),
+        );
+        let verifier = Verifier(VerificationResult::Verified);
+        let fetch = FakeFetch::success(manifest, asset);
+        assert!(matches!(
+            stage_outcome(
+                &path,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                1,
+                &staging,
+                &fetch,
+                &verifier
+            )
+            .unwrap(),
+            StageOutcome::Staged { .. }
+        ));
+        // Tamper with the staged manifest bytes: the binding still matches,
+        // but the pinned digest no longer verifies them.
         std::fs::write(staging.join(MANIFEST_FILE), b"tampered").unwrap();
-        std::fs::write(staging.join(SCRIPT_FILE), b"tampered").unwrap();
         let installer = FakeInstaller::success();
         assert_eq!(
-            install_staged_bundle(&staging, &installer),
+            post_shutdown(&path, &staging, &installer, &verifier),
             Err(ManagedUpdateError::ManifestDigestMismatch)
         );
         assert_eq!(*installer.installs.borrow(), 0);
         assert_eq!(
-            install_staged_bundle(&staging, &installer).unwrap(),
+            post_shutdown(&path, &staging, &installer, &verifier).unwrap(),
             StagedInstallOutcome::NoStagedBundle
         );
     }

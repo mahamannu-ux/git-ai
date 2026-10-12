@@ -8454,11 +8454,27 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 /// unlocked.
 pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
     use crate::fleet::managed_update::{
-        ProductionBundleInstaller, StagedInstallOutcome, install_staged_bundle,
+        ProductionBundleInstaller, StagedInstallOutcome, install_managed_update_post_shutdown,
     };
 
-    if let Some(staging_dir) = crate::fleet::managed_update::default_staging_dir() {
-        match install_staged_bundle(&staging_dir, &ProductionBundleInstaller) {
+    let managed_paths = (|| {
+        Some((
+            crate::fleet::default_state_path()?,
+            crate::fleet::managed_update::default_staging_dir()?,
+            crate::metrics::delivery::MetricDeliveryRuntime::load_managed_bootstrap()?,
+        ))
+    })();
+    if let Some((state_path, staging_dir, bootstrap)) = managed_paths {
+        match install_managed_update_post_shutdown(
+            &state_path,
+            chrono::Utc::now(),
+            env!("CARGO_PKG_VERSION"),
+            &bootstrap,
+            &crate::fleet::UnavailableVerifier,
+            env!("CARGO_PKG_VERSION"),
+            &ProductionBundleInstaller,
+            &staging_dir,
+        ) {
             Ok(StagedInstallOutcome::Installed { version, tag }) => {
                 tracing::info!(
                     version = version.as_str(),

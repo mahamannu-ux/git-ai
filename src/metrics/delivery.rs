@@ -633,6 +633,17 @@ impl MetricDeliveryRuntime {
         )
     }
 
+    /// Load the managed bootstrap policy for post-shutdown authorization
+    /// checks. Returns `None` when no managed policy is installed, so the
+    /// post-shutdown path falls through to the channel updater.
+    pub fn load_managed_bootstrap() -> Option<DeliveryPolicyCache> {
+        let base = dirs::home_dir()?.join(".git-ai");
+        let policy_path = nonempty_path_env(TRACKAI_DELIVERY_POLICY_PATH_ENV)
+            .unwrap_or_else(|| base.join(TRACKAI_DELIVERY_POLICY_FILE));
+        let raw = std::fs::read_to_string(policy_path).ok()?;
+        DeliveryPolicyCache::from_json(&raw).ok()
+    }
+
     pub fn security_activation_bindings(&self) -> Vec<(String, MetricDeliveryHealthBinding)> {
         self.policy.security_activation_bindings()
     }
