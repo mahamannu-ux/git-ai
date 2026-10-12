@@ -35,6 +35,7 @@ const MAX_KEY_IDS: usize = 64;
 pub struct CleanupPlan {
     pub credential_key_ids: Vec<String>,
     pub remove_files: Vec<PathBuf>,
+    pub remove_dirs: Vec<PathBuf>,
     pub deregister_login_start: bool,
 }
 
@@ -142,11 +143,13 @@ fn read_key_ids(policy_path: &Path) -> Vec<String> {
 }
 
 /// Build the bounded cleanup plan. Reads at most the small bootstrap file;
-/// performs no mutation.
+/// performs no mutation. The staged-update directory is included so a
+/// superseded staged bundle can never install after offboarding.
 pub fn plan_cleanup(home: &Path) -> CleanupPlan {
     CleanupPlan {
         credential_key_ids: read_key_ids(&policy_path(home)),
         remove_files: vec![policy_path(home), state_path(home)],
+        remove_dirs: vec![crate::fleet::managed_update::staging_dir_for_home(home)],
         deregister_login_start: true,
     }
 }
@@ -225,35 +228,98 @@ fn unload_login_start() {
     }
 }
 
-/// True only when no platform registration remains. Query/spawn failures are
-/// strict: an unverifiable registration counts as present so cleanup reports
-/// failure instead of a false success.
+/// Bounded process-runner seam for platform registration queries. Tests inject
+/// scripted runners; production spawns the real tools.
+#[derive(Clone)]
+pub struct CommandResult {
+    pub success: bool,
+    pub output: String,
+}
+
+pub trait CommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandResult, &'static str>;
+}
+
+/// Production runner: at most 4 KiB of combined output, never logged.
+pub struct SystemRunner;
+
+impl CommandRunner for SystemRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandResult, &'static str> {
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(crate::utils::CREATE_NO_WINDOW);
+        }
+        let output = command.output().map_err(|_| "command_unavailable")?;
+        let mut combined = output.stdout;
+        combined.extend_from_slice(&output.stderr);
+        combined.truncate(4096);
+        Ok(CommandResult {
+            success: output.status.success(),
+            output: String::from_utf8_lossy(&combined).into_owned(),
+        })
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn current_uid(runner: &dyn CommandRunner) -> String {
+    runner
+        .run("id", &["-u"])
+        .ok()
+        .filter(|result| result.success)
+        .map(|result| result.output.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// True only on a recognized "not registered" result: launchctl reports the
+/// service as unfound. Tool, query and unexpected failures are not absence.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_registration_absent(runner: &dyn CommandRunner, uid: &str) -> bool {
+    if uid.is_empty() {
+        return false;
+    }
+    match runner.run(
+        "launchctl",
+        &["print", &format!("gui/{uid}/com.usegitai.bg")],
+    ) {
+        Ok(result) if result.success => false,
+        Ok(result) if result.output.contains("Could not find service") => true,
+        _ => false,
+    }
+}
+
+/// True only on a recognized "not found" result: schtasks reports the task
+/// file as missing. Tool, query and unexpected failures are not absence.
+#[cfg(any(test, windows))]
+fn windows_registration_absent(runner: &dyn CommandRunner) -> bool {
+    match runner.run("schtasks", &["/Query", "/TN", r"\GitAI\Start bg at logon"]) {
+        Ok(result) if result.success => false,
+        Ok(result)
+            if result
+                .output
+                .to_lowercase()
+                .contains("cannot find the file") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// True only when no platform registration remains. An unverifiable
+/// registration counts as present so cleanup reports failure instead of a
+/// false success.
 fn platform_registration_absent() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|uid| uid.trim().to_string())
-            .unwrap_or_default();
-        if uid.is_empty() {
-            return false;
-        }
-        !std::process::Command::new("launchctl")
-            .args(["print", &format!("gui/{uid}/com.usegitai.bg")])
-            .output()
-            .is_ok_and(|output| output.status.success())
+        let runner = SystemRunner;
+        macos_registration_absent(&runner, &current_uid(&runner))
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        !std::process::Command::new("schtasks")
-            .args(["/Query", "/TN", r"\GitAI\Start bg at logon"])
-            .creation_flags(crate::utils::CREATE_NO_WINDOW)
-            .output()
-            .is_ok_and(|output| output.status.success())
+        windows_registration_absent(&SystemRunner)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -306,6 +372,18 @@ pub fn apply_cleanup(
         steps.push(CleanupStep {
             action: "remove-file",
             target: path.to_string_lossy().into_owned(),
+            result,
+        });
+    }
+    for dir in &plan.remove_dirs {
+        let result = match std::fs::remove_dir_all(dir) {
+            Ok(()) => StepResult::Ok,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => StepResult::Missing,
+            Err(_) => StepResult::Failed("remove_failed"),
+        };
+        steps.push(CleanupStep {
+            action: "remove-dir",
+            target: dir.to_string_lossy().into_owned(),
             result,
         });
     }
@@ -437,6 +515,10 @@ mod tests {
         assert_eq!(
             plan.remove_files,
             vec![policy_path(&home), state_path(&home)]
+        );
+        assert_eq!(
+            plan.remove_dirs,
+            vec![crate::fleet::managed_update::staging_dir_for_home(&home)]
         );
         assert!(plan.deregister_login_start);
         // Planning is read-only: everything is still on disk.
@@ -603,6 +685,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_removes_staged_updates() {
+        let (_temp, home) = home_with_policy(&[]);
+        let staging = crate::fleet::managed_update::staging_dir_for_home(&home);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("tag"), b"v9.8.7").unwrap();
+        let plan = plan_cleanup(&home);
+        let store = MemoryMachineCredentialStore::default();
+        let registrar = FakeRegistrar::success();
+        let steps = apply_cleanup(&plan, &home, &store, &registrar);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.action == "remove-dir" && step.result == StepResult::Ok)
+        );
+        assert!(!staging.exists());
+        assert_eq!(cleanup_apply_exit_code(&steps), 0);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn platform_registrar_verifies_real_absence() {
@@ -673,5 +774,72 @@ mod tests {
             assert!(!rendered.contains("trk_v1"));
             assert!(!rendered.contains("aaaaaaa"));
         }
+    }
+
+    /// Scripted runner for verification strictness tests.
+    struct ScriptedRunner {
+        result: Result<CommandResult, &'static str>,
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, _program: &str, _args: &[&str]) -> Result<CommandResult, &'static str> {
+            self.result.clone()
+        }
+    }
+
+    fn runner(result: Result<CommandResult, &'static str>) -> ScriptedRunner {
+        ScriptedRunner { result }
+    }
+
+    fn failed_output(output: &str) -> Result<CommandResult, &'static str> {
+        Ok(CommandResult {
+            success: false,
+            output: output.to_string(),
+        })
+    }
+
+    #[test]
+    fn absence_requires_recognized_not_found_not_tool_failure() {
+        // Present registrations are never absent.
+        let present = Ok(CommandResult {
+            success: true,
+            output: String::new(),
+        });
+        assert!(!macos_registration_absent(&runner(present.clone()), "501"));
+        assert!(!windows_registration_absent(&runner(present)));
+
+        // Unavailable tools prove nothing.
+        let unavailable: Result<CommandResult, &'static str> = Err("command_unavailable");
+        assert!(!macos_registration_absent(&runner(unavailable), "501"));
+        assert!(!windows_registration_absent(&runner(Err(
+            "command_unavailable"
+        ))));
+
+        // Unexpected nonzero output (access denial, usage errors) is not
+        // absence either.
+        assert!(!macos_registration_absent(
+            &runner(failed_output("launchctl: Access denied")),
+            "501"
+        ));
+        assert!(!windows_registration_absent(&runner(failed_output(
+            "ERROR: Access is denied."
+        ))));
+
+        // Only recognized not-found results prove absence.
+        assert!(macos_registration_absent(
+            &runner(failed_output(
+                "Could not find service \"com.usegitai.bg\" in domain for gui/501"
+            )),
+            "501"
+        ));
+        assert!(windows_registration_absent(&runner(failed_output(
+            "ERROR: The system cannot find the file specified."
+        ))));
+
+        // An unresolvable user proves nothing on macOS.
+        assert!(!macos_registration_absent(
+            &runner(failed_output("Could not find service \"com.usegitai.bg\"")),
+            ""
+        ));
     }
 }

@@ -164,6 +164,12 @@ fn print_cleanup_plan(plan: &crate::fleet::cleanup::CleanupPlan) {
             path.to_string_lossy()
         );
     }
+    for dir in &plan.remove_dirs {
+        println!(
+            "fleet_cleanup_plan action=remove-dir target={}",
+            dir.to_string_lossy()
+        );
+    }
     if plan.deregister_login_start {
         println!(
             "fleet_cleanup_plan action=deregister-login-start target=login-start-registration"
