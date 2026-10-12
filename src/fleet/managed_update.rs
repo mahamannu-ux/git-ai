@@ -541,28 +541,6 @@ pub fn install_managed_update_post_shutdown(
     outcome
 }
 
-/// Install a staged bundle after the daemon is fully shut down. Re-verifies
-/// the staged bytes against the pinned manifest before executing anything.
-/// Missing staging is an idempotent no-op; staging is cleared on success and
-/// on failure so a failed install can never restart-loop (retry re-stages).
-pub fn install_staged_bundle(
-    staging_dir: &Path,
-    installer: &dyn BundleInstall,
-) -> Result<StagedInstallOutcome, ManagedUpdateError> {
-    let tag = match std::fs::read(staging_dir.join(TAG_FILE)) {
-        Ok(bytes) => String::from_utf8(bytes).map_err(|_| ManagedUpdateError::StageFailed)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(StagedInstallOutcome::NoStagedBundle);
-        }
-        Err(_) => return Err(ManagedUpdateError::StageFailed),
-    };
-    let outcome = install_staged_files(staging_dir, installer, &tag);
-    // Terminal either way: a failed install must not restart-loop. Retry
-    // re-stages from the retained authorization.
-    clear_staging_dir(staging_dir);
-    outcome
-}
-
 fn install_staged_files(
     staging_dir: &Path,
     installer: &dyn BundleInstall,
