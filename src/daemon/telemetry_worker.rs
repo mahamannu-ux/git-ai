@@ -389,12 +389,25 @@ fn submit_daemon_internal_telemetry_with_handle(
     handle: DaemonTelemetryWorkerHandle,
     envelopes: Vec<TelemetryEnvelope>,
 ) {
+    let (buffered_envelopes, metric_events) = split_metric_envelopes(envelopes);
+    // Post-commit command completion must not overtake durable queue insertion.
+    // Keep diagnostic envelopes asynchronous, but persist metrics on this
+    // already-blocking side-effect path before returning to the sequencer.
+    if !metric_events.is_empty()
+        && let Err(error) = handle.persist_metrics_blocking(&metric_events)
+    {
+        tracing::warn!(%error, "telemetry: failed to persist daemon metrics locally");
+    }
+
+    if buffered_envelopes.is_empty() {
+        return;
+    }
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
-            handle.submit_telemetry(envelopes).await;
+            handle.submit_telemetry(buffered_envelopes).await;
         });
     } else {
-        handle.submit_telemetry_sync(envelopes);
+        handle.submit_telemetry_sync(buffered_envelopes);
     }
 }
 
@@ -2559,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_daemon_internal_telemetry_spawns_when_runtime_exists() {
+    async fn submit_daemon_internal_non_metric_telemetry_spawns_when_runtime_exists() {
         let handle = DaemonTelemetryWorkerHandle::new_noop();
         let guard = handle.buffer.lock().await;
 
