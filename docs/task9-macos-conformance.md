@@ -24,7 +24,7 @@ promotes another row.
 | Row | Prerequisites | Exact procedure | Safe expected result | Evidence captured | Status | Customer claim permitted |
 |---|---|---|---|---|---|---|
 | Automated/static contract evidence | Rust 1.93 toolchain and repository dependencies | Run the focused gates in [Automated gates](#automated-gates), then `scripts/task9/macos-conformance.sh` in `plan`, `binary`, and `package` modes | Focused Task9 contracts pass; workflow asserts Intel PKG, signing/notarization gates and checksums; harness remains read-only | Test counts, commit, architecture, macOS version, artifact SHA-256, bounded result codes | passed — Task9-owned focused gates; inherited lint baseline recorded below | Engineering contracts exist for the macOS package, login start, managed state, native credential adapter, update and cleanup; no native support claim |
-| Current Intel-Mac local evidence (`IT-T9-02`) | Founder-approved checkpoints; exact Intel or universal PKG; disposable non-customer identifiers/runtime; Task9f automated gates | Follow [Founder-assisted Intel-Mac lifecycle](#founder-assisted-intel-mac-lifecycle-it-t9-02) | Per-user install and hooks, login start, Keychain behavior, isolated bootstrap/offline evidence, fail-closed update, and explicit idempotent cleanup behave as documented | Safe pass/fail codes only; no machine identity or content | pending prerequisite — founder-assisted native run | None until the complete row passes; afterward, only the tested Intel/macOS version and local post-login route |
+| Current Intel-Mac local evidence (`IT-T9-02`) | Founder-approved checkpoints; exact Intel or universal PKG; disposable non-customer identifiers/runtime; Task9f automated gates | Follow [Founder-assisted Intel-Mac lifecycle](#founder-assisted-intel-mac-lifecycle-it-t9-02) | Per-user install and hooks, login start, Keychain behavior, isolated bootstrap/offline evidence, fail-closed update, and explicit idempotent cleanup behave as documented | Safe pass/fail codes only; no machine identity or content | not passed — install, login start, Keychain, bootstrap and cleanup passed; offline delivery produced no managed queue row | No complete local-lifecycle or offline-delivery claim; bounded passed sub-checks may be reported only as development evidence |
 | Signed/notarized artifact evidence | Exact production PKG, its published checksum, Developer ID signature and stapled notarization ticket | Run read-only package inspection in checkpoint 1 and harness `package` mode | Checksum matches; `pkgutil`, `spctl`, and stapler checks succeed | Artifact basename class, SHA-256 and pass/fail codes; never certificate output | pending prerequisite — signed/notarized PKG unavailable | None; unsigned development mechanics must remain labelled unsigned |
 | Jamf-managed evidence (`IT-T9-03`) | Jamf Pro trial with package/policy/inventory features; active APNs certificate from an organization-controlled Apple Account; manually enrolled test Mac; signed/notarized PKG for a production package claim | Follow [Jamf phase 1](#jamf-phase-1-it-t9-03) after all prerequisites are confirmed | Post-login package/login-start/bootstrap delivery succeeds without transporting credentials; TrackAI authority remains independent; cleanup is separately delivered | Redacted/opaque policy and inventory result identifiers only | pending prerequisite — Jamf/APNs/enrollment not confirmed | No Jamf-managed macOS claim |
 | Second-Mac/Apple-Silicon evidence (`IT-T9-07`) | Second Mac, preferably Apple Silicon; bounded two-device rollout ring | Repeat the signed artifact and lifecycle procedure on the second Mac, then exercise the two-device ring | Both devices report separate bounded results; architecture is recorded honestly | Architecture, OS version and opaque rollout result only | pending prerequisite — second Mac unavailable | No two-device rollout-ring or Apple-Silicon claim |
@@ -117,6 +117,25 @@ package signature, Gatekeeper, and stapler results. Otherwise label the package
 
 ### Checkpoint 2 — install the reviewed PKG, founder approval required
 
+Pre-install baseline recorded 2026-10-13:
+
+- existing binary: GitAI 1.6.16 debug, x86_64,
+  SHA-256 `b8efed65e4424a8cc72d721709e945bd765543845fc3b9bde0ab7b1555786bb4`;
+- rollback copy (gitignored): `target/task9-native-backup/1.6.16/git-ai`;
+- candidate binary: GitAI 1.6.19 debug, x86_64, built from Task9d merge
+  `d1838619c` plus Task9f's docs/tests-only commit `e155f5eea`, SHA-256
+  `dce25adcc749af4ce810eec3bc1a3f35f9816fbfaec0bfe432a4a01f7a19ce1c`;
+- unsigned development PKG SHA-256:
+  `405e2f9fd313e16d42e709ae0ea79f9c175daedc8f881a7a211b7fe4688dc060`;
+- founder decision: keep 1.6.19 after this walkthrough. The rollback copy is
+  retained only for a later explicit rollback walkthrough or forensic check.
+
+Founder result, 2026-10-13: **passed for unsigned development mechanics**.
+The PKG installed successfully; the installed binary reported GitAI 1.6.19
+debug, x86_64, with the expected binary SHA-256; ownership and trace2 hook
+checks passed; `/opt/git-ai` and `/usr/local/bin/git-ai` remained absent. This
+does not change the signed/notarized artifact row, which remains pending.
+
 ```bash
 set -euo pipefail
 PKG=/absolute/path/to/git-ai-macos-x64.pkg
@@ -150,7 +169,38 @@ launchctl print "gui/$(id -u)/com.usegitai.bg" >/dev/null
 Confirm only that the daemon is healthy, the launcher exits successfully, and
 re-registration is idempotent. Do not paste `launchctl print` or daemon logs.
 
+Founder result, 2026-10-13: **passed**. macOS emitted two expected
+“Background Items Added” notifications because the LaunchAgent was registered
+and then re-registered for the idempotency check. The registration existed,
+the launcher exited, the daemon was healthy and survived launcher exit, and
+the second registration retained the same daemon process.
+
 ### Checkpoint 4 — native Keychain and non-secret bootstrap
+
+Founder result, 2026-10-13, native credential-store sub-checkpoint:
+**passed** using a generated synthetic credential. The store reported
+available; native Keychain store, load, and delete all succeeded; and the
+legacy plaintext fallback file remained absent. No credential value, account
+identifier, or device identifier was retained as evidence.
+
+Founder result, 2026-10-13, non-secret bootstrap sub-checkpoint: **passed**.
+One synthetic repository route targeting a loopback-only unavailable endpoint
+was installed with mode `0600`; the closed policy contained no plaintext
+credential. This proves local bootstrap installation only, not delivery or a
+live TrackAI integration.
+
+Founder result, 2026-10-13, offline delivery sub-checkpoint: **did not pass**.
+The configured repository allowlist first rejected an unlisted synthetic
+remote, which is the expected privacy behavior and was not weakened. A fully
+isolated-home attempt was discarded because that artificial home could not
+access the login Keychain. Under the normal daemon, an allowlisted local lab
+accepted a synthetic Codex checkpoint, produced two synthetic commits and an
+authorship note, and the daemon loaded the synthetic Keychain credential and
+failed safely against the loopback-only unavailable endpoint. However, no new
+metrics row with a managed delivery binding was created, so queue durability
+across restart was not exercised. No customer content or plaintext credential
+was used. This sub-checkpoint remains open and permits no offline-delivery
+claim.
 
 The credential is pasted into a silent shell read and piped over stdin. It is
 never placed in an argument, environment variable, fixture, file, or log.
@@ -181,6 +231,16 @@ update/rollback remains pending until Task15.
 
 Cleanup preserves the durable queue, authorship notes, repositories, normal
 user login, GitAI binary, and ordinary GitAI data.
+
+Founder result, 2026-10-13: **passed**. The bounded dry-run contained exactly
+the expected credential, managed-file, staging-directory and login-start
+actions. First apply returned only successful or already-missing results;
+the existing durable queue, synthetic authorship note and installed binary
+remained available while managed policy, synthetic Keychain credential and
+login-start registration were absent. The second dry-run contained no
+credential action, and the second apply was successful and idempotent. The two
+disposable synthetic repositories were then removed; the 1.6.19 binary and
+the retained 1.6.16 rollback copy were not removed.
 
 ```bash
 set -euo pipefail
