@@ -1,0 +1,89 @@
+tests/fixtures/security_v2/NOTICE.md
+  s_695bc47d3fa8a0::t_d4dc0846bd5909 1-38
+tests/fixtures/security_v2/fleet-configuration-v3.schema.json
+  s_695bc47d3fa8a0::t_5f4f94de1dc072 1-157
+tests/fixtures/security_v2/invalid-acknowledgement-applied-refusal-code.json
+  s_695bc47d3fa8a0::t_8b5dea2e355b12 1-7
+tests/fixtures/security_v2/invalid-activation-lease-monitor-no-agents.json
+  s_695bc47d3fa8a0::t_3a7f66adf32105 1-20
+tests/fixtures/security_v2/invalid-agent-inventory-content-preview.json
+  s_695bc47d3fa8a0::t_eafe2e37a4b3aa 1-16
+tests/fixtures/security_v2/invalid-data-settings-missing-urls.json
+  s_695bc47d3fa8a0::t_c3e4278965beee 1-7
+tests/fixtures/security_v2/invalid-enforcement-tool-result.json
+  s_695bc47d3fa8a0::t_8e6fb86cb9db4f 1-16
+tests/fixtures/security_v2/invalid-finding-endpoint-uid.json
+  s_695bc47d3fa8a0::t_7d1caad81d6e65 1-21
+tests/fixtures/security_v2/invalid-finding-evidence-refs.json
+  s_695bc47d3fa8a0::t_42fe0162af4ad5 1-21
+tests/fixtures/security_v2/invalid-finding-project-path-hash.json
+  s_695bc47d3fa8a0::t_a40b2f1477fc14 1-21
+tests/fixtures/security_v2/invalid-finding-tool-input.json
+  s_695bc47d3fa8a0::t_a9f648e665eeb7 1-21
+tests/fixtures/security_v2/invalid-fleet-configuration-v3-security-activation.json
+  s_695bc47d3fa8a0::t_b135886271ca63 1-24
+tests/fixtures/security_v2/invalid-indicator-sample-project-path-hash.json
+  s_695bc47d3fa8a0::t_d84521f838aef1 1-14
+tests/fixtures/security_v2/invalid-permission-event-content.json
+  s_695bc47d3fa8a0::t_5b1766e5bef67d 1-12
+tests/fixtures/security_v2/invalid-rule-bundle-file-too-large.json
+  s_695bc47d3fa8a0::t_fc8741b6490766 1-19
+tests/fixtures/security_v2/invalid-rule-bundle-path-traversal.json
+  s_695bc47d3fa8a0::t_27f311016837e3 1-19
+tests/fixtures/security_v2/invalid-scan-summary-project-path.json
+  s_695bc47d3fa8a0::t_2e524d52c009f9 1-14
+tests/fixtures/security_v2/invalid-security-status-endpoint-device-id.json
+  s_695bc47d3fa8a0::t_5837467582084d 1-15
+tests/fixtures/security_v2/manifest.json
+  s_695bc47d3fa8a0::t_0c548cd59305ba 1-44
+tests/fixtures/security_v2/security-acknowledgement-v1.schema.json
+  s_695bc47d3fa8a0::t_9dd42e5d53e964 1-50
+tests/fixtures/security_v2/security-activation-lease-v2.schema.json
+  s_695bc47d3fa8a0::t_9e0ef0d8bf4969 1-81
+tests/fixtures/security_v2/security-data-settings-v1.schema.json
+  s_695bc47d3fa8a0::t_f3ca5b969fe74b 1-23
+tests/fixtures/security_v2/security-rule-bundle-v1.schema.json
+  s_695bc47d3fa8a0::t_6e460cf8c4810b 1-139
+tests/fixtures/security_v2/security-upload-v2.schema.json
+  s_695bc47d3fa8a0::t_19678eae5fbc5f 1-374
+tests/fixtures/security_v2/valid-acknowledgement.json
+  s_695bc47d3fa8a0::t_f4723be6cb7d0b 1-7
+tests/fixtures/security_v2/valid-activation-lease.json
+  s_695bc47d3fa8a0::t_d54f3bee91a9a6 1-20
+tests/fixtures/security_v2/valid-agent-inventory.json
+  s_695bc47d3fa8a0::t_badf736ef42d3f 1-15
+tests/fixtures/security_v2/valid-data-settings.json
+  s_695bc47d3fa8a0::t_cadd8d22232bac 1-8
+tests/fixtures/security_v2/valid-enforcement.json
+  s_695bc47d3fa8a0::t_45bb9228f8c01a 1-15
+tests/fixtures/security_v2/valid-finding.json
+  s_695bc47d3fa8a0::t_4df6a87435e2a9 1-23
+tests/fixtures/security_v2/valid-fleet-configuration-v3.json
+  s_695bc47d3fa8a0::t_e696c9a00cf455 1-30
+tests/fixtures/security_v2/valid-indicator.json
+  s_695bc47d3fa8a0::t_a8d8900f8f81cd 1-13
+tests/fixtures/security_v2/valid-permission-event.json
+  s_695bc47d3fa8a0::t_e2a93089031076 1-11
+tests/fixtures/security_v2/valid-rule-bundle.json
+  s_695bc47d3fa8a0::t_b569fd90c09cc0 1-19
+tests/fixtures/security_v2/valid-scan-summary.json
+  s_695bc47d3fa8a0::t_bef3e1804ddabc 1-13
+tests/fixtures/security_v2/valid-security-status.json
+  s_695bc47d3fa8a0::t_464bca573568fb 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "0eacd7264fc7e509b95037ae8fdca21f2400c9b9",
+  "prompts": {},
+  "sessions": {
+    "s_695bc47d3fa8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14abb-bc2a-7ec2-95b8-2dc028235936",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
