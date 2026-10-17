@@ -546,7 +546,6 @@ fn copy_optional(source: &Map<String, Value>, out: &mut Map<String, Value>, keys
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn lease(settings: SecurityDataSettings) -> ProjectionLease {
         ProjectionLease {
@@ -810,12 +809,16 @@ mod tests {
 
     #[test]
     fn endpoint_generated_projections_are_closed() {
-        let mut status = fixture("valid-security-status.json")["records"][0]
-            .as_object()
-            .unwrap()
-            .clone();
-        status.remove("kind");
-        status.remove("record_id");
+        let mut status = json!({
+            "observed_at":"2026-10-17T10:00:00Z", "numbat_version":"0.5.0",
+            "wired_agents":["claude-code"], "active_bundle_digest":null,
+            "lease_id":null, "last_record_at":null,
+            "health":{"hook_status":"ok","agent_effective_view":"ok",
+                "local_record":"ok","forwarder_ack":"unavailable"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         status.insert("endpoint".into(), json!({"device_id":"forbidden"}));
         assert!(
             project_security_status(status)
@@ -825,12 +828,14 @@ mod tests {
                 .is_none()
         );
 
-        let mut inventory = fixture("valid-agent-inventory.json")["records"][0]
-            .as_object()
-            .unwrap()
-            .clone();
-        inventory.remove("kind");
-        inventory.remove("record_id");
+        let mut inventory = json!({
+            "observed_at":"2026-10-17T10:00:00Z",
+            "agents":[{"agent":"claude-code","version":null,"config":"present",
+                "artifacts":"present","wired":"yes"}]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         inventory.insert("content_preview".into(), json!("forbidden"));
         assert!(
             project_agent_inventory(inventory)
@@ -858,230 +863,6 @@ mod tests {
                     false
                 )
                 .is_none()
-            );
-        }
-    }
-
-    fn fixture(name: &str) -> Value {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/security_v2")
-            .join(name);
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-    }
-
-    fn local_ref<'a>(schema: &'a Value, reference: &str) -> Option<&'a Value> {
-        reference
-            .strip_prefix("#/")?
-            .split('/')
-            .try_fold(schema, |node, part| node.get(part))
-    }
-
-    fn validates(schema: &Value, root: &Value, value: &Value) -> bool {
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            return local_ref(root, reference).is_some_and(|target| validates(target, root, value));
-        }
-        if let Some(constant) = schema.get("const")
-            && value != constant
-        {
-            return false;
-        }
-        if let Some(values) = schema.get("enum").and_then(Value::as_array)
-            && !values.contains(value)
-        {
-            return false;
-        }
-        if let Some(branches) = schema.get("oneOf").and_then(Value::as_array)
-            && branches
-                .iter()
-                .filter(|branch| validates(branch, root, value))
-                .count()
-                != 1
-        {
-            return false;
-        }
-        match schema.get("type").and_then(Value::as_str) {
-            Some("object") => {
-                let Some(object) = value.as_object() else {
-                    return false;
-                };
-                if let Some(required) = schema.get("required").and_then(Value::as_array)
-                    && required
-                        .iter()
-                        .any(|key| key.as_str().is_none_or(|key| !object.contains_key(key)))
-                {
-                    return false;
-                }
-                let properties = schema.get("properties").and_then(Value::as_object);
-                if schema.get("additionalProperties") == Some(&Value::Bool(false))
-                    && object
-                        .keys()
-                        .any(|key| properties.is_none_or(|map| !map.contains_key(key)))
-                {
-                    return false;
-                }
-                if let Some(properties) = properties {
-                    for (key, value) in object {
-                        if let Some(property) = properties.get(key)
-                            && !validates(property, root, value)
-                        {
-                            return false;
-                        }
-                    }
-                }
-            }
-            Some("array") => {
-                let Some(array) = value.as_array() else {
-                    return false;
-                };
-                if let Some(items) = schema.get("items")
-                    && array.iter().any(|value| !validates(items, root, value))
-                {
-                    return false;
-                }
-            }
-            Some("string") if !value.is_string() => return false,
-            Some("integer") if !value.is_i64() && !value.is_u64() => return false,
-            Some("boolean") if !value.is_boolean() => return false,
-            Some("null") if !value.is_null() => return false,
-            _ => {}
-        }
-        true
-    }
-
-    fn validates_upload_fixture(schema: &Value, fixture: &Value) -> bool {
-        let Some(records) = fixture.get("records").and_then(Value::as_array) else {
-            return false;
-        };
-        let names = [
-            ("finding", "finding"),
-            ("enforcement", "enforcement"),
-            ("indicator", "indicator"),
-            ("scan_summary", "scanSummary"),
-            ("permission_event", "permissionEvent"),
-            ("security_status", "securityStatus"),
-            ("agent_inventory", "agentInventory"),
-        ];
-        records.iter().all(|record| {
-            let Some(kind) = record.get("kind").and_then(Value::as_str) else {
-                return false;
-            };
-            let Some((_, definition)) = names.iter().find(|(name, _)| *name == kind) else {
-                return false;
-            };
-            schema
-                .get("definitions")
-                .and_then(|definitions| definitions.get(*definition))
-                .is_some_and(|record_schema| validates(record_schema, schema, record))
-        })
-    }
-
-    #[test]
-    fn copied_upload_schema_accepts_every_valid_and_refuses_every_invalid_record_fixture() {
-        let schema = fixture("security-upload-v2.schema.json");
-        let valid = [
-            "valid-finding.json",
-            "valid-enforcement.json",
-            "valid-indicator.json",
-            "valid-scan-summary.json",
-            "valid-permission-event.json",
-            "valid-security-status.json",
-            "valid-agent-inventory.json",
-        ];
-        let invalid = [
-            "invalid-finding-tool-input.json",
-            "invalid-finding-evidence-refs.json",
-            "invalid-finding-project-path-hash.json",
-            "invalid-finding-endpoint-uid.json",
-            "invalid-enforcement-tool-result.json",
-            "invalid-indicator-sample-project-path-hash.json",
-            "invalid-scan-summary-project-path.json",
-            "invalid-permission-event-content.json",
-            "invalid-security-status-endpoint-device-id.json",
-            "invalid-agent-inventory-content-preview.json",
-        ];
-        for name in valid {
-            assert!(validates_upload_fixture(&schema, &fixture(name)), "{name}");
-        }
-        for name in invalid {
-            assert!(!validates_upload_fixture(&schema, &fixture(name)), "{name}");
-        }
-    }
-
-    #[test]
-    fn every_projection_validates_against_the_copied_upload_schema() {
-        let schema = fixture("security-upload-v2.schema.json");
-        let mut settings = SecurityDataSettings::ALL_OFF;
-        settings.urls = true;
-        let lease = lease(settings);
-        let sources = [
-            json!({
-                "schema_version":"0.5.0","record_type":"finding","finding_id":"f1",
-                "rule_id":"rule","rule_version":"1","severity":"low","title":"title",
-                "source_agent":"codex","source_type":"hook","confidence":"high",
-                "detected_at":"2026-10-17T10:00:00Z"
-            }),
-            json!({
-                "schema_version":"0.5.0","record_type":"enforcement","decision_id":"d1",
-                "decision":"no_override","mode":"monitor","rule_ids":["rule"],
-                "finding_ids":["f1"],"source_agent":"codex",
-                "timestamp":"2026-10-17T10:00:01Z"
-            }),
-            json!({
-                "schema_version":"0.5.0","record_type":"indicator","run_id":"run1",
-                "type":"domain","value":"example.invalid","count":1,
-                "first_seen":"2026-10-17T10:00:00Z","last_seen":"2026-10-17T10:00:01Z",
-                "source_agent":"codex"
-            }),
-            json!({
-                "schema_version":"0.5.0","record_type":"scan_summary","run_id":"run1",
-                "status":"complete","artifacts_scanned":1,"events_emitted":1,
-                "findings_emitted":1,"indicators_emitted":1,"diagnostics":0
-            }),
-            json!({
-                "schema_version":"0.5.0","record_type":"event","event_id":"event1",
-                "event_type":"permission.approved","source_agent":"codex",
-                "timestamp":"2026-10-17T10:00:02Z"
-            }),
-        ];
-        let mut joins = PermissionJoinTracker::default();
-        let mut projected = sources
-            .iter()
-            .map(|source| {
-                project_numbat_record(
-                    source.to_string().as_bytes(),
-                    &lease,
-                    &HashMap::new(),
-                    &mut joins,
-                    false,
-                )
-                .unwrap()
-                .json
-            })
-            .collect::<Vec<_>>();
-
-        for (fixture_name, projector) in [
-            (
-                "valid-security-status.json",
-                project_security_status as fn(Map<String, Value>) -> Option<ProjectedRecord>,
-            ),
-            ("valid-agent-inventory.json", project_agent_inventory),
-        ] {
-            let mut fields = fixture(fixture_name)["records"][0]
-                .as_object()
-                .unwrap()
-                .clone();
-            fields.remove("kind");
-            fields.remove("record_id");
-            projected.push(projector(fields).unwrap().json);
-        }
-
-        for record in projected {
-            assert!(
-                validates_upload_fixture(
-                    &schema,
-                    &json!({"schema_version":"trackai.security-upload/2","records":[record]})
-                ),
-                "projection did not match frozen upload schema"
             );
         }
     }

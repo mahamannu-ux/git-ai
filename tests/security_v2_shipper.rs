@@ -3,6 +3,9 @@
 //! This is ignored by default because the caller must first build the pinned
 //! Numbat binary and provide its absolute path in `TRACKAI_NUMBAT_BIN`.
 
+#[path = "support/security_v2_schema.rs"]
+mod security_v2_schema;
+
 use chrono::{NaiveDate, TimeZone, Utc};
 use git_ai::metrics::delivery::MetricDeliveryHealthBinding;
 use git_ai::security::activation::{LeaseSnapshot, SecurityLeaseContext};
@@ -11,6 +14,7 @@ use git_ai::security::delivery_queue::SecurityRecordQueue;
 use git_ai::security::records::{PermissionJoinTracker, SecurityDataSettings};
 use git_ai::security::shipper::poll_security_records;
 use git_ai::security::tail::rotate_if_due;
+use security_v2_schema::validates;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -45,7 +49,17 @@ impl SecurityLeaseContext for Lease {
 
 fn run_hook(binary: &Path, home: &Path, records: &Path, fixture: &Path) {
     let mut child = Command::new(binary)
-        .args(["hook", "PreToolUse", "--agent", "claude", "--output-file"])
+        .args([
+            "hook",
+            "PreToolUse",
+            "--agent",
+            "claude",
+            "--emit",
+            "all",
+            "--output",
+            "file",
+            "--output-file",
+        ])
         .arg(records)
         .current_dir(home)
         .env_clear()
@@ -68,13 +82,14 @@ fn run_hook(binary: &Path, home: &Path, records: &Path, fixture: &Path) {
         "pinned Numbat hook failed with status {:?}",
         output.status.code()
     );
+    assert!(records.is_file(), "pinned Numbat file sink was not created");
 }
 
 fn receive(listener: &TcpListener, schema: &Value) -> Vec<String> {
     let (mut stream, _) = listener.accept().unwrap();
     let body = read_http_body(&stream);
     let upload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(validates(schema, schema, &upload));
+    assert!(validates(schema, &upload));
     let records = upload["records"].as_array().unwrap();
     let record_ids = records
         .iter()
@@ -89,7 +104,11 @@ fn receive(listener: &TcpListener, schema: &Value) -> Vec<String> {
             })
         })
         .collect::<Vec<_>>();
-    let response_body = serde_json::json!({"results": results}).to_string();
+    let response_body = serde_json::json!({
+        "schema_version":"trackai.security-upload-result/2",
+        "results": results
+    })
+    .to_string();
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -127,97 +146,6 @@ fn read_http_body(stream: &TcpStream) -> Vec<u8> {
     let mut body = vec![0; content_length.unwrap()];
     reader.read_exact(&mut body).unwrap();
     body
-}
-
-fn local_ref<'a>(schema: &'a Value, reference: &str) -> Option<&'a Value> {
-    reference
-        .strip_prefix("#/")?
-        .split('/')
-        .try_fold(schema, |node, part| node.get(part))
-}
-
-fn validates(schema: &Value, root: &Value, value: &Value) -> bool {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        return local_ref(root, reference).is_some_and(|target| validates(target, root, value));
-    }
-    if schema
-        .get("const")
-        .is_some_and(|constant| value != constant)
-    {
-        return false;
-    }
-    if schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .is_some_and(|values| !values.contains(value))
-    {
-        return false;
-    }
-    if schema
-        .get("oneOf")
-        .and_then(Value::as_array)
-        .is_some_and(|branches| {
-            branches
-                .iter()
-                .filter(|branch| validates(branch, root, value))
-                .count()
-                != 1
-        })
-    {
-        return false;
-    }
-    match schema.get("type").and_then(Value::as_str) {
-        Some("object") => {
-            let Some(object) = value.as_object() else {
-                return false;
-            };
-            if schema
-                .get("required")
-                .and_then(Value::as_array)
-                .is_some_and(|required| {
-                    required
-                        .iter()
-                        .any(|key| key.as_str().is_none_or(|key| !object.contains_key(key)))
-                })
-            {
-                return false;
-            }
-            let properties = schema.get("properties").and_then(Value::as_object);
-            if schema.get("additionalProperties") == Some(&Value::Bool(false))
-                && object
-                    .keys()
-                    .any(|key| properties.is_none_or(|properties| !properties.contains_key(key)))
-            {
-                return false;
-            }
-            if let Some(properties) = properties
-                && object.iter().any(|(key, value)| {
-                    properties
-                        .get(key)
-                        .is_some_and(|property| !validates(property, root, value))
-                })
-            {
-                return false;
-            }
-        }
-        Some("array") => {
-            let Some(array) = value.as_array() else {
-                return false;
-            };
-            if schema
-                .get("items")
-                .is_some_and(|items| array.iter().any(|value| !validates(items, root, value)))
-            {
-                return false;
-            }
-        }
-        Some("string") if !value.is_string() => return false,
-        Some("integer") if !value.is_i64() && !value.is_u64() => return false,
-        Some("boolean") if !value.is_boolean() => return false,
-        Some("null") if !value.is_null() => return false,
-        _ => {}
-    }
-    true
 }
 
 #[test]

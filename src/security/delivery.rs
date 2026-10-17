@@ -21,11 +21,14 @@ pub struct UploadHttpResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResultEnvelope {
+    schema_version: String,
     results: Vec<RecordResult>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecordResult {
     record_id: String,
     result: String,
@@ -172,12 +175,19 @@ where
                 summary.retrying += ids.len();
                 continue;
             };
-            if envelope.results.len() != batch.len()
+            if envelope.schema_version != "trackai.security-upload-result/2"
+                || envelope.results.len() != batch.len()
                 || envelope
                     .results
                     .iter()
                     .zip(&batch)
-                    .any(|(result, (record, _))| result.record_id != record.record_id)
+                    .any(|(result, (record, _))| {
+                        result.record_id != record.record_id
+                            || !matches!(
+                                (result.result.as_str(), result.code.as_deref()),
+                                ("accepted" | "duplicate", None) | ("rejected", Some(_))
+                            )
+                    })
             {
                 let ids = batch
                     .iter()
@@ -430,7 +440,7 @@ mod tests {
         ]);
         let result=flush_security_records_with(
             &mut queue,&Lease(SecurityDataSettings::ALL_OFF),10,|_|Some("credential".into()),
-            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"results":[
+            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"schema_version":"trackai.security-upload-result/2","results":[
                 {"record_id":body["records"][0]["record_id"],"result":"accepted"},
                 {"record_id":body["records"][1]["record_id"],"result":"duplicate"},
                 {"record_id":body["records"][2]["record_id"],"result":"rejected","code":"SECURITY_V2_LEASE_MISMATCH"},
@@ -454,7 +464,7 @@ mod tests {
         })]);
         let result=flush_security_records_with(
             &mut queue,&Lease(SecurityDataSettings::ALL_OFF),10,|_|Some("credential".into()),
-            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"results":[{
+            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"schema_version":"trackai.security-upload-result/2","results":[{
                 "record_id":body["records"][0]["record_id"],"result":"rejected","code":"SECURITY_V2_FIELD_NOT_PERMITTED"
             }]}).to_string() })
         ).unwrap();
@@ -508,7 +518,7 @@ mod tests {
                 Ok(UploadHttpResponse {
                     status: 200,
                     retry_after_seconds: None,
-                    body: json!({"results":[{
+                    body: json!({"schema_version":"trackai.security-upload-result/2","results":[{
                         "record_id":body["records"][0]["record_id"],
                         "result":"rejected","code":"SECURITY_V2_FIELD_NOT_PERMITTED"
                     }]})
@@ -539,5 +549,35 @@ mod tests {
         assert_eq!(result, SecurityFlushResult::default());
         assert!(!upload_called);
         assert_eq!(queue.dequeue_pending(500, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_success_envelope_never_deletes_a_durable_row() {
+        for response_body in [
+            json!({"results":[]}),
+            json!({
+                "schema_version":"trackai.security-upload-result/2",
+                "results":[],
+                "unknown":true
+            }),
+        ] {
+            let (_temp, mut queue) = queue_with(vec![json!({"kind":"scan_summary"})]);
+            let result = flush_security_records_with(
+                &mut queue,
+                &Lease(SecurityDataSettings::ALL_OFF),
+                10,
+                |_| Some("credential".into()),
+                |_, _, _| {
+                    Ok(UploadHttpResponse {
+                        status: 200,
+                        retry_after_seconds: None,
+                        body: response_body.to_string(),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(result.retrying, 1);
+            assert_eq!(queue.dequeue_pending(500, 1_000).unwrap().len(), 1);
+        }
     }
 }
