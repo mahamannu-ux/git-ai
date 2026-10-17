@@ -1,0 +1,19 @@
+packaging/numbat/reproduce.sh
+  s_ea092e4fd2f6e9::t_4c122fcf955be1 1-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "471d25b9e5106a234ead0a979122cff2f1a34e41",
+  "prompts": {},
+  "sessions": {
+    "s_ea092e4fd2f6e9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eb71cff07ffe5WzjrpDCkiTB0X",
+        "model": "glm-5.3-flash-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
