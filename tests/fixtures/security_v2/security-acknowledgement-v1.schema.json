@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trackai.dev/contracts/security-v2/security-acknowledgement-v1.schema.json",
+  "title": "TrackAI security activation acknowledgement v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "lease_id", "bundle_digest", "result"],
+  "properties": {
+    "schema_version": { "const": "trackai.security-acknowledgement/1" },
+    "lease_id": { "$ref": "#/definitions/opaqueId" },
+    "bundle_digest": { "$ref": "#/definitions/sha256" },
+    "result": { "enum": ["applied", "refused"] },
+    "refusal_code": {
+      "enum": [
+        "SIGNATURE_REJECTED",
+        "VERIFICATION_UNAVAILABLE",
+        "LEASE_EXPIRED",
+        "MACHINE_MISMATCH",
+        "TENANT_MISMATCH",
+        "EPOCH_REGRESSION",
+        "BUNDLE_DIGEST_MISMATCH",
+        "RULES_CHECK_FAILED",
+        "UNSUPPORTED_SCHEMA"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["result"],
+        "properties": { "result": { "const": "refused" } }
+      },
+      "then": { "required": ["refusal_code"] },
+      "else": { "not": { "required": ["refusal_code"] } }
+    }
+  ],
+  "definitions": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\s]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

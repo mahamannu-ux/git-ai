@@ -1,0 +1,7 @@
+{
+  "schema_version": "trackai.security-data-settings/1",
+  "command_previews": false,
+  "file_paths": false,
+  "host_identity": false,
+  "user_identity": false
+}

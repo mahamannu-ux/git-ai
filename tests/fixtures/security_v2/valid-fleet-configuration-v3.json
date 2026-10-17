@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 3,
+  "configurationId": "configuration-placeholder",
+  "epoch": 1,
+  "issuedAt": "2026-10-17T10:00:00Z",
+  "validUntil": null,
+  "channel": "latest",
+  "ring": null,
+  "repositoryPolicies": [{
+    "repositoryId": "repository-placeholder",
+    "enrollmentId": "enrollment-placeholder",
+    "grantId": "grant-placeholder",
+    "branchPatterns": ["main"],
+    "effectiveFrom": "2026-10-17T10:00:00Z",
+    "effectiveUntil": null
+  }],
+  "securityLease": {
+    "leaseId": "lease-placeholder",
+    "bundleDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expiresAt": "2026-10-20T10:00:00Z"
+  },
+  "verification": { "required": true, "state": "unavailable" },
+  "clientCompatibility": { "minimumVersion": "1.0.0", "maximumVersion": "1.0.0" },
+  "desiredRelease": {
+    "version": "1.0.0",
+    "releaseTag": "v1.0.0",
+    "manifestUrl": "https://github.com/mahamannu-ux/git-ai/releases/download/v1.0.0/SHA256SUMS",
+    "manifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

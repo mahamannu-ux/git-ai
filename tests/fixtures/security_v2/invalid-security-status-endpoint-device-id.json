@@ -1,0 +1,15 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "security_status",
+    "record_id": "sha256:3b85d236fdca28674a6762d420852b6e4e78541e02cff09149eec586a2230f13",
+    "observed_at": "2026-10-17T10:00:00Z",
+    "numbat_version": "0.5.0",
+    "wired_agents": [],
+    "active_bundle_digest": null,
+    "lease_id": null,
+    "last_record_at": null,
+    "health": { "hook_status": "ok", "agent_effective_view": "ok", "local_record": "ok", "forwarder_ack": "ok" },
+    "endpoint": { "device_id": "forbidden" }
+  }]
+}

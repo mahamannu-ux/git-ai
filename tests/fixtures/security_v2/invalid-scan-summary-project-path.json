@@ -1,0 +1,14 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "scan_summary",
+    "record_id": "sha256:e69cd3a4af4f20d0e39260d7a709ea29bc1e9f1f5444f57649075f76856d1fde",
+    "status": "complete",
+    "artifacts_scanned": 3,
+    "events_emitted": 3,
+    "findings_emitted": 2,
+    "indicators_emitted": 0,
+    "diagnostics": 0,
+    "project_path": "/forbidden"
+  }]
+}

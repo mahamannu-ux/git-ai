@@ -1,0 +1,374 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trackai.dev/contracts/security-v2/security-upload-v2.schema.json",
+  "title": "TrackAI security upload v2",
+  "description": "Machine-authenticated security records. Tenant and machine identity are derived from the credential and are forbidden in this body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "records"],
+  "properties": {
+    "schema_version": { "const": "trackai.security-upload/2" },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/definitions/finding" },
+          { "$ref": "#/definitions/enforcement" },
+          { "$ref": "#/definitions/indicator" },
+          { "$ref": "#/definitions/scanSummary" },
+          { "$ref": "#/definitions/permissionEvent" },
+          { "$ref": "#/definitions/securityStatus" },
+          { "$ref": "#/definitions/agentInventory" }
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "recordId": {
+      "type": "string",
+      "maxLength": 71,
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\s]+$"
+    },
+    "boundedName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "redactedPreview": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "safeCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40,
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/definitions/utcTimestamp" },
+        { "type": "null" }
+      ]
+    },
+    "nullableSha256": {
+      "oneOf": [
+        { "$ref": "#/definitions/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "nullableOpaqueId": {
+      "oneOf": [
+        { "$ref": "#/definitions/opaqueId" },
+        { "type": "null" }
+      ]
+    },
+    "sourceAgent": {
+      "enum": [
+        "claude-code", "cowork", "codex", "gemini-cli", "cursor", "windsurf",
+        "copilot", "vscode", "opencode", "openclaw", "antigravity", "factory",
+        "grok", "devin-cli", "hermes", "kimi-code", "pi", "qwen-code",
+        "cline", "amp", "auggie", "kiro", "goose", "kilo", "openhands",
+        "crush", "junie", "unknown"
+      ]
+    },
+    "repository": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": { "const": "enrolled" },
+            "id": { "$ref": "#/definitions/opaqueId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "not_enrolled" }
+          }
+        }
+      ]
+    },
+    "findingEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 2,
+      "properties": {
+        "hostname": { "$ref": "#/definitions/redactedPreview" },
+        "username": { "$ref": "#/definitions/redactedPreview" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "rule_id", "rule_version", "severity", "title",
+        "source_agent", "source_type", "confidence", "detected_at",
+        "numbat_schema_version", "bundle_digest", "lease_id", "found_at_rest",
+        "repository"
+      ],
+      "properties": {
+        "kind": { "const": "finding" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "rule_id": { "$ref": "#/definitions/boundedName" },
+        "rule_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "severity": { "enum": ["info", "low", "medium", "high", "critical"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "source_agent": { "$ref": "#/definitions/sourceAgent" },
+        "source_type": { "enum": ["artifact", "hook", "otel"] },
+        "model": { "$ref": "#/definitions/boundedName" },
+        "model_provider": { "$ref": "#/definitions/boundedName" },
+        "session_id": { "$ref": "#/definitions/opaqueId" },
+        "parent_session_id": { "$ref": "#/definitions/opaqueId" },
+        "sub_agent_id": { "$ref": "#/definitions/opaqueId" },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "tags": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+        },
+        "detected_at": { "$ref": "#/definitions/utcTimestamp" },
+        "numbat_schema_version": { "const": "0.5.0" },
+        "bundle_digest": { "$ref": "#/definitions/sha256" },
+        "lease_id": { "$ref": "#/definitions/opaqueId" },
+        "found_at_rest": { "type": "boolean" },
+        "repository": { "$ref": "#/definitions/repository" },
+        "observed_command": { "$ref": "#/definitions/redactedPreview" },
+        "observed_file_path": { "$ref": "#/definitions/redactedPreview" },
+        "observed_url": { "$ref": "#/definitions/redactedPreview" },
+        "endpoint": { "$ref": "#/definitions/findingEndpoint" }
+      }
+    },
+    "enforcement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "decision", "mode", "rule_ids",
+        "finding_record_ids", "source_agent", "timestamp"
+      ],
+      "properties": {
+        "kind": { "const": "enforcement" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "decision": { "enum": ["deny", "no_override"] },
+        "mode": { "enum": ["monitor", "enforce"] },
+        "rule_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/boundedName" }
+        },
+        "deny_rule_id": { "$ref": "#/definitions/boundedName" },
+        "deny_rule_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "finding_record_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/recordId" }
+        },
+        "tool_name": { "$ref": "#/definitions/boundedName" },
+        "tool_call_id": { "$ref": "#/definitions/opaqueId" },
+        "session_id": { "$ref": "#/definitions/opaqueId" },
+        "source_agent": { "$ref": "#/definitions/sourceAgent" },
+        "timestamp": { "$ref": "#/definitions/utcTimestamp" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["decision"],
+            "properties": { "decision": { "const": "deny" } }
+          },
+          "then": {
+            "required": ["deny_rule_id", "deny_rule_version"],
+            "properties": { "mode": { "const": "enforce" } }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["deny_rule_id"] },
+                { "required": ["deny_rule_version"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "monitor" } }
+          },
+          "then": { "properties": { "decision": { "const": "no_override" } } }
+        }
+      ]
+    },
+    "indicator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "type", "value", "count", "first_seen",
+        "last_seen", "source_agent"
+      ],
+      "properties": {
+        "kind": { "const": "indicator" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "type": { "enum": ["domain", "ipv4", "ipv6", "url", "email", "md5", "sha1", "sha256"] },
+        "value": { "$ref": "#/definitions/redactedPreview" },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "first_seen": { "$ref": "#/definitions/utcTimestamp" },
+        "last_seen": { "$ref": "#/definitions/utcTimestamp" },
+        "source_agent": { "$ref": "#/definitions/sourceAgent" }
+      }
+    },
+    "scanSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "status", "artifacts_scanned", "events_emitted",
+        "findings_emitted", "indicators_emitted", "diagnostics"
+      ],
+      "properties": {
+        "kind": { "const": "scan_summary" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "status": { "enum": ["complete", "partial", "error"] },
+        "artifacts_scanned": { "$ref": "#/definitions/safeCount" },
+        "events_emitted": { "$ref": "#/definitions/safeCount" },
+        "findings_emitted": { "$ref": "#/definitions/safeCount" },
+        "indicators_emitted": { "$ref": "#/definitions/safeCount" },
+        "diagnostics": { "$ref": "#/definitions/safeCount" }
+      }
+    },
+    "permissionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "outcome", "source_agent", "timestamp", "join"
+      ],
+      "properties": {
+        "kind": { "const": "permission_event" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "outcome": { "enum": ["requested", "approved", "denied"] },
+        "tool_name": { "$ref": "#/definitions/boundedName" },
+        "tool_call_id": { "$ref": "#/definitions/opaqueId" },
+        "session_id": { "$ref": "#/definitions/opaqueId" },
+        "source_agent": { "$ref": "#/definitions/sourceAgent" },
+        "timestamp": { "$ref": "#/definitions/utcTimestamp" },
+        "join": { "enum": ["exact", "same_session_window", "unavailable"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["join"],
+            "properties": { "join": { "const": "exact" } }
+          },
+          "then": { "required": ["tool_call_id"] }
+        },
+        {
+          "if": {
+            "required": ["join"],
+            "properties": { "join": { "const": "same_session_window" } }
+          },
+          "then": { "required": ["session_id"] }
+        }
+      ]
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hook_status", "agent_effective_view", "local_record", "forwarder_ack"],
+      "properties": {
+        "hook_status": { "$ref": "#/definitions/healthState" },
+        "agent_effective_view": { "$ref": "#/definitions/healthState" },
+        "local_record": { "$ref": "#/definitions/healthState" },
+        "forwarder_ack": { "$ref": "#/definitions/healthState" }
+      }
+    },
+    "healthState": {
+      "enum": ["ok", "failed", "unavailable"]
+    },
+    "securityStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "record_id", "observed_at", "numbat_version", "wired_agents",
+        "active_bundle_digest", "lease_id", "last_record_at", "health"
+      ],
+      "properties": {
+        "kind": { "const": "security_status" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "observed_at": { "$ref": "#/definitions/utcTimestamp" },
+        "numbat_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "wired_agents": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/sourceAgent" }
+        },
+        "active_bundle_digest": { "$ref": "#/definitions/nullableSha256" },
+        "lease_id": { "$ref": "#/definitions/nullableOpaqueId" },
+        "last_record_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "health": { "$ref": "#/definitions/health" }
+      }
+    },
+    "agentInventoryRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "version", "config", "artifacts", "wired"],
+      "properties": {
+        "agent": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 64 },
+            { "type": "null" }
+          ]
+        },
+        "config": { "enum": ["present", "absent", "unavailable"] },
+        "artifacts": { "enum": ["present", "absent", "not_supported", "unavailable"] },
+        "wired": { "enum": ["yes", "no", "not_supported", "unavailable"] }
+      }
+    },
+    "agentInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "record_id", "observed_at", "agents"],
+      "properties": {
+        "kind": { "const": "agent_inventory" },
+        "record_id": { "$ref": "#/definitions/recordId" },
+        "observed_at": { "$ref": "#/definitions/utcTimestamp" },
+        "agents": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/agentInventoryRow" }
+        }
+      }
+    }
+  }
+}
