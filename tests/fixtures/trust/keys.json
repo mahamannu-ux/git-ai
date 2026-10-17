@@ -1,0 +1,76 @@
+{
+  "vector_version": 1,
+  "note": "Synthetic test keys derived from public seeds; they protect nothing.",
+  "keys": [
+    {
+      "name": "root1",
+      "keyid": "sha256:8967391807b5d99219191000657962a999fc89a477f310f8be32cbb4455aa63b",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEE/nXSEB7D7fyyS8D+65AqgNrNUlPYttHDajwFe2a910CQdTQkFX9bogMk6AtxTZR6DVZfNcts/Ty5rXtr9hmhQ=="
+    },
+    {
+      "name": "root2",
+      "keyid": "sha256:5b966a3b08328ce405a93b2244362e21d9b9c620b9570944af2dcc7253cddc20",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5HWTn8CcCmOSiwpx1TFWyvBwWYItyXjbk1EFAXFcqZjNuoFyx5a++7lrdRQsbZ2dlabkpor4imIQbT6Xq6zLtg=="
+    },
+    {
+      "name": "anchor1",
+      "keyid": "sha256:337fd5052491a8aafad0488bbcb08f1d4e81e6d5bbb6f4e6d2ddd09001c17c7f",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEe5bUKokODUrp2XnLW5L3B7zeMUPSZQKRkkiFWzc9xaA63fGj7ayrllBWY95l0ONyropkmpfFjk8xUWf79LFYvA=="
+    },
+    {
+      "name": "lease1",
+      "keyid": "sha256:67fabf1927bd9b06402bc3d0651a9475e8bed50f60db839281d994e66f1e1870",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENntb1TAMkQooTWoOn4u3DeUvwRw8OBYQp1gRgbd0VU87mamLe8Qbymne36A7tbXbaRCk4UR/SXmc+pgirGSqsw=="
+    },
+    {
+      "name": "fleet1",
+      "keyid": "sha256:02ce06f9387d202d90150296650c61c2da2f1c2e9cd2feec26ebb8bd3bd5868c",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbGWWn1ooOLZ83uny6B+gSEJ6rTQFl4bvmNrTUd7BRvT5avRgAtptjfefbiPHFKmCCfjCwY3EyGgclWsqHb0kRA=="
+    },
+    {
+      "name": "policy1",
+      "keyid": "sha256:80bf82c53bc6bf447800bb60fd6a06a8e23443aa732acec6004b101d0b97f480",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEUE/16Q1hOAeoGzPUeHYWvoupNSRfBfOn9arlnxS57LFRdnuX0LYNDHZJca4ZpE32USU370JbFMWShdthk426vQ=="
+    },
+    {
+      "name": "release1",
+      "keyid": "sha256:a2aec1c4b840a971ac819e6d3d7e498bc86649f942a0837993c3aa4a9303b03a",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcekk06B6qcIOPhumo57bf0X8wsTpE3vG0tCEVnqkE3iVIbCQTnZa7LyffwOWJzNtqKpJ+KplLgyIC0TDN4crTg=="
+    },
+    {
+      "name": "keyset1",
+      "keyid": "sha256:5a3b5d3cf79e6474061bc3ae713459d512bd303651c437310f739dab58de988a",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5K3EkZt0TWlg8dVWzPa+A7wl1nnQcMFvu/lxt891zgcV5sei4Ala27LvhV5snQRTc5hLngaBqODy1aFLKN7nsA=="
+    },
+    {
+      "name": "stmtA1",
+      "keyid": "sha256:c84df3c7afeb7ddc1d0c181de89d9bf1289829c117a0372face8ef6758b1ebef",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEN1DrR265C/PIVxvecbBJjDkS01pV65ofZ7eicS298h76odSsoyHGbo4wR0otoOxvdP0GSX97eZmCWPfz6qARZQ=="
+    },
+    {
+      "name": "stmtA2",
+      "keyid": "sha256:5963e86dfaec51dffdfc0cb409e9ebe3a5933ccb58f8f8b12a6bc8776f9c181c",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEXRzarM5j5H9JIP20QPTm4AbVqWkcE1mNyM+4BNOGTnvSZaspVGevZ5cxs0xh0LT99hpN8qSczfjCn420yx+hEA=="
+    },
+    {
+      "name": "stmtB1",
+      "keyid": "sha256:916e4290a7877e082f5b54cebd2e50e68862c9fcdf510e9c92dcb48baac18067",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzx0j4Cnw//DgSCK6uVW3ttukvp0Ln7ZdCE4B+D6H2T6ULYuBfa+zl5SLs1iLyZ2XOHHtuWb5MJdnir7zd50Tvw=="
+    },
+    {
+      "name": "attacker",
+      "keyid": "sha256:66e2b3d6617f16414572591d9d64e5690faf31f547b89c5a0a7705fccf6a1c35",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExmxQ37mZt/Ljho7eXiFg5uLjrxwgY4KdZLotxwKsLaUNlscgnIhkoF2RhCdfcMbCkTad6enZOC+8jCQ1K0gy/Q=="
+    },
+    {
+      "name": "attacker2",
+      "keyid": "sha256:01353d94e39fb93a6559a89454681a0450fc9ccde314ced123beafc8ea710fb8",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhoST/v4o5Ct1EYOPx3REyexOM5hH0S9CRbnR9QQou/h/234gCdyHO+Sbs88mK0USTMJHyjdW9UsShA5z09NbCQ=="
+    },
+    {
+      "name": "keyset2",
+      "keyid": "sha256:f7b340215a55ce7b7159d008cf9717402eabb6a62eb198fabc863ace307826cc",
+      "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+KxdRS9SSlvh0hzY9lN9M09XTjMs31VHvv3pFqzT4xYJ4183pRtYtZDxm/4aCc2KNDcRIWW/ke+OaY4LdUWJSw=="
+    }
+  ]
+}
