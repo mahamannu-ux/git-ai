@@ -13,16 +13,18 @@
 set -eu
 
 stripped_flag() {
-    # POSIX nm prints only "no symbols" for a stripped binary.
+    # Spec: `nm "$bin" | wc -l` on macOS; 0 lines or "no symbols" means
+    # stripped. nm emits "no symbols" on stderr for a fully stripped binary,
+    # on stdout when it has only that note.
     if ! command -v nm >/dev/null 2>&1; then
         echo unknown
         return 0
     fi
-    if [ -z "$(nm "$1" 2>/dev/null)" ]; then
-        echo yes
-    else
-        echo no
-    fi
+    nm_text=$(nm "$1" 2>&1 | head -3)
+    case "$nm_text" in
+    "no symbols" | "") echo yes ;;
+    *) echo no ;;
+    esac
 }
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then

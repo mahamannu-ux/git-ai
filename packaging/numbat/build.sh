@@ -86,7 +86,7 @@ if [ "$goos" = "windows" ]; then
 fi
 binary_src="$out_pkg/numbat_built"
 
-mkdir -p "$out_dir" "$out_pkg"
+mkdir -p "$out_pkg"
 (
     cd "$src_dir"
     CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local \
