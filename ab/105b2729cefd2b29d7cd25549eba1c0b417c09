@@ -1,0 +1,33 @@
+src/daemon.rs
+  s_695bc47d3fa8a0::t_e19b356b3d25d7 6965-6966,6968-6970
+src/daemon/telemetry_worker.rs
+  s_695bc47d3fa8a0::t_f00ee16caf1980 30-32,49,53,465,474-475,479-480,482-494,496,498,503,505
+src/security/activation.rs
+  s_36d458b32edec5::t_46faef2117d5da 1,3,5-7,11,13-15,18-19,23
+src/security/shipper.rs
+  s_695bc47d3fa8a0::t_99bbfc4ce423db 1-10,12-15,17,19-21,23-27,30-40,42-127,130-131,134-159,162-183,185,187-190,192-194,196-205,207-211,213-214,216-242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "ab105b2729cefd2b29d7cd25549eba1c0b417c09",
+  "prompts": {},
+  "sessions": {
+    "s_36d458b32edec5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eb53fa016ffeNNqC1CaQsrhdRB",
+        "model": "muse-spark-1.3"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    },
+    "s_695bc47d3fa8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14abb-bc2a-7ec2-95b8-2dc028235936",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
