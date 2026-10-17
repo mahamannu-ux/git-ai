@@ -288,11 +288,11 @@ fn open_no_follow(path: &Path) -> Result<File, GitAiError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        return OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .map_err(GitAiError::from);
+            .map_err(GitAiError::from)
     }
     #[cfg(not(unix))]
     {

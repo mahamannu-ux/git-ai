@@ -41,6 +41,8 @@ pub struct SecurityFlushResult {
 }
 
 type RouteKey = (String, String, String);
+type ParsedQueuedRecord = (QueuedSecurityRecord, Value);
+type SecurityBatch = Vec<ParsedQueuedRecord>;
 
 pub fn flush_security_records_with<Resolve, Upload>(
     queue: &mut SecurityRecordQueue,
@@ -230,9 +232,9 @@ where
 
 fn split_batches(
     records: Vec<QueuedSecurityRecord>,
-) -> Result<(Vec<Vec<(QueuedSecurityRecord, Value)>>, Vec<i64>), GitAiError> {
+) -> Result<(Vec<SecurityBatch>, Vec<i64>), GitAiError> {
     let mut batches = Vec::new();
-    let mut current: Vec<(QueuedSecurityRecord, Value)> = Vec::new();
+    let mut current = SecurityBatch::new();
     let mut invalid_ids = Vec::new();
     for record in records {
         let Ok(value) = serde_json::from_str::<Value>(&record.projection_json) else {
