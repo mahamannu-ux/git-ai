@@ -1,0 +1,19 @@
+packaging/numbat/coverage/v0.2.0-trackai.1.md
+  s_ea092e4fd2f6e9::t_e0ffe40604e05a 1-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "913bc6df1856eb088ca630c26d8791d04ea58a39",
+  "prompts": {},
+  "sessions": {
+    "s_ea092e4fd2f6e9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eb71cff07ffe5WzjrpDCkiTB0X",
+        "model": "glm-5.3-flash-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
