@@ -27,8 +27,9 @@ use crate::metrics::pos_encoded::sparse_get_string;
 use crate::metrics::types::MetricEventId;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
-use crate::security::activation::refresh_configured_security_activations;
-use crate::security::delivery::flush_configured_security_findings;
+use crate::security::delivery::flush_configured_security_records;
+use crate::security::records::PermissionJoinTracker;
+use crate::security::shipper::poll_configured_security_records;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,11 +46,11 @@ const MAX_DAEMON_LOG_BUFFER_EVENTS: usize = 5000;
 // complete within the HTTP response window while preserving ordered retries.
 const MAX_BOUND_METRICS_PER_ENVELOPE: usize = 10;
 const CLIENT_DELIVERY_HEALTH_REPORT_INTERVAL_SECS: u64 = 60;
-const SECURITY_ACTIVATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const SECURITY_SHIPPER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 static METRICS_UPLOAD_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static METRICS_METADATA_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
-static SECURITY_ACTIVATION_REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
+static SECURITY_SHIPPER_STARTED: AtomicBool = AtomicBool::new(false);
 static LAST_CLIENT_DELIVERY_HEALTH_REPORT_AT: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(target_os = "macos", windows))]
 static LAST_MANAGED_FLEET_REFRESH_AT: AtomicU64 = AtomicU64::new(0);
@@ -461,7 +462,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
     let daemon_id = crate::uuid::generate_v4();
 
     spawn_metrics_metadata_backfill();
-    spawn_security_activation_refresh_worker();
+    spawn_security_shipper_worker();
 
     tokio::spawn(async move {
         telemetry_flush_loop(buffer, daemon_id, flush_rx).await;
@@ -470,26 +471,38 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
     handle
 }
 
-fn spawn_security_activation_refresh_worker() {
-    if SECURITY_ACTIVATION_REFRESH_STARTED.swap(true, Ordering::Relaxed) {
+fn spawn_security_shipper_worker() {
+    if SECURITY_SHIPPER_STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
 
-    tokio::spawn(async {
+    let joins = Arc::new(std::sync::Mutex::new(PermissionJoinTracker::default()));
+    tokio::spawn(async move {
         loop {
-            if let Err(error) = tokio::task::spawn_blocking(|| {
-                refresh_configured_security_activations();
-                if let Err(error) =
-                    flush_configured_security_findings(chrono::Utc::now().timestamp() as u64, 100)
+            let joins = joins.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                if let Ok(mut joins) = joins.lock()
+                    && let Err(error) = poll_configured_security_records(
+                        &crate::security::activation::UNAVAILABLE_LEASE_CONTEXT,
+                        None,
+                        &std::collections::HashMap::new(),
+                        &mut joins,
+                        chrono::Utc::now().timestamp() as u64,
+                    )
                 {
-                    tracing::warn!(%error, "security finding delivery failed");
+                    tracing::warn!(%error, "security record polling failed");
+                }
+                if let Err(error) =
+                    flush_configured_security_records(chrono::Utc::now().timestamp() as u64)
+                {
+                    tracing::warn!(%error, "security record delivery failed");
                 }
             })
             .await
             {
-                tracing::warn!(%error, "security activation refresh task failed");
+                tracing::warn!(%error, "security shipper task failed");
             }
-            tokio::time::sleep(SECURITY_ACTIVATION_REFRESH_INTERVAL).await;
+            tokio::time::sleep(SECURITY_SHIPPER_POLL_INTERVAL).await;
         }
     });
 }
