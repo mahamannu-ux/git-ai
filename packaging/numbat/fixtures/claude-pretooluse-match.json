@@ -1,0 +1,8 @@
+{
+  "session_id": "trackai-measure-1",
+  "cwd": "/trackai-demo",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat .env"
+  }
+}
