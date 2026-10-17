@@ -1,0 +1,189 @@
+Cargo.lock
+  s_36d458b32edec5::t_59794b1e9724f7 140-145,397-402,559-570,684-693,742,744,794-807,814-832,902-911,1107,1151,1176,1553-1563,1675-1683,2518-2529,2675-2684,2768-2776,2870-2872,3055-3064,3196-3209,3430-3439,3480-3489,3529-3534,3982
+tests/fixtures/trust/01-good-statement.json
+  s_36d458b32edec5::t_455bd68342f0e7 1-97
+tests/fixtures/trust/02-good-release.json
+  s_36d458b32edec5::t_393764f20a198d 1-93
+tests/fixtures/trust/03-good-activation-lease.json
+  s_36d458b32edec5::t_1aa1cc59310f4c 1-93
+tests/fixtures/trust/04-good-fleet-config.json
+  s_36d458b32edec5::t_cf3f4fca951084 1-93
+tests/fixtures/trust/05-good-tenant-b.json
+  s_36d458b32edec5::t_d0cdc49186a76c 1-97
+tests/fixtures/trust/06-rotation-old-key-before-retirement.json
+  s_36d458b32edec5::t_74f322755a7abf 1-93
+tests/fixtures/trust/07-rotation-old-key-after-retirement.json
+  s_36d458b32edec5::t_7739288918fff2 1-85
+tests/fixtures/trust/08-key-before-not-before.json
+  s_36d458b32edec5::t_f1a48bed6e9fec 1-85
+tests/fixtures/trust/09-signed-at-in-future.json
+  s_36d458b32edec5::t_2389eed0fbda47 1-85
+tests/fixtures/trust/10-root-rotation-chain.json
+  s_36d458b32edec5::t_72fc0bff4e9299 1-107
+tests/fixtures/trust/11-root-rotation-statement.json
+  s_36d458b32edec5::t_bf3b41a6567493 1-111
+tests/fixtures/trust/12-root-new-pin-only.json
+  s_36d458b32edec5::t_0633c6f53232ae 1-97
+tests/fixtures/trust/13-root-old-pin-missing-link.json
+  s_36d458b32edec5::t_f08433ac6a16ec 1-89
+tests/fixtures/trust/14-root-retired-root-signs.json
+  s_36d458b32edec5::t_2b9321ae1e3ed6 1-113
+tests/fixtures/trust/15-root-rotation-missing-old-signature.json
+  s_36d458b32edec5::t_a40a60df4684a4 1-95
+tests/fixtures/trust/16-root-rotation-missing-new-signature.json
+  s_36d458b32edec5::t_2af258ad890753 1-95
+tests/fixtures/trust/17-root-pinned-threshold-not-met.json
+  s_36d458b32edec5::t_8f59e8eb03cf52 1-85
+tests/fixtures/trust/18-root-version-gap.json
+  s_36d458b32edec5::t_6414a6684a61f0 1-95
+tests/fixtures/trust/19-root-none-held.json
+  s_36d458b32edec5::t_31896d41c0ace0 1-74
+tests/fixtures/trust/20-root-not-pinned-production.json
+  s_36d458b32edec5::t_4ae5e489a8427b 1-83
+tests/fixtures/trust/21-root-unpinned-development.json
+  s_36d458b32edec5::t_2c5f597cce7e40 1-91
+tests/fixtures/trust/22-root-unpinned-development-not-allowed.json
+  s_36d458b32edec5::t_7838c59265ebba 1-83
+tests/fixtures/trust/23-root-rollback.json
+  s_36d458b32edec5::t_47cf22e545e51f 1-90
+tests/fixtures/trust/24-root-expired.json
+  s_36d458b32edec5::t_65e440e7ece1c2 1-85
+tests/fixtures/trust/25-keyset-missing.json
+  s_36d458b32edec5::t_b7502656e004fb 1-63
+tests/fixtures/trust/26-keyset-expiry-boundary-inside.json
+  s_36d458b32edec5::t_a320d02baecaeb 1-87
+tests/fixtures/trust/27-keyset-expiry-boundary-outside.json
+  s_36d458b32edec5::t_78e1e947269cf2 1-85
+tests/fixtures/trust/28-keyset-rollback.json
+  s_36d458b32edec5::t_95a11c6d2ec91a 1-90
+tests/fixtures/trust/29-keyset-from-future.json
+  s_36d458b32edec5::t_20d901ff69b2c2 1-83
+tests/fixtures/trust/30-keyset-conflict.json
+  s_36d458b32edec5::t_a7d6eadceb72cd 1-83
+tests/fixtures/trust/31-keyset-regression.json
+  s_36d458b32edec5::t_4d8bb3307b5b25 1-83
+tests/fixtures/trust/32-keyset-signed-by-unknown-key.json
+  s_36d458b32edec5::t_792ce6e8355749 1-73
+tests/fixtures/trust/33-keyset-signed-by-wrong-purpose.json
+  s_36d458b32edec5::t_95ec9244686c47 1-73
+tests/fixtures/trust/34-keyset-not-canonical.json
+  s_36d458b32edec5::t_ba6ba0b27d1ac6 1-73
+tests/fixtures/trust/35-keyset-keyid-not-spki-digest.json
+  s_36d458b32edec5::t_b34ef316b305ec 1-73
+tests/fixtures/trust/36-revoked-superseded-before.json
+  s_36d458b32edec5::t_33dd9e72d46401 1-91
+tests/fixtures/trust/37-revoked-superseded-after.json
+  s_36d458b32edec5::t_f8d98e944102ab 1-83
+tests/fixtures/trust/38-compromised-no-time-evidence.json
+  s_36d458b32edec5::t_9cda7023cec839 1-83
+tests/fixtures/trust/39-compromised-time-evidence-before.json
+  s_36d458b32edec5::t_4cc0cdb64f648f 1-101
+tests/fixtures/trust/40-compromised-time-evidence-after.json
+  s_36d458b32edec5::t_6883279c8593c7 1-89
+tests/fixtures/trust/41-compromised-time-evidence-other-payload.json
+  s_36d458b32edec5::t_85f333362548a7 1-89
+tests/fixtures/trust/42-key-unknown-statement.json
+  s_36d458b32edec5::t_624e55050fb90f 1-85
+tests/fixtures/trust/43-key-unknown-release.json
+  s_36d458b32edec5::t_09e31893239699 1-85
+tests/fixtures/trust/44-purpose-release-as-lease.json
+  s_36d458b32edec5::t_8ec1fb3758152e 1-85
+tests/fixtures/trust/45-purpose-keyset-key-as-statement.json
+  s_36d458b32edec5::t_f5f36d50927033 1-85
+tests/fixtures/trust/46-purpose-statement-key-as-release.json
+  s_36d458b32edec5::t_399fafb5d0839a 1-85
+tests/fixtures/trust/47-audience-tenant-a-key-for-b.json
+  s_36d458b32edec5::t_541179374f217e 1-85
+tests/fixtures/trust/48-signature-invalid.json
+  s_36d458b32edec5::t_24d4c1465ab673 1-85
+tests/fixtures/trust/49-keyset-first-use-needs-history.json
+  s_36d458b32edec5::t_904997af2e7435 1-63
+tests/fixtures/trust/50-keyset-forged-after-last-trusted.json
+  s_36d458b32edec5::t_8a273318e6d64b 1-78
+tests/fixtures/trust/51-keyset-forged-without-last-trusted-doc.json
+  s_36d458b32edec5::t_4bf3dbe4975b33 1-68
+tests/fixtures/trust/52-keyset-same-version-fork.json
+  s_36d458b32edec5::t_052885ad228f88 1-68
+tests/fixtures/trust/53-keyset-anchored-at-last-trusted.json
+  s_36d458b32edec5::t_7f2681d33fd081 1-96
+tests/fixtures/trust/54-keyset-lifetime-too-long.json
+  s_36d458b32edec5::t_ca77adbffdacb5 1-63
+tests/fixtures/trust/55-root-fork-by-rotated-out-key.json
+  s_36d458b32edec5::t_9f0a25f15d70f9 1-114
+tests/fixtures/trust/56-root-fork-first-use.json
+  s_36d458b32edec5::t_91dd8e47c69c0c 1-117
+tests/fixtures/trust/57-root-anchored-at-last-trusted.json
+  s_36d458b32edec5::t_3df87227c9a309 1-102
+tests/fixtures/trust/58-compromised-release-signature-evidence.json
+  s_36d458b32edec5::t_a768ea63a2c451 1-109
+tests/fixtures/trust/59-compromised-release-payload-timestamped.json
+  s_36d458b32edec5::t_5df474c10b5587 1-101
+tests/fixtures/trust/60-compromised-release-other-signature-evidence.json
+  s_36d458b32edec5::t_ae5b04cef3610d 1-101
+tests/fixtures/trust/61-pin-overrides-without-trackai.json
+  s_36d458b32edec5::t_13e49c722ada95 1-52
+tests/fixtures/trust/62-pin-excludes-listed-key.json
+  s_36d458b32edec5::t_017ec8f221fe00 1-97
+tests/fixtures/trust/63-pin-revoked-compromised.json
+  s_36d458b32edec5::t_ffc78fe9405bb5 1-100
+tests/fixtures/trust/64-input-payload-not-envelope.json
+  s_36d458b32edec5::t_fec76e0f6be08d 1-85
+tests/fixtures/trust/65-input-payload-type-mismatch.json
+  s_36d458b32edec5::t_2123b5f61a0697 1-85
+tests/fixtures/trust/66-input-two-signatures.json
+  s_36d458b32edec5::t_fc0d5c43e553a0 1-89
+tests/fixtures/trust/67-input-statement-audience-platform.json
+  s_36d458b32edec5::t_3fec7ccfcbfa64 1-85
+tests/fixtures/trust/68-input-release-audience-tenant.json
+  s_36d458b32edec5::t_cf87c1c51a1ac8 1-85
+tests/fixtures/trust/69-input-purpose-root.json
+  s_36d458b32edec5::t_6f1d8194a2db51 1-85
+tests/fixtures/trust/70-keyset-recovery-fresh.json
+  s_36d458b32edec5::t_daec4ef4071f01 1-105
+tests/fixtures/trust/71-keyset-recovery-anchored.json
+  s_36d458b32edec5::t_e7ec9d354885b0 1-90
+tests/fixtures/trust/72-keyset-newest-by-compromised-keyset-key.json
+  s_36d458b32edec5::t_3e7758b00362d3 1-83
+tests/fixtures/trust/73-compromised-statement-signature-evidence.json
+  s_36d458b32edec5::t_defc6cd78cf7b7 1-91
+tests/fixtures/trust/74-root-lifetime-too-long.json
+  s_36d458b32edec5::t_e3a5fc604f5fc7 1-85
+tests/fixtures/trust/75-root-signer-outside-validity.json
+  s_36d458b32edec5::t_e4e8ad65057891 1-99
+tests/fixtures/trust/76-rotation-old-key-signed-at-only.json
+  s_36d458b32edec5::t_950a9478949f54 1-85
+tests/fixtures/trust/77-revoked-superseded-signed-at-only.json
+  s_36d458b32edec5::t_2dc183e119e8d1 1-83
+tests/fixtures/trust/78-key-expired-signed-at-only.json
+  s_36d458b32edec5::t_6456cf68c00850 1-49
+tests/fixtures/trust/79-key-expired-signature-evidence.json
+  s_36d458b32edec5::t_8ff9d8b7605415 1-58
+tests/fixtures/trust/80-time-evidence-malformed.json
+  s_36d458b32edec5::t_5f394952089c19 1-91
+tests/fixtures/trust/81-clock-behind-floor.json
+  s_36d458b32edec5::t_718c00960ee92d 1-86
+tests/fixtures/trust/82-clock-floor-within-skew.json
+  s_36d458b32edec5::t_c68da72fb60e00 1-88
+tests/fixtures/trust/SOURCE.md
+  s_36d458b32edec5::t_6b10dcff37f1ce 1-9
+tests/fixtures/trust/keys.json
+  s_36d458b32edec5::t_24cea8b6b42ba4 1-76
+tests/trust_vectors.rs
+  s_36d458b32edec5::t_7b5a7f0a6f10b2 1-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "9f4f799ad997288b1baeee3b9364c66bae860c7a",
+  "prompts": {},
+  "sessions": {
+    "s_36d458b32edec5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eb53fa016ffeNNqC1CaQsrhdRB",
+        "model": "muse-spark-1.3"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
