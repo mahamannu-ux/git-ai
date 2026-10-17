@@ -1,0 +1,21 @@
+src/security/tail.rs
+  s_695bc47d3fa8a0::t_722fb063cd3c8d 61,179-186,219-225,233-286,493-549
+tests/security_v2_shipper.rs
+  s_695bc47d3fa8a0::t_fc394991790f2d 1-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "70bef013687f3d90e8e3eccbdcd3d55c8de0d02f",
+  "prompts": {},
+  "sessions": {
+    "s_695bc47d3fa8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14abb-bc2a-7ec2-95b8-2dc028235936",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
