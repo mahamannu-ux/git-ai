@@ -1,0 +1,19 @@
+packaging/numbat/measure.sh
+  s_ea092e4fd2f6e9::t_f40350a7fe2521 8-14,86,90-112,198,202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "f9642e1871b76a0ae664b8ba12bcf440333a33f8",
+  "prompts": {},
+  "sessions": {
+    "s_ea092e4fd2f6e9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eb71cff07ffe5WzjrpDCkiTB0X",
+        "model": "glm-5.3-flash-free"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
