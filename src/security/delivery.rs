@@ -56,6 +56,12 @@ where
     Upload:
         FnMut(&MetricDeliveryHealthBinding, &str, &Value) -> Result<UploadHttpResponse, GitAiError>,
 {
+    // Verification unavailable or no current lease is the off state. Preserve
+    // already-minimized rows for a later verified lease, but do not put them
+    // on the wire while local authorization is absent.
+    if leases.current().is_none() {
+        return Ok(SecurityFlushResult::default());
+    }
     let records = queue.dequeue_pending(MAX_RECORDS, now)?;
     let mut routes = BTreeMap::<RouteKey, Vec<QueuedSecurityRecord>>::new();
     for record in records {
@@ -334,7 +340,7 @@ pub fn flush_configured_security_records(now: u64) -> Result<SecurityFlushResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::activation::LeaseSnapshot;
+    use crate::security::activation::{LeaseSnapshot, UnavailableLeaseContext};
     use crate::security::records::{ProjectedRecord, SecurityDataSettings};
     use crate::security::tail::{FileIdentity, TailRead};
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -513,5 +519,25 @@ mod tests {
         .unwrap();
         assert_eq!(result.dropped, 1);
         assert!(queue.dequeue_pending(500, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unavailable_lease_context_sends_nothing_and_preserves_queue() {
+        let (_temp, mut queue) = queue_with(vec![json!({"kind":"scan_summary"})]);
+        let mut upload_called = false;
+        let result = flush_security_records_with(
+            &mut queue,
+            &UnavailableLeaseContext,
+            10,
+            |_| Some("credential".into()),
+            |_, _, _| {
+                upload_called = true;
+                unreachable!()
+            },
+        )
+        .unwrap();
+        assert_eq!(result, SecurityFlushResult::default());
+        assert!(!upload_called);
+        assert_eq!(queue.dequeue_pending(500, 10).unwrap().len(), 1);
     }
 }
