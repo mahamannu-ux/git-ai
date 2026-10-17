@@ -42,21 +42,32 @@ if [ "$got_commit" != "$NUMBAT_COMMIT" ]; then
 fi
 
 log_file="$work_dir/test.log"
-ok_lines=0
 if (cd "$src_dir" && CGO_ENABLED=0 GOTOOLCHAIN=local go test ./...) >"$log_file" 2>&1; then
-    ok_lines=$(grep -c '^ok[[:space:]]' "$log_file" || true)
-    echo "numbat-tests: ok $ok_lines packages"
+    echo "numbat-tests: ok $(grep -c '^ok[[:space:]]' "$log_file" || true) packages"
 else
-    # One retry: upstream's OpenClaw node-harness test has a hard-coded 500ms
-    # child deadline that flakes under machine load (sandbox-only, not the pin).
-    echo "test-pin.sh: first run failed; retrying once" >&2
-    cp "$log_file" "$work_dir/first.log"
-    if (cd "$src_dir" && CGO_ENABLED=0 GOTOOLCHAIN=local go test ./...) >"$log_file" 2>&1; then
-        ok_lines=$(grep -c '^ok[[:space:]]' "$log_file" || true)
-        echo "numbat-tests: ok $ok_lines packages (after one retry)"
-    else
+    # Targeted retry, and only this: upstream's OpenClaw node-harness test has
+    # a hard-coded 500ms child deadline that flakes under machine load
+    # (openclaw_runtime_test.go:71-80 at the pin; the failure is a timing
+    # artifact of the test harness, not the pin). Retry is allowed only when
+    # the first run's failures are exactly that one test — anything else
+    # (another test, a panic, a build failure) fails the gate without retry.
+    tail -n 40 "$log_file" >&2 || true
+    failed_tests=$(grep -c '^--- FAIL:' "$log_file" || true)
+    openclaw_fails=$(grep -c '^--- FAIL: TestOpenClawGeneratedPluginRuntime' "$log_file" || true)
+    if [ "$failed_tests" -gt "1" ] || [ "$openclaw_fails" -ne "1" ] || grep -q '^panic:' "$log_file"; then
         echo "numbat-tests: failed" >&2
-        tail -n 40 "$log_file" >&2 || true
+        exit 1
+    fi
+    echo "test-pin.sh: retrying only TestOpenClawGeneratedPluginRuntime (classified timing flake)" >&2
+    if (cd "$src_dir" && CGO_ENABLED=0 GOTOOLCHAIN=local \
+            go test ./internal/hook -run 'TestOpenClawGeneratedPluginRuntime') \
+        >"$work_dir/retry.log" 2>&1; then
+        ok_lines=$(( $(grep -c '^ok[[:space:]]' "$log_file" || true) \
+            + $(grep -c '^ok[[:space:]]' "$work_dir/retry.log" || true) ))
+        echo "numbat-tests: ok $ok_lines packages (after targeted retry of the upstream timing-flaky OpenClaw node-harness test)"
+    else
+        tail -n 40 "$work_dir/retry.log" >&2 || true
+        echo "numbat-tests: failed" >&2
         exit 1
     fi
 fi

@@ -5,11 +5,13 @@
 # Usage: measure.sh <numbat-binary> [<git-ai-binary>]
 #
 # Isolation (TrackAI AGENTS.md s9 item 6): every run uses a throwaway HOME and
-# a throwaway `git init` repository as the working directory; the developer's
-# own daemon is never started, stopped or contacted. The Git AI case runs only
-# with GIT_AI_MEASURE=1. Prints sizes and median / p95 / max latency per case.
-# Never prints payload contents, record contents, or paths outside the
-# throwaway directory.
+# a throwaway `git init` repository as the working directory; inherited
+# GIT_AI_* and GIT_TRACE2* pointers, XDG_CONFIG_HOME and Git global/system
+# config overrides are stripped before any git or git-ai command runs, so the
+# developer's own daemon is never started, stopped or contacted. The Git AI
+# case runs only with GIT_AI_MEASURE=1. Prints sizes and median / p95 / max
+# latency per case. Never prints payload contents, record contents, or paths
+# outside the throwaway directory.
 set -eu
 
 stripped_flag() {
@@ -81,12 +83,33 @@ export THROWAWAY_HOME="$tmp/home"
 export RUN_REPO="$tmp/repo"
 export RUN_STDERR_LOG="$tmp/run.stderr"
 export NUMBAT_BIN="$numbat_bin"
-export GIT_AI_BIN="$git_ai_bin"
-export GIT_AI_MEASURE
+export MEASURE_GIT_AI_BIN="$git_ai_bin"
 RUNS=200
 WARMUP=10
 export RUNS WARMUP
-mkdir -p "$THROWAWAY_HOME"
+
+# Isolation is applied to this shell itself BEFORE any git or git-ai command:
+# the throwaway home mkdir and the throwaway `git init` must not see the
+# developer's configuration or daemon pointers.
+measure_git_ai_measure=${GIT_AI_MEASURE:-}
+unset_git_ai_and_trace_vars() {
+    for v in $(env | sed -n 's/^\(GIT_AI_[A-Za-z0-9_]*\)=.*/\1/p'); do
+        unset "$v"
+    done
+    for v in $(env | sed -n 's/^\(GIT_TRACE2[A-Za-z0-9_]*\)=.*/\1/p'); do
+        unset "$v"
+    done
+    unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM XDG_CONFIG_HOME || true
+}
+unset_git_ai_and_trace_vars
+# Re-export only the measurement switches this script itself owns.
+if [ -n "$measure_git_ai_measure" ]; then
+    export GIT_AI_MEASURE="$measure_git_ai_measure"
+fi
+export HOME="$tmp/home"
+export XDG_CONFIG_HOME="$tmp/home/.config"
+export GIT_CONFIG_NOSYSTEM=1
+mkdir -p "$HOME" "$XDG_CONFIG_HOME"
 git init -q "$RUN_REPO"
 
 NUMBAT_HOOK_BENIGN="$script_dir/fixtures/claude-pretooluse-benign.json" \
@@ -172,10 +195,10 @@ run_case("numbat-hook-benign", $ENV{NUMBAT_HOOK_BENIGN}, $ENV{NUMBAT_BIN}, @hook
 run_case("numbat-hook-match",  $ENV{NUMBAT_HOOK_MATCH},  $ENV{NUMBAT_BIN}, @hook_args);
 
 exit 0 unless $ENV{GIT_AI_MEASURE} && $ENV{GIT_AI_MEASURE} eq "1";
-if (!$ENV{GIT_AI_BIN} || !-x $ENV{GIT_AI_BIN}) {
+if (!$ENV{MEASURE_GIT_AI_BIN} || !-x $ENV{MEASURE_GIT_AI_BIN}) {
     print "git-ai-hook: unavailable (binary not found)\n";
     exit 0;
 }
-run_case("git-ai-hook", $ENV{NUMBAT_HOOK_BENIGN}, $ENV{GIT_AI_BIN},
+run_case("git-ai-hook", $ENV{NUMBAT_HOOK_BENIGN}, $ENV{MEASURE_GIT_AI_BIN},
     "checkpoint", "claude", "--hook-input", "stdin");
 PERL

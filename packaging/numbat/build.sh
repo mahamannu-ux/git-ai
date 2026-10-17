@@ -89,8 +89,14 @@ binary_src="$out_pkg/numbat_built"
 mkdir -p "$out_pkg"
 (
     cd "$src_dir"
+    # Dependency resolution: one `go mod download` fetches exactly the module
+    # versions of the pin's go.mod, checksum-verified against the pin's
+    # go.sum (founder-approved exception; see README "The pin" and the
+    # handoff). The build itself below runs fully offline: GOPROXY=off
+    # guarantees no fetch can happen after dependencies are in place.
+    CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local go mod download
     CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local \
-        GOOS="$goos" GOARCH="$goarch" \
+        GOPROXY=off GOOS="$goos" GOARCH="$goarch" \
         go build -trimpath -buildvcs=false \
         -o "$binary_src" \
         -ldflags "-s -w -buildid= -X github.com/perplexityai/numbat/internal/version.Version=$NUMBAT_VERSION" \

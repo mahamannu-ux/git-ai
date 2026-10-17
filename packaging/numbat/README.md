@@ -35,7 +35,7 @@ Clones the mirror at `NUMBAT_TAG` into a fresh temporary checkout, verifies HEAD
 
 `PROVENANCE.txt` records the mirror, tag, exact commit, Go version, full flag string, and build time in UTC. Rebuilding into the same `out-dir` replaces that target's own SHA256SUMS line (multiple targets coexist). Required targets: `darwin/amd64`, `darwin/arm64`; `linux/{amd64,arm64}` and `windows/amd64` build here but carry **no support claim** (they are used for cross-checks only).
 
-Network use: clone/fetch from the pinned mirror, plus Go module downloads (go.sum-verified at the pin, `GOFLAGS=-mod=readonly`; nothing else is fetched). No network access in `reproduce.sh`.
+Network use, as founder-approved (2026-10-17): (a) clone/fetch from the pinned mirror; (b) one `go mod download` fetch of exactly the module versions in the pin's `go.mod`, over proxy.golang.org, checksum-verified by Go against the pin's committed `go.sum` (immutable module zips). The **build command itself runs fully offline** (`GOPROXY=off`, `GOTOOLCHAIN=local`), so no fetch can occur after dependencies are in place. Nothing else is fetched. No network access in `reproduce.sh`.
 
 ### `reproduce.sh <goos> <goarch>`
 
@@ -43,7 +43,7 @@ Builds the pin **twice** into two fresh directories with build.sh and exits 0 on
 
 ### `test-pin.sh`
 
-Clones the pin like build.sh does, then runs Numbat's own suite (`go test ./...`) inside it. On success prints exactly `numbat-tests: ok <n> packages`. On failure prints `numbat-tests: failed` plus the tail of the test log. Retries once automatically: upstream's OpenClaw node-harness test (`openclaw_runtime_test.go:71-80` at the pin) has a hard-coded 500 ms child deadline that flakes under machine load — this is a sandbox quirk of the test, not the pin (verified: passes in isolation).
+Clones the pin like build.sh does, then runs Numbat's own suite (`go test ./...`) inside it. On success prints exactly `numbat-tests: ok <n> packages`. On failure prints `numbat-tests: failed` plus the tail of the test log. One **targeted** retry is allowed: only when the first run's failure set is exactly `TestOpenClawGeneratedPluginRuntime` (upstream's OpenClaw Node-harness test with a hard-coded 500 ms child deadline, `openclaw_runtime_test.go:71-80` at the pin — a timing flake under machine load, verified passing in isolation). Any other failing test, a panic, or a build failure fails the gate with no retry, and the retry re-runs only that one test.
 
 ### `measure.sh <numbat-binary> [<git-ai-binary>]`
 
@@ -52,7 +52,7 @@ Clones the pin like build.sh does, then runs Numbat's own suite (`go test ./...`
   1. Numbat hook, benign Claude Code `PreToolUse` Bash payload (emits no rule finding);
   2. Numbat hook, the same payload running `cat .env` (matched by `secrets.agent_read_env` — rule version `1.3`, severity `medium` at the pin);
   3. `git-ai checkpoint claude --hook-input stdin` with the benign payload — **only with `GIT_AI_MEASURE=1`** set. Note: the benign synthetic payload carries no `transcript_path`, so the claude preset skips attribution processing — case (3) measures the CLI startup/entry path only, which is exactly what a cross-hook latency budget compares.
-- **Isolation (TrackAI AGENTS.md §9 item 6)**: every run uses a throwaway `HOME` and a throwaway `git init` repository as the working directory, so the developer's own Git AI daemon or configuration is never started, stopped or contacted. If the git-ai probe fails, it prints `git-ai-hook: unavailable (<reason>)` and stops (exit-code or reason-class only). No payload contents, record contents, or paths outside the throwaway directory are printed. For Numbat's `--output-file`, each timed run truncates the throwaway records file first so late runs don't pay an append cost.
+- **Isolation (TrackAI AGENTS.md §9 item 6)**: inherited `GIT_AI_*` and `GIT_TRACE2*` variables, `XDG_CONFIG_HOME` and Git global/system config pointers are stripped **before any git or git-ai command runs** (the throwaway `git init` included); every run then uses a throwaway `HOME` and a throwaway `git init` repository as the working directory, so the developer's own Git AI daemon or configuration is never started, stopped or contacted. If the git-ai probe fails, it prints `git-ai-hook: unavailable (<reason>)` and stops (exit-code or reason-class only). No payload contents, record contents, or paths outside the throwaway directory are printed. For Numbat's `--output-file`, each timed run truncates the throwaway records file first so late runs don't pay an append cost.
 - Requires `perl -MTime::HiRes` (macOS default); Linux ships it too.
 
 Fixtures: `fixtures/*.json`, synthetic payloads in the Claude Code PreToolUse shape used by Numbat's own `cmd/numbat/hook_test.go` (shape copied from the claude payload in `TestHookPrintsPassthroughAndExitsZero`, `cmd/numbat/hook_test.go:129-131`; verified live at the pin: benign `ls -la` yields zero records, `cat .env` matches `secrets.agent_read_env`). No real paths, users, or secrets.
