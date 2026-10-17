@@ -58,7 +58,7 @@ pub fn read_available(
     checkpoint: &TailCheckpoint,
     max_entries: usize,
 ) -> Result<TailRead, GitAiError> {
-    let mut file = open_no_follow(path)?;
+    let mut file = open_checkpoint_source(path, checkpoint)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(GitAiError::Generic(
@@ -176,6 +176,14 @@ pub fn rotate_if_due(
 }
 
 pub fn delete_expired_rotations(path: &Path, utc_date: NaiveDate) -> Result<usize, GitAiError> {
+    delete_expired_rotations_except(path, utc_date, None)
+}
+
+pub fn delete_expired_rotations_except(
+    path: &Path,
+    utc_date: NaiveDate,
+    preserve: Option<FileIdentity>,
+) -> Result<usize, GitAiError> {
     let parent = path.parent().ok_or_else(|| {
         GitAiError::Generic("Numbat record path has no parent directory".to_string())
     })?;
@@ -208,11 +216,72 @@ pub fn delete_expired_rotations(path: &Path, utc_date: NaiveDate) -> Result<usiz
             continue;
         };
         if utc_date.signed_duration_since(date).num_days() > RETAIN_ROTATIONS_DAYS {
+            if preserve.is_some_and(|identity| {
+                open_no_follow(&entry.path())
+                    .and_then(|file| Ok(file_identity(&file.metadata()?)))
+                    .is_ok_and(|candidate| candidate == identity)
+            }) {
+                continue;
+            }
             std::fs::remove_file(entry.path())?;
             deleted += 1;
         }
     }
     Ok(deleted)
+}
+
+fn open_checkpoint_source(path: &Path, checkpoint: &TailCheckpoint) -> Result<File, GitAiError> {
+    let active = open_no_follow(path).ok();
+    if let (Some(file), Some(saved)) = (active.as_ref(), checkpoint.identity)
+        && file_identity(&file.metadata()?) == saved
+    {
+        return open_no_follow(path);
+    }
+
+    if let Some(saved) = checkpoint.identity
+        && let Some(rotated) = find_rotation(path, saved)?
+    {
+        let metadata = rotated.metadata()?;
+        // A just-rotated inode remains the checkpoint source until any append
+        // that raced the rename has been consumed. Once it is stable at the
+        // saved EOF, move to a newly-created active file.
+        if checkpoint.offset < metadata.len() || checkpoint.partial_len != 0 || active.is_none() {
+            return Ok(rotated);
+        }
+    }
+
+    active.ok_or_else(|| GitAiError::Generic("Numbat record input is unavailable".to_string()))
+}
+
+fn find_rotation(path: &Path, identity: FileIdentity) -> Result<Option<File>, GitAiError> {
+    let parent = path.parent().ok_or_else(|| {
+        GitAiError::Generic("Numbat record path has no parent directory".to_string())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| GitAiError::Generic("Numbat record path is invalid".to_string()))?;
+    let prefix = format!("{file_name}.");
+    if !parent.try_exists()? {
+        return Ok(None);
+    }
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let Ok(file) = open_no_follow(&entry.path()) else {
+            continue;
+        };
+        let metadata = file.metadata()?;
+        if metadata.is_file() && file_identity(&metadata) == identity {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 fn open_no_follow(path: &Path) -> Result<File, GitAiError> {
@@ -420,5 +489,62 @@ mod tests {
         assert!(!temp.path().join("records.ndjson.2026-10-09.1").exists());
         assert!(temp.path().join("records.ndjson.2026-10-10.1").exists());
         assert!(temp.path().join("records.ndjson.unrelated").exists());
+    }
+
+    #[test]
+    fn checkpointed_rotated_inode_is_drained_before_new_active_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("records.ndjson");
+        write(&path, b"one\n");
+        let first = read_available(&path, &TailCheckpoint::default(), 500).unwrap();
+        let saved = TailCheckpoint {
+            identity: Some(first.identity),
+            offset: first.next_offset,
+            partial_len: 0,
+            last_rotation_local_date: None,
+        };
+        let rotated = temp.path().join("records.ndjson.2026-10-17.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&rotated)
+            .unwrap()
+            .write_all(b"late\n")
+            .unwrap();
+        write(&path, b"new\n");
+
+        let late = read_available(&path, &saved, 500).unwrap();
+        assert_eq!(late.identity, first.identity);
+        assert_eq!(
+            late.entries[0].kind,
+            TailEntryKind::Record(b"late".to_vec())
+        );
+        let drained = TailCheckpoint {
+            identity: Some(late.identity),
+            offset: late.next_offset,
+            partial_len: late.partial_len,
+            last_rotation_local_date: None,
+        };
+        let active = read_available(&path, &drained, 500).unwrap();
+        assert!(active.reset);
+        assert_eq!(
+            active.entries[0].kind,
+            TailEntryKind::Record(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn retention_preserves_the_checkpointed_rotation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("records.ndjson");
+        let rotated = temp.path().join("records.ndjson.2026-10-01.1");
+        write(&rotated, b"held\n");
+        let identity = file_identity(&std::fs::metadata(&rotated).unwrap());
+        let today = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        assert_eq!(
+            delete_expired_rotations_except(&path, today, Some(identity)).unwrap(),
+            0
+        );
+        assert!(rotated.exists());
     }
 }
