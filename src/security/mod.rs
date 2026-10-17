@@ -8,6 +8,7 @@ use serde::Serialize;
 pub mod activation;
 pub mod delivery;
 pub mod delivery_queue;
+pub mod tail;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorMode {
