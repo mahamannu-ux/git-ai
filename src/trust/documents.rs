@@ -23,11 +23,10 @@ use sha2::{Digest as _, Sha256};
 
 use super::dsse::{self, DsseEnvelope};
 use super::{
-    ArtifactPurpose, CustomerPinnedKey, KeyPurpose, KeyStatus, RevocationReason, TrustCode,
-    TrustDocumentBody, TrustKeyEntry, KEYSET_PAYLOAD_TYPE, KEYSET_TYPE, PLATFORM_SCOPE,
-    TRUST_MAX_DOCUMENT_BYTES, TRUST_MAX_KEYS_PER_DOCUMENT, TRUST_MAX_KEYSET_LIFETIME_MS,
-    TRUST_MAX_ROOT_LIFETIME_MS, TRUST_MAX_SIGNATURES_PER_DOCUMENT, TRUST_ROOT_PAYLOAD_TYPE,
-    TRUST_ROOT_TYPE,
+    ArtifactPurpose, CustomerPinnedKey, KEYSET_PAYLOAD_TYPE, KEYSET_TYPE, KeyPurpose, KeyStatus,
+    PLATFORM_SCOPE, RevocationReason, TRUST_MAX_DOCUMENT_BYTES, TRUST_MAX_KEYS_PER_DOCUMENT,
+    TRUST_MAX_KEYSET_LIFETIME_MS, TRUST_MAX_ROOT_LIFETIME_MS, TRUST_MAX_SIGNATURES_PER_DOCUMENT,
+    TRUST_ROOT_PAYLOAD_TYPE, TRUST_ROOT_TYPE, TrustCode, TrustDocumentBody, TrustKeyEntry,
 };
 
 /// Integers the JCS snapshot refuses: beyond ±(2^53 − 1) but below 1e21.
@@ -52,9 +51,7 @@ fn is_lower_hex(byte: u8) -> bool {
 /// `DIGEST_RE`: `sha256:` + 64 lowercase hex chars.
 pub fn is_digest(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() == 71
-        && value.starts_with("sha256:")
-        && bytes[7..].iter().all(|b| is_lower_hex(*b))
+    bytes.len() == 71 && value.starts_with("sha256:") && bytes[7..].iter().all(|b| is_lower_hex(*b))
 }
 
 /// `UUID_RE`: lowercase tenant UUID.
@@ -77,13 +74,10 @@ pub fn is_uuid(value: &str) -> bool {
 }
 
 fn two_digits(bytes: &[u8], range: std::ops::RangeInclusive<u8>) -> bool {
-    bytes.len() == 2
-        && bytes[0].is_ascii_digit()
-        && bytes[1].is_ascii_digit()
-        && {
-            let value = (bytes[0] - b'0') * 10 + (bytes[1] - b'0');
-            range.contains(&value)
-        }
+    bytes.len() == 2 && bytes[0].is_ascii_digit() && bytes[1].is_ascii_digit() && {
+        let value = (bytes[0] - b'0') * 10 + (bytes[1] - b'0');
+        range.contains(&value)
+    }
 }
 
 /// `TS_RE`: RFC 3339 UTC with milliseconds and a century of 19xx-21xx.
@@ -137,7 +131,7 @@ fn is_canonical_base64(value: &str) -> bool {
         return true;
     }
     let bytes = value.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return false;
     }
     if bytes[..bytes.len() - 4].iter().any(|b| !is_b64_char(*b)) {
@@ -161,9 +155,7 @@ pub fn decode_base64_strict(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
     if value.len() > max_bytes.div_ceil(3) * 4 || !is_canonical_base64(value) {
         return None;
     }
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
 }
 
 /// `sha256:` plus the lowercase hex SHA-256 of `data`.
@@ -278,7 +270,7 @@ fn parse_revocation_reason(value: &Value) -> Option<RevocationReason> {
 /// `SPKI_B64_RE`: exactly a 91-byte uncompressed P-256 SPKI in standard base64.
 fn valid_spki_b64(value: &str) -> bool {
     const PREFIX: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE";
-    const TAIL_OK: [u8; 4] = [b'A', b'Q', b'g', b'w'];
+    const TAIL_OK: &[u8] = b"AQgw";
     let bytes = value.as_bytes();
     bytes.len() == 124
         && value.starts_with(PREFIX)
@@ -300,7 +292,10 @@ pub struct ParsedKey {
 }
 
 /// Validate one key entry (document or customer pin). Err is DOCUMENT_MALFORMED.
-pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey, TrustDocumentError> {
+pub fn parse_key_entry(
+    raw: &Value,
+    allowed: &[KeyPurpose],
+) -> Result<ParsedKey, TrustDocumentError> {
     let bad = || TrustDocumentError::new(TrustCode::DocumentMalformed);
     let obj = raw.as_object().ok_or_else(bad)?;
     const KEY_FIELDS: [&str; 9] = [
@@ -339,8 +334,7 @@ pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey,
     if keyid_of(&spki) != keyid {
         return Err(bad());
     }
-    let public_key =
-        p256::PublicKey::from_public_key_der(&spki).map_err(|_| bad())?;
+    let public_key = p256::PublicKey::from_public_key_der(&spki).map_err(|_| bad())?;
     let not_before = obj
         .get("not_before")
         .and_then(Value::as_str)
@@ -354,7 +348,10 @@ pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey,
     if not_before >= not_after {
         return Err(bad());
     }
-    let status = obj.get("status").and_then(parse_key_status).ok_or_else(bad)?;
+    let status = obj
+        .get("status")
+        .and_then(parse_key_status)
+        .ok_or_else(bad)?;
     let has = |field: &str| obj.contains_key(field);
     let mut revoked_at: Option<i64> = None;
     let mut compromised_since: Option<i64> = None;
@@ -382,7 +379,10 @@ pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey,
                     .and_then(parse_timestamp)
                     .ok_or_else(bad)?,
             );
-            match obj.get("revocation_reason").and_then(parse_revocation_reason) {
+            match obj
+                .get("revocation_reason")
+                .and_then(parse_revocation_reason)
+            {
                 Some(RevocationReason::Superseded) => {
                     if has("compromised_since") {
                         return Err(bad());
@@ -404,7 +404,9 @@ pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey,
         }
     }
     let reason = match status {
-        KeyStatus::Revoked => obj.get("revocation_reason").and_then(parse_revocation_reason),
+        KeyStatus::Revoked => obj
+            .get("revocation_reason")
+            .and_then(parse_revocation_reason),
         _ => None,
     };
     Ok(ParsedKey {
@@ -443,8 +445,7 @@ pub fn parse_key_entry(raw: &Value, allowed: &[KeyPurpose]) -> Result<ParsedKey,
 
 /// Validate one customer pin as a `statement` key entry. Err is INPUT_INVALID.
 pub fn parse_customer_pin(raw: &CustomerPinnedKey) -> Result<ParsedKey, TrustCode> {
-    let value =
-        serde_json::to_value(raw).map_err(|_| TrustCode::InputInvalid)?;
+    let value = serde_json::to_value(raw).map_err(|_| TrustCode::InputInvalid)?;
     parse_key_entry(&value, &[KeyPurpose::Statement]).map_err(|_| TrustCode::InputInvalid)
 }
 
@@ -618,10 +619,15 @@ pub fn parse_trust_document(envelope: &DsseEnvelope) -> Result<ParsedDocument, T
         DocumentKind::Root => {
             let active_roots = keys
                 .values()
-                .filter(|k| k.entry.purpose == KeyPurpose::Root && k.entry.status == KeyStatus::Active)
+                .filter(|k| {
+                    k.entry.purpose == KeyPurpose::Root && k.entry.status == KeyStatus::Active
+                })
                 .count() as i64;
-            let value = body.get("threshold").and_then(as_safe_int).ok_or_else(bad)?;
-            if value < 1 || value > 16 || value > active_roots {
+            let value = body
+                .get("threshold")
+                .and_then(as_safe_int)
+                .ok_or_else(bad)?;
+            if !(1..=16).contains(&value) || value > active_roots {
                 return Err(bad());
             }
         }
@@ -655,7 +661,11 @@ fn status_order(status: KeyStatus) -> u8 {
 
 /// True when `sig` is a valid ES256 DER signature by `key` over the document's PAE.
 pub fn document_signed_by(doc: &ParsedDocument, key: &VerifyingKey, sig: &[u8]) -> bool {
-    verify_signature(key, &dsse::pae(&doc.envelope.payload_type, &doc.payload), sig)
+    verify_signature(
+        key,
+        &dsse::pae(&doc.envelope.payload_type, &doc.payload),
+        sig,
+    )
 }
 
 pub fn verify_signature(key: &VerifyingKey, data: &[u8], sig: &[u8]) -> bool {
@@ -746,11 +756,7 @@ pub struct SignatureFacts {
 }
 
 impl SignatureFacts {
-    pub fn for_artifact(
-        purpose: ArtifactPurpose,
-        signature: &[u8],
-        payload: &[u8],
-    ) -> Self {
+    pub fn for_artifact(purpose: ArtifactPurpose, signature: &[u8], payload: &[u8]) -> Self {
         let purpose = match purpose {
             ArtifactPurpose::Anchor => KeyPurpose::Anchor,
             ArtifactPurpose::ActivationLease => KeyPurpose::ActivationLease,
@@ -803,10 +809,10 @@ pub fn key_validity_violation(
         return Some(TrustCode::KeyNotValidAt);
     }
     let entry = &key.entry;
-    let superseded =
-        entry.status == KeyStatus::Revoked && entry.revocation_reason == Some(RevocationReason::Superseded);
-    let compromised =
-        entry.status == KeyStatus::Revoked && entry.revocation_reason == Some(RevocationReason::Compromised);
+    let superseded = entry.status == KeyStatus::Revoked
+        && entry.revocation_reason == Some(RevocationReason::Superseded);
+    let compromised = entry.status == KeyStatus::Revoked
+        && entry.revocation_reason == Some(RevocationReason::Compromised);
     if facts.is_none() {
         // Documents carry no time evidence: a compromised keyset key never vouches.
         if entry.status == KeyStatus::Retired {
@@ -872,7 +878,10 @@ mod tests {
 
     #[test]
     fn timestamp_shape_matches_typescript() {
-        assert_eq!(parse_timestamp("2026-10-20T12:00:00.000Z"), Some(1_792_497_600_000));
+        assert_eq!(
+            parse_timestamp("2026-10-20T12:00:00.000Z"),
+            Some(1_792_497_600_000)
+        );
         assert_eq!(parse_timestamp("not-a-time"), None);
         assert_eq!(parse_timestamp("2026-10-20T12:00:00Z"), None);
         assert_eq!(parse_timestamp("2026-13-01T00:00:00.000Z"), None);

@@ -19,10 +19,10 @@ use super::documents::{
 };
 use super::dsse::{self, DsseEnvelope};
 use super::{
-    ArtifactPurpose, KeyPurpose, KeyStatus, TimeEvidence, TrustCode, TrustState, TrustVerdict,
-    TrustedDocumentRef, VerifyTrustedInput, PLATFORM_SCOPE, TRUST_DEFAULT_CLOCK_SKEW_MS,
+    ArtifactPurpose, KeyPurpose, KeyStatus, PLATFORM_SCOPE, TRUST_DEFAULT_CLOCK_SKEW_MS,
     TRUST_MAX_DOCUMENTS_PER_SCOPE, TRUST_MAX_SCOPES, TRUST_MAX_SIGNED_BYTES,
-    TRUST_MAX_TOTAL_DOCUMENT_BYTES,
+    TRUST_MAX_TOTAL_DOCUMENT_BYTES, TimeEvidence, TrustCode, TrustState, TrustVerdict,
+    TrustedDocumentRef, VerifyTrustedInput,
 };
 
 const MAX_SKEW_MS: i64 = 3_600_000;
@@ -66,8 +66,8 @@ fn check_input(input: &VerifyTrustedInput) -> Result<Checked<'_>, TrustCode> {
     if input.envelope.payload_type != input.payload_type {
         return Err(INVALID);
     }
-    let decoded = decode_base64_strict(&input.envelope.payload, TRUST_MAX_SIGNED_BYTES)
-        .ok_or(INVALID)?;
+    let decoded =
+        decode_base64_strict(&input.envelope.payload, TRUST_MAX_SIGNED_BYTES).ok_or(INVALID)?;
     if decoded.as_slice() != input.payload.as_slice() {
         return Err(INVALID);
     }
@@ -99,7 +99,7 @@ fn check_input(input: &VerifyTrustedInput) -> Result<Checked<'_>, TrustCode> {
     let state = &input.state;
     let now = parse_timestamp(&state.now).ok_or(INVALID)?;
     let skew = state.clock_skew_ms.unwrap_or(TRUST_DEFAULT_CLOCK_SKEW_MS);
-    if !is_safe_int(skew) || skew < 0 || skew > MAX_SKEW_MS {
+    if !is_safe_int(skew) || !(0..=MAX_SKEW_MS).contains(&skew) {
         return Err(INVALID);
     }
     if let Some(evidence) = &input.time_evidence {
@@ -203,10 +203,10 @@ fn parse_all(
 fn by_version(docs: Vec<ParsedDocument>) -> Result<BTreeMap<i64, ParsedDocument>, TrustCode> {
     let mut out: BTreeMap<i64, ParsedDocument> = BTreeMap::new();
     for doc in docs {
-        if let Some(seen) = out.get(&doc.body.version) {
-            if seen.digest != doc.digest {
-                return Err(TrustCode::DocumentConflict);
-            }
+        if let Some(seen) = out.get(&doc.body.version)
+            && seen.digest != doc.digest
+        {
+            return Err(TrustCode::DocumentConflict);
         }
         out.insert(doc.body.version, doc);
     }
@@ -323,8 +323,8 @@ fn verify_root_chain(c: &Checked<'_>) -> Result<ParsedDocument, TrustCode> {
         };
         let need = candidate.body.threshold.unwrap_or(1);
         let signers =
-            valid_document_signers(candidate, &active_root_keys(candidate), KeyPurpose::Root)
-                .len() as i64;
+            valid_document_signers(candidate, &active_root_keys(candidate), KeyPurpose::Root).len()
+                as i64;
         if signers < need {
             return Err(TrustCode::ThresholdNotMet);
         }
@@ -487,18 +487,18 @@ fn listed_for_other_tenant(c: &Checked<'_>) -> bool {
 /// Format epoch ms as RFC 3339 UTC with milliseconds (`Date.toISOString` shape).
 fn format_iso_millis(ms: i64) -> Result<String, TrustCode> {
     let instant = chrono::DateTime::from_timestamp_millis(ms).ok_or(TrustCode::InputInvalid)?;
-    Ok(
-        instant
-            .to_utc()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string(),
-    )
+    Ok(instant
+        .to_utc()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string())
 }
 
 fn run(input: &VerifyTrustedInput) -> Result<TrustVerdict, TrustCode> {
     let c = check_input(input)?;
     // Step 1b: a clock behind the persisted floor (beyond skew) cannot judge expiry or validity.
-    if c.floor.is_some_and(|floor| c.now < floor.saturating_sub(c.skew)) {
+    if c.floor
+        .is_some_and(|floor| c.now < floor.saturating_sub(c.skew))
+    {
         return Err(TrustCode::ClockBehind);
     }
     let keys: BTreeMap<String, ParsedKey>;
@@ -569,9 +569,14 @@ fn run(input: &VerifyTrustedInput) -> Result<TrustVerdict, TrustCode> {
     }
     // Step 8: the key was valid for this signature.
     let facts = SignatureFacts::for_artifact(c.purpose, &c.sig, c.payload);
-    if let Some(violation) =
-        key_validity_violation(&key, c.signed_at, c.now, c.skew, c.time_evidence, Some(&facts))
-    {
+    if let Some(violation) = key_validity_violation(
+        &key,
+        c.signed_at,
+        c.now,
+        c.skew,
+        c.time_evidence,
+        Some(&facts),
+    ) {
         return Err(violation);
     }
     // Step 9: all passed.
@@ -591,5 +596,176 @@ pub fn verify_trusted_impl(input: &VerifyTrustedInput) -> TrustVerdict {
     match run(input) {
         Ok(verdict) => verdict,
         Err(code) => TrustVerdict::of(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::super::{
+        ArtifactPurpose, DsseEnvelope, DsseSignature, TrustCode, TrustState, TrustStatus,
+        VerifyTrustedInput, verify_trusted,
+    };
+    use super::verify_trusted_impl;
+
+    fn minimal_state() -> TrustState {
+        TrustState {
+            pinned_root_keyids: Vec::new(),
+            pinned_root_threshold: None,
+            root_documents: Vec::new(),
+            keyset_documents: BTreeMap::new(),
+            customer_pins: None,
+            last_trusted: BTreeMap::new(),
+            now: "2026-10-20T12:00:00.000Z".to_string(),
+            trusted_time_floor: None,
+            clock_skew_ms: None,
+            production: false,
+            allow_unpinned_root: None,
+        }
+    }
+
+    fn input_with_envelope(payload: Vec<u8>, envelope: DsseEnvelope) -> VerifyTrustedInput {
+        VerifyTrustedInput {
+            payload_type: "application/vnd.in-toto+json".to_string(),
+            payload,
+            envelope,
+            purpose: ArtifactPurpose::Release,
+            audience: "platform".to_string(),
+            signed_at: "2026-10-16T00:00:00.000Z".to_string(),
+            time_evidence: None,
+            state: minimal_state(),
+        }
+    }
+
+    #[test]
+    fn garbage_envelope_is_input_invalid() {
+        let input = input_with_envelope(
+            b"{}".to_vec(),
+            DsseEnvelope {
+                payload: "%%%not-base64%%%".to_string(),
+                payload_type: "application/vnd.in-toto+json".to_string(),
+                signatures: Vec::new(),
+            },
+        );
+        assert_eq!(verify_trusted(&input).code, TrustCode::InputInvalid);
+    }
+
+    #[test]
+    fn truncated_envelope_payload_is_input_invalid() {
+        // Valid base64, but decodes to bytes that are not the artifact payload.
+        let input = input_with_envelope(
+            b"{\"note\":\"full\"}".to_vec(),
+            DsseEnvelope {
+                payload: "eyJub3".to_string(),
+                payload_type: "application/vnd.in-toto+json".to_string(),
+                signatures: vec![DsseSignature {
+                    keyid: format!("sha256:{}", "0".repeat(64)),
+                    sig: "AA==".to_string(),
+                }],
+            },
+        );
+        assert_eq!(verify_trusted(&input).code, TrustCode::InputInvalid);
+    }
+
+    #[test]
+    fn empty_signature_list_is_input_invalid() {
+        let input = input_with_envelope(
+            b"{}".to_vec(),
+            DsseEnvelope {
+                payload: "e30=".to_string(),
+                payload_type: "application/vnd.in-toto+json".to_string(),
+                signatures: Vec::new(),
+            },
+        );
+        assert_eq!(verify_trusted(&input).code, TrustCode::InputInvalid);
+    }
+
+    #[test]
+    fn oversized_payload_is_input_invalid() {
+        let big = vec![0u8; super::super::TRUST_MAX_SIGNED_BYTES + 1];
+        let input = input_with_envelope(
+            big,
+            DsseEnvelope {
+                payload: String::new(),
+                payload_type: "application/vnd.in-toto+json".to_string(),
+                signatures: Vec::new(),
+            },
+        );
+        assert_eq!(verify_trusted(&input).code, TrustCode::InputInvalid);
+    }
+
+    #[test]
+    fn unknown_purposes_are_rejected_at_the_boundary() {
+        // `root` and `tenant_keyset` sign documents only: they are not artifact
+        // purposes, so they never deserialize and can never reach the verifier.
+        for purpose in ["root", "tenant_keyset", "policy"] {
+            let parsed: Result<ArtifactPurpose, _> =
+                serde_json::from_value(serde_json::Value::String(purpose.to_string()));
+            assert!(
+                parsed.is_err(),
+                "{purpose} must not parse as an artifact purpose"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_is_deterministic() {
+        // Positive path: vector 01 verifies, and the same input verifies identically twice.
+        let text = include_str!("../../tests/fixtures/trust/01-good-statement.json");
+        let raw: serde_json::Value = serde_json::from_str(text).expect("fixture parses");
+        let input_value = raw.get("input").expect("fixture has input");
+        let payload_b64 = input_value
+            .get("payload_b64")
+            .and_then(serde_json::Value::as_str)
+            .expect("fixture has payload_b64");
+        let payload = super::super::documents::decode_base64_strict(
+            payload_b64,
+            super::super::TRUST_MAX_SIGNED_BYTES,
+        )
+        .expect("fixture payload is base64");
+        let input = VerifyTrustedInput {
+            payload_type: serde_json::from_value(
+                input_value
+                    .get("payload_type")
+                    .cloned()
+                    .expect("payload_type"),
+            )
+            .expect("payload_type parses"),
+            payload,
+            envelope: serde_json::from_value(
+                input_value.get("envelope").cloned().expect("envelope"),
+            )
+            .expect("envelope parses"),
+            purpose: serde_json::from_value(input_value.get("purpose").cloned().expect("purpose"))
+                .expect("purpose parses"),
+            audience: serde_json::from_value(
+                input_value.get("audience").cloned().expect("audience"),
+            )
+            .expect("audience parses"),
+            signed_at: serde_json::from_value(
+                input_value.get("signed_at").cloned().expect("signed_at"),
+            )
+            .expect("signed_at parses"),
+            time_evidence: None,
+            state: serde_json::from_value(input_value.get("state").cloned().expect("state"))
+                .expect("state parses"),
+        };
+        let first = verify_trusted_impl(&input);
+        let second = verify_trusted(&input);
+        assert_eq!(first.code, TrustCode::Verified);
+        assert_eq!(first.status, TrustStatus::Verified);
+        assert_eq!(first, second);
+
+        // Negative path is deterministic too.
+        let bad = input_with_envelope(
+            b"{}".to_vec(),
+            DsseEnvelope {
+                payload: "e30=".to_string(),
+                payload_type: "application/vnd.in-toto+json".to_string(),
+                signatures: Vec::new(),
+            },
+        );
+        assert_eq!(verify_trusted(&bad), verify_trusted(&bad));
     }
 }

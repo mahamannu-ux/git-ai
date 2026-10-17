@@ -33,7 +33,12 @@ pub struct DsseEnvelope {
 /// SP body`, where lengths are ASCII decimal counts of *bytes*.
 pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     let type_bytes = payload_type.as_bytes();
-    let header = format!("DSSEv1 {} {} {} ", type_bytes.len(), payload_type, payload.len());
+    let header = format!(
+        "DSSEv1 {} {} {} ",
+        type_bytes.len(),
+        payload_type,
+        payload.len()
+    );
     let mut out = Vec::with_capacity(header.len() + payload.len());
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(payload);

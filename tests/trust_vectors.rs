@@ -50,12 +50,10 @@ struct VectorExpected {
 
 fn base64_decode_strict(value: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return None;
     }
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
 }
 
 #[test]
@@ -67,7 +65,10 @@ fn trust_vectors_match_typescript() {
         .filter(|p| {
             p.extension().map(|x| x == "json").unwrap_or(false)
                 && p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with(|c: char| c.is_ascii_digit()))
+                    .map(|n| {
+                        n.to_string_lossy()
+                            .starts_with(|c: char| c.is_ascii_digit())
+                    })
                     .unwrap_or(false)
         })
         .collect();
@@ -88,8 +89,7 @@ fn trust_vectors_match_typescript() {
         let vector = match parsed {
             Ok(v) => v,
             Err(err) => {
-                let raw: serde_json::Value =
-                    serde_json::from_str(&text).expect("vector is JSON");
+                let raw: serde_json::Value = serde_json::from_str(&text).expect("vector is JSON");
                 let expected: VectorExpected = serde_json::from_value(
                     raw.get("expected").cloned().expect("vector has expected"),
                 )
