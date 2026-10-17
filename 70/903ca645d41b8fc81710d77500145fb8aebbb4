@@ -1,0 +1,19 @@
+src/security/records.rs
+  s_695bc47d3fa8a0::t_51fe76580d891a 812-821,831-838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "70903ca645d41b8fc81710d77500145fb8aebbb4",
+  "prompts": {},
+  "sessions": {
+    "s_695bc47d3fa8a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14abb-bc2a-7ec2-95b8-2dc028235936",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
