@@ -1,0 +1,13 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "indicator",
+    "record_id": "sha256:679b83b6728e080b15b3ec16486fba76a9c6e9c737919d00013d6e99bd2fef4b",
+    "type": "domain",
+    "value": "example.invalid",
+    "count": 2,
+    "first_seen": "2026-06-02T10:00:00Z",
+    "last_seen": "2026-06-02T10:05:00Z",
+    "source_agent": "claude-code"
+  }]
+}

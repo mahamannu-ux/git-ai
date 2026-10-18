@@ -1,0 +1,11 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "permission_event",
+    "record_id": "sha256:15907aea1fc2023f7059b0a62f5a145d4449107058b66591282db14a2d7def60",
+    "outcome": "approved",
+    "source_agent": "claude-code",
+    "timestamp": "2026-06-02T10:00:00Z",
+    "join": "unavailable"
+  }]
+}

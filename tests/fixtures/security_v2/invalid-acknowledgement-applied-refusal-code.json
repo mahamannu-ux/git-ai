@@ -1,0 +1,7 @@
+{
+  "schema_version": "trackai.security-acknowledgement/1",
+  "lease_id": "lease-placeholder",
+  "bundle_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "result": "applied",
+  "refusal_code": "EPOCH_REGRESSION"
+}

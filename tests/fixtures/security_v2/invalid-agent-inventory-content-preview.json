@@ -1,0 +1,16 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "agent_inventory",
+    "record_id": "sha256:a422f340f1abbd7d715d7285774273b6d04693375cf44bd473e9d3db971385fe",
+    "observed_at": "2026-10-17T10:00:00Z",
+    "agents": [{
+      "agent": "claude-code",
+      "version": null,
+      "config": "present",
+      "artifacts": "present",
+      "wired": "yes",
+      "content_preview": "forbidden"
+    }]
+  }]
+}

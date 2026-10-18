@@ -1,0 +1,15 @@
+{
+  "schema_version": "trackai.security-upload/2",
+  "records": [{
+    "kind": "enforcement",
+    "record_id": "sha256:e30e4c26c44c18fc4627ab16cf08d16b40c4cde7b6d66cfe5db1ca87cb4b2bc1",
+    "decision": "no_override",
+    "mode": "monitor",
+    "rule_ids": ["secrets.agent_read_env"],
+    "finding_record_ids": ["sha256:3600c333faf7fddf87d4508d3d9e308f05f53cf70b3735c8575fadf0488a8338"],
+    "tool_name": "Bash",
+    "session_id": "session-placeholder",
+    "source_agent": "codex",
+    "timestamp": "2026-10-17T10:00:00Z"
+  }]
+}

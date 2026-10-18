@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "trackai.security-v2-contract-fixtures/1",
+  "cases": [
+    { "file": "valid-finding.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Finding projected from a deterministic replay of Numbat's persisted Codex hook test for the cat .env action." },
+    { "file": "invalid-finding-tool-input.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Finding refuses forbidden tool_input." },
+    { "file": "invalid-finding-evidence-refs.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Finding refuses forbidden evidence_refs." },
+    { "file": "invalid-finding-project-path-hash.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Finding refuses forbidden project_path_hash." },
+    { "file": "invalid-finding-endpoint-uid.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Finding endpoint refuses forbidden endpoint.uid." },
+
+    { "file": "valid-enforcement.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Enforcement projected from the same replayed hook record pair and joined to its finding." },
+    { "file": "invalid-enforcement-tool-result.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Enforcement refuses forbidden tool_result." },
+
+    { "file": "valid-indicator.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Indicator accepts the bounded Numbat projection." },
+    { "file": "invalid-indicator-sample-project-path-hash.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Indicator refuses forbidden sample_project_path_hash." },
+
+    { "file": "valid-scan-summary.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Scan summary carries status and counts only." },
+    { "file": "invalid-scan-summary-project-path.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Scan summary refuses forbidden project_path." },
+
+    { "file": "valid-permission-event.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Unavailable permission join needs neither tool_call_id nor session_id." },
+    { "file": "invalid-permission-event-content.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Permission event refuses forbidden content." },
+
+    { "file": "valid-security-status.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Security status carries bounded health and lease state." },
+    { "file": "invalid-security-status-endpoint-device-id.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Security status refuses forbidden endpoint.device_id." },
+
+    { "file": "valid-agent-inventory.json", "schema": "../security-upload-v2.schema.json", "expectedValid": true, "rationale": "Agent version may be null when Numbat 0.5.0 does not report it." },
+    { "file": "invalid-agent-inventory-content-preview.json", "schema": "../security-upload-v2.schema.json", "expectedValid": false, "rationale": "Agent inventory refuses forbidden content_preview." },
+
+    { "file": "valid-data-settings.json", "schema": "../security-data-settings-v1.schema.json", "expectedValid": true, "rationale": "All five data groups are explicitly disabled by default." },
+    { "file": "invalid-data-settings-missing-urls.json", "schema": "../security-data-settings-v1.schema.json", "expectedValid": false, "rationale": "Every data-setting boolean is required." },
+
+    { "file": "valid-rule-bundle.json", "schema": "../security-rule-bundle-v1.schema.json", "expectedValid": true, "rationale": "Bundle has a positive version and epoch, pinned Numbat revision, and bounded agent files." },
+    { "file": "invalid-rule-bundle-path-traversal.json", "schema": "../security-rule-bundle-v1.schema.json", "expectedValid": false, "rationale": "Bundle file paths refuse traversal." },
+    { "file": "invalid-rule-bundle-file-too-large.json", "schema": "../security-rule-bundle-v1.schema.json", "expectedValid": false, "rationale": "A 262146-byte decoded rule file exceeds the 262144-byte limit." },
+
+    { "file": "valid-activation-lease.json", "schema": "../security-activation-lease-v2.schema.json", "expectedValid": true, "rationale": "Monitoring lease embeds complete versioned data settings and at least one agent." },
+    { "file": "invalid-activation-lease-monitor-no-agents.json", "schema": "../security-activation-lease-v2.schema.json", "expectedValid": false, "rationale": "An active monitoring mode requires at least one agent." },
+
+    { "file": "valid-fleet-configuration-v3.json", "schema": "../fleet-configuration-v3.schema.json", "expectedValid": true, "rationale": "Fleet configuration v3 uses securityLease instead of securityActivation." },
+    { "file": "invalid-fleet-configuration-v3-security-activation.json", "schema": "../fleet-configuration-v3.schema.json", "expectedValid": false, "rationale": "Fleet configuration v3 refuses legacy securityActivation." },
+
+    { "file": "valid-acknowledgement.json", "schema": "../security-acknowledgement-v1.schema.json", "expectedValid": true, "rationale": "A refused acknowledgement uses a closed refusal code." },
+    { "file": "invalid-acknowledgement-applied-refusal-code.json", "schema": "../security-acknowledgement-v1.schema.json", "expectedValid": false, "rationale": "An applied acknowledgement must not carry refusal_code." }
+  ]
+}
