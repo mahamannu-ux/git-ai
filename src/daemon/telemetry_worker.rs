@@ -28,6 +28,7 @@ use crate::metrics::types::MetricEventId;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use crate::security::delivery::flush_configured_security_records;
+use crate::security::policy_apply::refresh_configured_security_policy;
 use crate::security::records::PermissionJoinTracker;
 use crate::security::shipper::poll_configured_security_records;
 use serde_json::{Value, json};
@@ -481,20 +482,22 @@ fn spawn_security_shipper_worker() {
         loop {
             let joins = joins.clone();
             if let Err(error) = tokio::task::spawn_blocking(move || {
+                let now = chrono::Utc::now();
+                if let Err(error) = refresh_configured_security_policy(now) {
+                    tracing::warn!(%error, "security policy refresh failed");
+                }
                 if let Ok(mut joins) = joins.lock()
                     && let Err(error) = poll_configured_security_records(
-                        &crate::security::activation::UNAVAILABLE_LEASE_CONTEXT,
+                        crate::security::activation::configured_lease_context(),
                         None,
                         &std::collections::HashMap::new(),
                         &mut joins,
-                        chrono::Utc::now().timestamp() as u64,
+                        now.timestamp() as u64,
                     )
                 {
                     tracing::warn!(%error, "security record polling failed");
                 }
-                if let Err(error) =
-                    flush_configured_security_records(chrono::Utc::now().timestamp() as u64)
-                {
+                if let Err(error) = flush_configured_security_records(now.timestamp() as u64) {
                     tracing::warn!(%error, "security record delivery failed");
                 }
             })
