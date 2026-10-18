@@ -1,0 +1,24 @@
+src/security/policy_apply.rs
+  s_614a018723afbe::t_1ca924828b6939 1-1147
+src/security/lease_state.rs
+  s_614a018723afbe::t_4ccc852ebdd140 38-39,68,74-80,220-225
+  s_614a018723afbe::t_d6b7a9a16f425a 59,61
+  s_614a018723afbe::t_d4218d4b4598e2 60
+  s_614a018723afbe::t_4cc5f6aa31d146 62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "a16941736c8c84c33a0bdc22d01707f7c77886c2",
+  "prompts": {},
+  "sessions": {
+    "s_614a018723afbe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14f00-52b1-7563-875b-e7576212aed2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
