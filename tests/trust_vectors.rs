@@ -10,7 +10,7 @@ use std::fs;
 
 use git_ai::trust::{
     ArtifactPurpose, DsseEnvelope, TimeEvidence, TrustCode, TrustState, TrustStatus, TrustVerdict,
-    TrustedDocumentRef, VerifyTrustedInput,
+    TrustedDocumentRef, VerifyTrustedInput, verify_trusted,
 };
 use serde::Deserialize;
 
@@ -49,11 +49,45 @@ struct VectorExpected {
 }
 
 fn base64_decode_strict(value: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    if !value.len().is_multiple_of(4) {
-        return None;
+    git_ai::trust::documents::decode_base64_strict(value, git_ai::trust::TRUST_MAX_SIGNED_BYTES)
+}
+
+/// The verdict for a vector `input` object. An input that does not even
+/// deserialize is a malformed call: the TypeScript answers INPUT_INVALID.
+fn verdict_for_input_value(input: &serde_json::Value) -> TrustVerdict {
+    let parsed: Result<VectorInput, _> = serde_json::from_value(input.clone());
+    match parsed {
+        Ok(vector) => {
+            let payload = base64_decode_strict(&vector.payload_b64).expect("test payload valid");
+            verify_trusted(&VerifyTrustedInput {
+                payload_type: vector.payload_type,
+                payload,
+                envelope: vector.envelope,
+                purpose: vector.purpose,
+                audience: vector.audience,
+                signed_at: vector.signed_at,
+                time_evidence: vector.time_evidence,
+                state: vector.state,
+            })
+        }
+        Err(_) => TrustVerdict {
+            status: TrustStatus::Rejected,
+            code: TrustCode::InputInvalid,
+            keyid: None,
+            trusted: None,
+            trusted_time: None,
+        },
     }
-    base64::engine::general_purpose::STANDARD.decode(value).ok()
+}
+
+fn fixture_input(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/tests/fixtures/trust/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = fs::read_to_string(path).expect("fixture readable");
+    let raw: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+    raw.get("input").cloned().expect("fixture has input")
 }
 
 #[test]
@@ -162,5 +196,153 @@ fn trust_vectors_match_typescript() {
         "{} vector(s) mismatched:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// Flip one unused trailing pad bit of a base64 signature so the text differs
+/// but the bytes are identical (Node drops those bits; so must we).
+fn flip_unused_trailing_bit(sig_b64: &str) -> String {
+    const PARTNERS: [(char, char); 32] = [
+        ('A', 'B'),
+        ('C', 'D'),
+        ('E', 'F'),
+        ('G', 'H'),
+        ('I', 'J'),
+        ('K', 'L'),
+        ('M', 'N'),
+        ('O', 'P'),
+        ('Q', 'R'),
+        ('S', 'T'),
+        ('U', 'V'),
+        ('W', 'X'),
+        ('Y', 'Z'),
+        ('a', 'b'),
+        ('c', 'd'),
+        ('e', 'f'),
+        ('g', 'h'),
+        ('i', 'j'),
+        ('k', 'l'),
+        ('m', 'n'),
+        ('o', 'p'),
+        ('q', 'r'),
+        ('s', 't'),
+        ('u', 'v'),
+        ('w', 'x'),
+        ('y', 'z'),
+        ('0', '1'),
+        ('2', '3'),
+        ('4', '5'),
+        ('6', '7'),
+        ('8', '9'),
+        ('+', '/'),
+    ];
+    let partner = |c: char| {
+        PARTNERS
+            .iter()
+            .find_map(|(a, b)| (*a == c).then_some(*b).or((*b == c).then_some(*a)))
+            .expect("alphabet char")
+    };
+    let mut chars: Vec<char> = sig_b64.chars().collect();
+    // Last data char before the padding: bit 0 is unused with `==`, bits 0-1
+    // with a single `=`. XOR-1 partners keep every used bit identical.
+    let at = chars
+        .iter()
+        .rposition(|c| *c != '=')
+        .expect("signature has data");
+    chars[at] = partner(chars[at]);
+    chars.into_iter().collect()
+}
+
+#[test]
+fn signature_with_nonzero_trailing_bits_still_verifies() {
+    // Cross-language edge: Node's decoder drops non-zero trailing pad bits, so
+    // `AR==` verifies exactly like `AQ==`. The re-encoded signature below
+    // decodes to byte-identical DER and must verify with the same keyid.
+    let mut input = fixture_input("01-good-statement");
+    let sig = input
+        .pointer("/envelope/signatures/0/sig")
+        .and_then(|v| v.as_str())
+        .expect("vector has a signature")
+        .to_string();
+    assert!(sig.ends_with('='));
+    let tweaked = flip_unused_trailing_bit(&sig);
+    assert_ne!(tweaked, sig);
+    assert_eq!(
+        base64_decode_strict(&tweaked),
+        base64_decode_strict(&sig),
+        "tweak must not change the decoded bytes"
+    );
+    *input
+        .pointer_mut("/envelope/signatures/0/sig")
+        .expect("signature present") = serde_json::Value::String(tweaked);
+    let got = verdict_for_input_value(&input);
+    assert_eq!(got.code, TrustCode::Verified);
+    assert_eq!(
+        got.keyid.as_deref(),
+        Some("sha256:5963e86dfaec51dffdfc0cb409e9ebe3a5933ccb58f8f8b12a6bc8776f9c181c")
+    );
+}
+
+#[test]
+fn document_envelope_unknown_field_is_malformed() {
+    // parseTrustDocument rejects unknown envelope keys; the artifact path ignores them.
+    let mut input = fixture_input("01-good-statement");
+    input
+        .pointer_mut("/state/root_documents/0")
+        .expect("root document present")
+        .as_object_mut()
+        .expect("envelope is an object")
+        .insert("zzz".to_string(), serde_json::Value::from(1));
+    assert_eq!(
+        verdict_for_input_value(&input).code,
+        TrustCode::DocumentMalformed
+    );
+}
+
+#[test]
+fn document_signature_entry_unknown_field_is_malformed() {
+    let mut input = fixture_input("01-good-statement");
+    input
+        .pointer_mut("/state/root_documents/0/signatures/0")
+        .expect("signature entry present")
+        .as_object_mut()
+        .expect("entry is an object")
+        .insert("zzz".to_string(), serde_json::Value::from(1));
+    assert_eq!(
+        verdict_for_input_value(&input).code,
+        TrustCode::DocumentMalformed
+    );
+}
+
+#[test]
+fn artifact_envelope_extras_are_ignored_like_typescript() {
+    // checkInput never enumerates the artifact envelope's keys, so extras verify.
+    let input = fixture_input("01-good-statement");
+    for pointer in ["/envelope", "/envelope/signatures/0"] {
+        let mut probe = input.clone();
+        probe
+            .pointer_mut(pointer)
+            .expect("target present")
+            .as_object_mut()
+            .expect("target is an object")
+            .insert("zzz".to_string(), serde_json::Value::from(1));
+        let got = verdict_for_input_value(&probe);
+        assert_eq!(got.code, TrustCode::Verified, "extra field at {pointer}");
+    }
+}
+
+#[test]
+fn customer_pin_unknown_field_is_input_invalid() {
+    // parseKeyEntry rejects unknown pin keys; pinnedKeys maps that to INPUT_INVALID.
+    let mut input = fixture_input("61-pin-overrides-without-trackai");
+    let pins = input
+        .pointer_mut("/state/customer_pins/0a0a0a0a-0000-4000-8000-00000000000a/0")
+        .expect("customer pin present");
+    pins.as_object_mut()
+        .expect("pin is an object")
+        .insert("zzz".to_string(), serde_json::Value::from(1));
+    assert_eq!(
+        verdict_for_input_value(&input).code,
+        TrustCode::InputInvalid
     );
 }

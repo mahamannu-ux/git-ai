@@ -124,8 +124,9 @@ pub struct TrustDocumentBody {
 }
 
 /// A key the auditor or customer pins for their own tenant (founder decision 2026-10-13).
+/// Closed shape: any malformed pin is a caller error (`INPUT_INVALID`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct CustomerPinnedKey {
     pub keyid: String,
     pub purpose: KeyPurpose,

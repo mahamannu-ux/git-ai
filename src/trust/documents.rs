@@ -8,13 +8,15 @@
 // forward-only rule between versions, and the per-key validity rule. Pure: no
 // database, no network, no clock.
 //
-// Deviation from trust-documents.ts: the envelope-level closed shape (no unknown
-// `payload`/`payloadType`/`signatures` keys) is enforced by serde at the caller's
-// deserialization boundary rather than here, because envelopes arrive as the typed
-// `DsseEnvelope`. No vector covers that edge.
+// The envelope's closed shape (no unknown `payload`/`payloadType`/`signatures`
+// keys, and no unknown keys on signature entries) is enforced here from the
+// fields `DsseEnvelope` captures at deserialization, because the artifact path
+// (`checkInput`) deliberately ignores those same extras, exactly like the
+// TypeScript.
 
 use std::collections::BTreeMap;
 
+use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey as _;
@@ -149,13 +151,20 @@ fn is_canonical_base64(value: &str) -> bool {
         || (tail[2] == b'=' && tail[3] == b'=')
 }
 
-/// Strict base64 like `decodeBase64Strict`: canonical padding, bounded length.
+/// Strict base64 like `decodeBase64Strict`: canonical alphabet and padding, bounded
+/// length. Non-zero trailing pad bits decode like Node does (they are dropped:
+/// `AR==` decodes exactly like `AQ==`), so every regex-valid encoding the
+/// TypeScript accepts decodes to the same bytes here.
 pub fn decode_base64_strict(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
     use base64::Engine;
+    static ENGINE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
     if value.len() > max_bytes.div_ceil(3) * 4 || !is_canonical_base64(value) {
         return None;
     }
-    base64::engine::general_purpose::STANDARD.decode(value).ok()
+    ENGINE.decode(value).ok()
 }
 
 /// `sha256:` plus the lowercase hex SHA-256 of `data`.
@@ -482,6 +491,9 @@ pub struct ParsedSignature {
 /// Signatures are only shape-checked here. Err is TrustDocumentError (MALFORMED).
 pub fn parse_trust_document(envelope: &DsseEnvelope) -> Result<ParsedDocument, TrustDocumentError> {
     let bad = || TrustDocumentError::new(TrustCode::DocumentMalformed);
+    if envelope.has_unknown_fields() {
+        return Err(bad());
+    }
     let kind = match envelope.payload_type.as_str() {
         x if x == TRUST_ROOT_PAYLOAD_TYPE => DocumentKind::Root,
         x if x == KEYSET_PAYLOAD_TYPE => DocumentKind::Keyset,
@@ -498,6 +510,9 @@ pub fn parse_trust_document(envelope: &DsseEnvelope) -> Result<ParsedDocument, T
     let mut signatures = Vec::with_capacity(envelope.signatures.len());
     let mut seen: Vec<&str> = Vec::with_capacity(envelope.signatures.len());
     for entry in &envelope.signatures {
+        if entry.has_unknown_fields() {
+            return Err(bad());
+        }
         let sig = decode_base64_strict(&entry.sig, 256)
             .filter(|s| !s.is_empty())
             .ok_or_else(bad)?;
@@ -890,14 +905,40 @@ mod tests {
     }
 
     #[test]
-    fn base64_is_strict() {
-        assert!(decode_base64_strict("AQ==", 256).is_some());
+    fn base64_trailing_bits_match_node() {
+        // Ground truth from Node's Buffer.from(x, 'base64'): non-zero trailing
+        // pad bits are dropped, so these pairs decode identically.
+        let pairs = [
+            ("AQ==", vec![0x01]),
+            ("AR==", vec![0x01]),
+            ("Ag==", vec![0x02]),
+            ("Ah==", vec![0x02]),
+            ("AB==", vec![0x00]),
+            ("AZ==", vec![0x01]),
+            ("/w==", vec![0xff]),
+            ("/x==", vec![0xff]),
+            ("//8=", vec![0xff, 0xff]),
+            ("//9=", vec![0xff, 0xff]),
+            ("e30=", vec![0x7b, 0x7d]),
+            ("QQ==", vec![0x41]),
+        ];
+        for (text, bytes) in pairs {
+            assert_eq!(
+                decode_base64_strict(text, 256),
+                Some(bytes),
+                "{text} must decode like Node"
+            );
+        }
+        // Rejected exactly where the TypeScript regex rejects.
+        for text in ["AQ=", "A===", "====", "AQ== ", "AQ-_", "eyJub3"] {
+            assert!(
+                decode_base64_strict(text, 256).is_none(),
+                "{text} must be refused like the TypeScript"
+            );
+        }
+        // The byte bound mirrors Math.ceil(maxBytes / 3) * 4 on the text length.
         assert!(decode_base64_strict("AQ==", 0).is_none());
         assert!(decode_base64_strict("AQ==", 1).is_some());
-        assert!(decode_base64_strict("AQ ", 256).is_none());
-        assert!(decode_base64_strict("AQ-_", 256).is_none());
-        assert!(decode_base64_strict("AQQ=", 256).is_some());
-        assert!(decode_base64_strict("AQ=", 256).is_none());
         assert!(!is_canonical_base64("AQ="));
         assert!(is_canonical_base64(""));
     }

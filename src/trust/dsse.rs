@@ -8,18 +8,31 @@
 // https://github.com/secure-systems-lab/dsse. Signatures are ECDSA P-256 over
 // SHA-256, DER-encoded.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// One signature entry of an envelope: base64-encoded DER signature by `keyid`.
+/// Unknown fields are captured, not discarded: trust documents reject them
+/// (`DOCUMENT_MALFORMED`) while the artifact path ignores them, exactly like
+/// `checkInput` vs `parseTrustDocument` in the TypeScript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DsseSignature {
     pub keyid: String,
     /// Base64-encoded DER signature.
     pub sig: String,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl DsseSignature {
+    pub fn has_unknown_fields(&self) -> bool {
+        !self.extra.is_empty()
+    }
 }
 
 /// A DSSE envelope: base64-encoded payload bytes plus signatures.
+/// Unknown fields are captured, not discarded (see `DsseSignature`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DsseEnvelope {
     /// Base64-encoded payload bytes.
@@ -27,6 +40,14 @@ pub struct DsseEnvelope {
     #[serde(rename = "payloadType")]
     pub payload_type: String,
     pub signatures: Vec<DsseSignature>,
+    #[serde(default, flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl DsseEnvelope {
+    pub fn has_unknown_fields(&self) -> bool {
+        !self.extra.is_empty()
+    }
 }
 
 /// Pre-Authentication Encoding: `"DSSEv1" SP LEN(type) SP type SP LEN(body)

@@ -643,6 +643,7 @@ mod tests {
         let input = input_with_envelope(
             b"{}".to_vec(),
             DsseEnvelope {
+                extra: BTreeMap::new(),
                 payload: "%%%not-base64%%%".to_string(),
                 payload_type: "application/vnd.in-toto+json".to_string(),
                 signatures: Vec::new(),
@@ -657,9 +658,11 @@ mod tests {
         let input = input_with_envelope(
             b"{\"note\":\"full\"}".to_vec(),
             DsseEnvelope {
+                extra: BTreeMap::new(),
                 payload: "eyJub3".to_string(),
                 payload_type: "application/vnd.in-toto+json".to_string(),
                 signatures: vec![DsseSignature {
+                    extra: BTreeMap::new(),
                     keyid: format!("sha256:{}", "0".repeat(64)),
                     sig: "AA==".to_string(),
                 }],
@@ -673,6 +676,7 @@ mod tests {
         let input = input_with_envelope(
             b"{}".to_vec(),
             DsseEnvelope {
+                extra: BTreeMap::new(),
                 payload: "e30=".to_string(),
                 payload_type: "application/vnd.in-toto+json".to_string(),
                 signatures: Vec::new(),
@@ -687,6 +691,7 @@ mod tests {
         let input = input_with_envelope(
             big,
             DsseEnvelope {
+                extra: BTreeMap::new(),
                 payload: String::new(),
                 payload_type: "application/vnd.in-toto+json".to_string(),
                 signatures: Vec::new(),
@@ -761,6 +766,7 @@ mod tests {
         let bad = input_with_envelope(
             b"{}".to_vec(),
             DsseEnvelope {
+                extra: BTreeMap::new(),
                 payload: "e30=".to_string(),
                 payload_type: "application/vnd.in-toto+json".to_string(),
                 signatures: Vec::new(),
