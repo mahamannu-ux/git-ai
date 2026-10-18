@@ -125,8 +125,26 @@ impl LeaseStateStore {
 
     pub fn replace(
         &self,
+        next: DurableSecurityState,
+        now: DateTime<Utc>,
+    ) -> Result<(), GitAiError> {
+        self.replace_with_validation(next, now, true)
+    }
+
+    /// Persist trust progress while cached activation data is still being authenticated.
+    pub fn replace_unvalidated(
+        &self,
+        next: DurableSecurityState,
+        now: DateTime<Utc>,
+    ) -> Result<(), GitAiError> {
+        self.replace_with_validation(next, now, false)
+    }
+
+    fn replace_with_validation(
+        &self,
         mut next: DurableSecurityState,
         now: DateTime<Utc>,
+        validated: bool,
     ) -> Result<(), GitAiError> {
         next.accepted_leases
             .retain(|lease| lease.expires_at >= now - Duration::days(LEASE_HISTORY_DAYS));
@@ -140,7 +158,7 @@ impl LeaseStateStore {
             .state
             .write()
             .map_err(|_| GitAiError::Generic("security state lock poisoned".into()))? = next;
-        self.validated.store(true, Ordering::Release);
+        self.validated.store(validated, Ordering::Release);
         Ok(())
     }
 
@@ -153,11 +171,12 @@ impl LeaseStateStore {
     }
 
     pub fn discard_untrusted(&self) -> Result<(), GitAiError> {
+        let empty = DurableSecurityState::default();
+        self.write_atomic(&empty)?;
         *self
             .state
             .write()
-            .map_err(|_| GitAiError::Generic("security state lock poisoned".into()))? =
-            DurableSecurityState::default();
+            .map_err(|_| GitAiError::Generic("security state lock poisoned".into()))? = empty;
         self.validated.store(true, Ordering::Release);
         Ok(())
     }

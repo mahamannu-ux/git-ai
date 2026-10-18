@@ -19,12 +19,14 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LEASE_PAYLOAD_TYPE: &str = "application/vnd.trackai.security-activation-lease+json";
 pub const BUNDLE_PAYLOAD_TYPE: &str = "application/vnd.trackai.security-rule-bundle+json";
 pub const SECURITY_STATE_DIR: &str = "security";
 const MAX_SIGNED_BYTES: usize = 4 * 1024 * 1024 + 1024;
 const PINNED_ROOT_KEYIDS: &[&str] = &[];
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const SOURCE_AGENTS: &[&str] = &[
     "claude-code",
     "cowork",
@@ -619,17 +621,18 @@ impl PolicyApplier<'_> {
         };
         match self.checker.check(&staged.agent_dirs) {
             RulesCheck::Unavailable => {
-                let _ = fs::remove_dir_all(&staged.version_dir);
+                staged.remove_temporary();
                 return Ok(RefreshOutcome::Retry);
             }
             RulesCheck::Failed => {
-                let _ = fs::remove_dir_all(&staged.version_dir);
+                staged.remove_temporary();
                 return self.refuse(&lease, RefusalCode::RulesCheckFailed, now);
             }
             RulesCheck::Passed => {}
         }
-        self.switch_current(&staged.version_dir)?;
-        self.prune_rules(&staged.version_dir)?;
+        let version_dir = staged.publish()?;
+        self.switch_current(&version_dir)?;
+        self.prune_rules(&version_dir)?;
         self.accept(
             lease,
             response.body,
@@ -642,66 +645,97 @@ impl PolicyApplier<'_> {
 
     fn revalidate_cached(&self, now: DateTime<Utc>) -> Result<bool, GitAiError> {
         let mut state = self.state.snapshot();
-        let Some(accepted) = state
-            .accepted_leases
-            .iter()
-            .max_by_key(|lease| lease.issued_at)
-            .cloned()
-        else {
+        if state.accepted_leases.is_empty() {
             self.state.mark_validated();
             return Ok(true);
-        };
-        let Ok(envelope) = serde_json::from_slice::<DsseEnvelope>(&accepted.signed_bytes) else {
-            return Ok(false);
-        };
-        let Some(payload) = decode_base64_strict(&envelope.payload, MAX_SIGNED_BYTES) else {
-            return Ok(false);
-        };
-        let Ok(lease) = serde_json::from_slice::<LeasePayload>(&payload) else {
-            return Ok(false);
-        };
-        if !valid_lease(&lease)
-            || lease.schema_version != "trackai.security-activation-lease/2"
-            || lease.tenant_id != self.identity.tenant_id
-            || state.enrolled_tenant_id.as_deref() != Some(lease.tenant_id.as_str())
-            || state.enrolled_machine_id.as_deref() != Some(lease.machine_id.as_str())
-            || !accepted_matches(&accepted, &lease)
-        {
-            return Ok(false);
         }
-        let lease_verdict = self.verifier.verify(PolicyVerifyInput {
-            envelope: &envelope,
-            payload: &payload,
-            payload_type: LEASE_PAYLOAD_TYPE,
-            purpose: ArtifactPurpose::ActivationLease,
-            signed_at: &lease.issued_at.to_rfc3339(),
-            now,
-            persisted: &state,
-        });
-        if lease_verdict.status != TrustStatus::Verified {
-            return Ok(false);
+
+        let mut accepted_leases = state.accepted_leases.clone();
+        accepted_leases.sort_by_key(|lease| lease.issued_at);
+        let mut verified_any = false;
+        for accepted in &accepted_leases {
+            let Ok(envelope) = serde_json::from_slice::<DsseEnvelope>(&accepted.signed_bytes)
+            else {
+                return if verified_any {
+                    self.deactivate_preserving_trust(&state, now)
+                } else {
+                    Ok(false)
+                };
+            };
+            let Some(payload) = decode_base64_strict(&envelope.payload, MAX_SIGNED_BYTES) else {
+                return if verified_any {
+                    self.deactivate_preserving_trust(&state, now)
+                } else {
+                    Ok(false)
+                };
+            };
+            let Ok(lease) = serde_json::from_slice::<LeasePayload>(&payload) else {
+                return if verified_any {
+                    self.deactivate_preserving_trust(&state, now)
+                } else {
+                    Ok(false)
+                };
+            };
+            if !valid_lease(&lease)
+                || lease.schema_version != "trackai.security-activation-lease/2"
+                || lease.tenant_id != self.identity.tenant_id
+                || state.enrolled_tenant_id.as_deref() != Some(lease.tenant_id.as_str())
+                || state.enrolled_machine_id.as_deref() != Some(lease.machine_id.as_str())
+                || !accepted_matches(accepted, &lease)
+            {
+                return if verified_any {
+                    self.deactivate_preserving_trust(&state, now)
+                } else {
+                    Ok(false)
+                };
+            }
+            let lease_verdict = self.verifier.verify(PolicyVerifyInput {
+                envelope: &envelope,
+                payload: &payload,
+                payload_type: LEASE_PAYLOAD_TYPE,
+                purpose: ArtifactPurpose::ActivationLease,
+                signed_at: &lease.issued_at.to_rfc3339(),
+                now,
+                persisted: &state,
+            });
+            if lease_verdict.status != TrustStatus::Verified {
+                return if verified_any {
+                    self.deactivate_preserving_trust(&state, now)
+                } else {
+                    Ok(false)
+                };
+            }
+            advance_trust(&mut state, lease_verdict);
+            verified_any = true;
+            self.state.replace_unvalidated(state.clone(), now)?;
         }
-        advance_trust(&mut state, lease_verdict);
+
+        let accepted = accepted_leases
+            .last()
+            .expect("non-empty lease history checked above");
         if accepted.mode == LeaseMode::Off {
+            state.applied_epoch = None;
+            state.applied_digest = None;
+            state.applied_bundle_bytes = None;
             self.state.replace(state, now)?;
             return Ok(true);
         }
         let Some(bundle_signed_bytes) = state.applied_bundle_bytes.clone() else {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         };
         let Ok(bundle_envelope) = serde_json::from_slice::<DsseEnvelope>(&bundle_signed_bytes)
         else {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         };
         let Some(bundle_bytes) = decode_base64_strict(&bundle_envelope.payload, MAX_SIGNED_BYTES)
         else {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         };
         if hex_digest(&bundle_bytes) != accepted.bundle_digest {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         }
         let Ok(bundle) = serde_json::from_slice::<BundlePayload>(&bundle_bytes) else {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         };
         if !valid_bundle(&bundle)
             || bundle.schema_version != "trackai.security-rule-bundle/1"
@@ -710,7 +744,7 @@ impl PolicyApplier<'_> {
             || state.applied_epoch != Some(bundle.epoch)
             || state.applied_digest.as_deref() != Some(accepted.bundle_digest.as_str())
         {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         }
         let bundle_verdict = self.verifier.verify(PolicyVerifyInput {
             envelope: &bundle_envelope,
@@ -722,17 +756,38 @@ impl PolicyApplier<'_> {
             persisted: &state,
         });
         if bundle_verdict.status != TrustStatus::Verified {
-            return Ok(false);
+            return self.deactivate_preserving_trust(&state, now);
         }
-        let staged = self.stage_bundle(&bundle, &accepted.bundle_digest)?;
-        if self.checker.check(&staged.agent_dirs) != RulesCheck::Passed {
-            let _ = fs::remove_dir_all(staged.version_dir);
-            return Ok(false);
-        }
-        self.switch_current(&staged.version_dir)?;
-        self.prune_rules(&staged.version_dir)?;
         advance_trust(&mut state, bundle_verdict);
+        self.state.replace_unvalidated(state.clone(), now)?;
+        let staged = match self.stage_bundle(&bundle, &accepted.bundle_digest) {
+            Ok(staged) => staged,
+            Err(_) => return self.deactivate_preserving_trust(&state, now),
+        };
+        if self.checker.check(&staged.agent_dirs) != RulesCheck::Passed {
+            staged.remove_temporary();
+            return self.deactivate_preserving_trust(&state, now);
+        }
+        let version_dir = staged.publish()?;
+        self.switch_current(&version_dir)?;
+        self.prune_rules(&version_dir)?;
         self.state.replace(state, now)?;
+        Ok(true)
+    }
+
+    fn deactivate_preserving_trust(
+        &self,
+        state: &DurableSecurityState,
+        now: DateTime<Utc>,
+    ) -> Result<bool, GitAiError> {
+        self.state.replace(
+            DurableSecurityState {
+                last_trusted: state.last_trusted.clone(),
+                trusted_time_floor: state.trusted_time_floor.clone(),
+                ..Default::default()
+            },
+            now,
+        )?;
         Ok(true)
     }
 
@@ -743,17 +798,14 @@ impl PolicyApplier<'_> {
     ) -> Result<StagedRules, GitAiError> {
         let rules = self.state_dir.join("rules");
         fs::create_dir_all(&rules)?;
-        let version_dir = rules.join(format!("{}-{}", bundle.epoch, &digest[..12]));
-        if version_dir.exists() {
-            fs::remove_dir_all(&version_dir)?;
-        }
+        let final_dir = rules.join(format!("{}-{}", bundle.epoch, &digest[..12]));
         let mut agent_dirs = Vec::new();
         let mut paths = HashSet::new();
+        let mut expected_files = BTreeMap::new();
         for (agent, manifest) in &bundle.agents {
             if !safe_component(agent) || manifest.files.is_empty() {
                 return Err(invalid_bundle());
             }
-            let agent_dir = version_dir.join(agent);
             for file in &manifest.files {
                 if !safe_relative_path(&file.path)
                     || !paths.insert((agent.clone(), file.path.clone()))
@@ -765,17 +817,52 @@ impl PolicyApplier<'_> {
                 if hex_digest(&bytes) != file.sha256 {
                     return Err(invalid_bundle());
                 }
-                let path = agent_dir.join(&file.path);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, bytes)?;
+                expected_files.insert(PathBuf::from(agent).join(&file.path), bytes);
             }
-            agent_dirs.push(agent_dir);
+        }
+        if final_dir.exists() {
+            if !directory_matches(&final_dir, &expected_files)? {
+                return Err(invalid_bundle());
+            }
+            for agent in bundle.agents.keys() {
+                agent_dirs.push(final_dir.join(agent));
+            }
+            return Ok(StagedRules {
+                version_dir: final_dir.clone(),
+                final_dir,
+                agent_dirs,
+                temporary: false,
+            });
+        }
+        let version_dir = loop {
+            let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = rules.join(format!(
+                ".staging-{}-{}-{}-{sequence}",
+                bundle.epoch,
+                &digest[..12],
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        for (relative, bytes) in expected_files {
+            let path = version_dir.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, bytes)?;
+        }
+        for agent in bundle.agents.keys() {
+            agent_dirs.push(version_dir.join(agent));
         }
         Ok(StagedRules {
             version_dir,
+            final_dir,
             agent_dirs,
+            temporary: true,
         })
     }
 
@@ -846,6 +933,11 @@ impl PolicyApplier<'_> {
             day_one_scan: lease.day_one_scan,
             signed_bytes,
         });
+        if lease.mode == LeaseMode::Off {
+            state.applied_epoch = None;
+            state.applied_digest = None;
+            state.applied_bundle_bytes = None;
+        }
         if let Some(epoch) = epoch {
             state.applied_epoch = Some(epoch);
             state.applied_digest = Some(lease.bundle_digest.clone());
@@ -981,7 +1073,71 @@ impl PolicyApplier<'_> {
 
 struct StagedRules {
     version_dir: PathBuf,
+    final_dir: PathBuf,
     agent_dirs: Vec<PathBuf>,
+    temporary: bool,
+}
+
+impl StagedRules {
+    fn remove_temporary(&self) {
+        if self.temporary {
+            let _ = fs::remove_dir_all(&self.version_dir);
+        }
+    }
+
+    fn publish(self) -> Result<PathBuf, GitAiError> {
+        if self.temporary {
+            if self.final_dir.exists() {
+                self.remove_temporary();
+                return Err(invalid_bundle());
+            }
+            fs::rename(&self.version_dir, &self.final_dir)?;
+            if let Some(parent) = self.final_dir.parent()
+                && let Ok(directory) = fs::File::open(parent)
+            {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(self.final_dir)
+    }
+}
+
+fn directory_matches(
+    root: &Path,
+    expected: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<bool, GitAiError> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        expected: &BTreeMap<PathBuf, Vec<u8>>,
+        found: &mut usize,
+    ) -> Result<bool, GitAiError> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !visit(root, &path, expected, found)? {
+                    return Ok(false);
+                }
+            } else if file_type.is_file() {
+                let relative = path.strip_prefix(root).map_err(|_| invalid_bundle())?;
+                let Some(bytes) = expected.get(relative) else {
+                    return Ok(false);
+                };
+                if fs::read(&path)? != *bytes {
+                    return Ok(false);
+                }
+                *found += 1;
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    let mut found = 0;
+    Ok(visit(root, root, expected, &mut found)? && found == expected.len())
 }
 
 fn advance_trust(state: &mut DurableSecurityState, verdict: TrustVerdict) {
@@ -1352,7 +1508,15 @@ mod tests {
             bundle: None,
             posts: Mutex::new(Vec::new()),
         };
-        let state = LeaseStateStore::load(temp.path());
+        let state = LeaseStateStore::from_state(
+            temp.path(),
+            DurableSecurityState {
+                applied_epoch: Some(9),
+                applied_digest: Some("f".repeat(64)),
+                applied_bundle_bytes: Some(b"old signed bundle".to_vec()),
+                ..Default::default()
+            },
+        );
         let verifier = verifier(1);
         let checker = FakeChecker(RulesCheck::Passed);
         let apply = PolicyApplier {
@@ -1372,6 +1536,9 @@ mod tests {
             RefreshOutcome::Applied { epoch: None, .. }
         ));
         assert!(state.current().is_none());
+        assert_eq!(state.snapshot().applied_epoch, None);
+        assert_eq!(state.snapshot().applied_digest, None);
+        assert_eq!(state.snapshot().applied_bundle_bytes, None);
         assert_eq!(http.posts.lock().unwrap().len(), 1);
     }
 
@@ -1590,6 +1757,156 @@ mod tests {
         };
         assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
         assert!(restored.current().is_none());
+        assert!(restored.snapshot().accepted_leases.is_empty());
+    }
+
+    #[test]
+    fn restart_authenticates_every_retained_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let initial_verifier = verifier(2);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &initial_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        apply.refresh(now).unwrap();
+
+        let mut persisted: Value =
+            serde_json::from_slice(&fs::read(state.state_path()).unwrap()).unwrap();
+        let mut forged_history = persisted["accepted_leases"][0].clone();
+        forged_history["issued_at"] =
+            Value::String((now - chrono::Duration::minutes(2)).to_rfc3339());
+        persisted["accepted_leases"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, forged_history);
+        fs::write(state.state_path(), serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let restored = LeaseStateStore::load(temp.path());
+        let no_lease = FakeHttp {
+            lease: HttpResponse {
+                status: 404,
+                body: serde_json::to_vec(&json!({"code":"SECURITY_V2_LEASE_NOT_ISSUED"})).unwrap(),
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let cached_verifier = verifier(2);
+        let restart = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &no_lease,
+            verifier: &cached_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert!(restored.snapshot().accepted_leases.is_empty());
+        assert!(restored.current().is_none());
+    }
+
+    #[test]
+    fn unavailable_restart_check_preserves_rules_and_verified_trust_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let initial_verifier = verifier(2);
+        let passed = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &initial_verifier,
+            checker: &passed,
+            lease_hint: None,
+        };
+        apply.refresh(now).unwrap();
+        let installed = temp.path().join("rules/current/codex/rule.yaml");
+        let installed_bytes = fs::read(&installed).unwrap();
+
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            PLATFORM_SCOPE.to_string(),
+            crate::trust::TrustedDocumentRef {
+                version: 7,
+                digest: format!("sha256:{}", "e".repeat(64)),
+            },
+        );
+        let restart_verifier = FakeVerifier(Mutex::new(VecDeque::from([
+            TrustVerdict {
+                status: TrustStatus::Verified,
+                code: TrustCode::Verified,
+                keyid: None,
+                trusted: Some(trusted),
+                trusted_time: Some(now.to_rfc3339()),
+            },
+            TrustVerdict::of(TrustCode::Verified),
+        ])));
+        let no_lease = FakeHttp {
+            lease: HttpResponse {
+                status: 404,
+                body: serde_json::to_vec(&json!({"code":"SECURITY_V2_LEASE_NOT_ISSUED"})).unwrap(),
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let restored = LeaseStateStore::load(temp.path());
+        let unavailable = FakeChecker(RulesCheck::Unavailable);
+        let restart = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &no_lease,
+            verifier: &restart_verifier,
+            checker: &unavailable,
+            lease_hint: None,
+        };
+        assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert_eq!(fs::read(installed).unwrap(), installed_bytes);
+        assert_eq!(restored.snapshot().last_trusted[PLATFORM_SCOPE].version, 7);
         assert!(restored.snapshot().accepted_leases.is_empty());
     }
 }
