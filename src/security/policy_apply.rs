@@ -646,7 +646,10 @@ impl PolicyApplier<'_> {
     fn revalidate_cached(&self, now: DateTime<Utc>) -> Result<bool, GitAiError> {
         let mut state = self.state.snapshot();
         if state.accepted_leases.is_empty() {
-            self.state.mark_validated();
+            state.applied_epoch = None;
+            state.applied_digest = None;
+            state.applied_bundle_bytes = None;
+            self.state.replace(state, now)?;
             return Ok(true);
         }
 
@@ -782,6 +785,7 @@ impl PolicyApplier<'_> {
     ) -> Result<bool, GitAiError> {
         self.state.replace(
             DurableSecurityState {
+                acknowledgements: state.acknowledgements.clone(),
                 last_trusted: state.last_trusted.clone(),
                 trusted_time_floor: state.trusted_time_floor.clone(),
                 ..Default::default()
@@ -1908,5 +1912,53 @@ mod tests {
         assert_eq!(fs::read(installed).unwrap(), installed_bytes);
         assert_eq!(restored.snapshot().last_trusted[PLATFORM_SCOPE].version, 7);
         assert!(restored.snapshot().accepted_leases.is_empty());
+        assert!(restored.snapshot().acknowledgements["lease-1"].sent);
+        assert!(no_lease.posts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_lease_history_cannot_reuse_unauthenticated_applied_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, _, now, digest) = fixture("machine-a", "monitor");
+        let seeded = LeaseStateStore::load(temp.path());
+        seeded
+            .replace(
+                DurableSecurityState {
+                    applied_epoch: Some(1),
+                    applied_digest: Some(digest),
+                    applied_bundle_bytes: Some(b"tampered bundle".to_vec()),
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        let restored = LeaseStateStore::load(temp.path());
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let lease_verifier = verifier(1);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &http,
+            verifier: &lease_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert_eq!(apply.refresh(now).unwrap(), RefreshOutcome::Retry);
+        assert_eq!(restored.snapshot().applied_epoch, None);
+        assert_eq!(restored.snapshot().applied_digest, None);
+        assert!(restored.snapshot().accepted_leases.is_empty());
+        assert!(http.posts.lock().unwrap().is_empty());
     }
 }
