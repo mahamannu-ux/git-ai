@@ -9,7 +9,7 @@ use crate::security::tail::{
     DEFAULT_MAX_ENTRIES_PER_POLL, TailEntryKind, delete_expired_rotations_except, read_available,
     rotate_if_due,
 };
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub fn poll_security_records(
     }
     let checkpoint = queue.checkpoint()?;
     let read = read_available(path, &checkpoint, DEFAULT_MAX_ENTRIES_PER_POLL)?;
-    let lease = leases.current();
+    let current_lease = leases.current();
     let mut projected = Vec::new();
     let mut counters = BTreeMap::<String, u64>::new();
     for entry in &read.entries {
@@ -84,7 +84,7 @@ pub fn poll_security_records(
                     increment(&mut counters, "not_security_v2");
                     continue;
                 }
-                let Some(lease) = lease.as_ref() else {
+                let Some(current_lease) = current_lease.as_ref() else {
                     increment(&mut counters, "lease_absent");
                     continue;
                 };
@@ -92,7 +92,21 @@ pub fn poll_security_records(
                     increment(&mut counters, "delivery_binding_absent");
                     continue;
                 };
-                if let Some(record) = project_numbat_record(raw, lease, repositories, joins, false)
+                let lease = if parsed.get("record_type").and_then(Value::as_str) == Some("finding")
+                {
+                    parsed
+                        .get("detected_at")
+                        .and_then(Value::as_str)
+                        .and_then(|at| at.parse::<DateTime<Utc>>().ok())
+                        .and_then(|at| leases.lease_at(at))
+                } else {
+                    Some(current_lease.clone())
+                };
+                let Some(lease) = lease else {
+                    increment(&mut counters, "lease_at_detection_absent");
+                    continue;
+                };
+                if let Some(record) = project_numbat_record(raw, &lease, repositories, joins, false)
                 {
                     projected.push((record, binding));
                 } else {
@@ -177,6 +191,10 @@ mod tests {
                 data_settings: SecurityDataSettings::ALL_OFF,
             })
         }
+        fn lease_at(&self, at: DateTime<Utc>) -> Option<LeaseSnapshot> {
+            self.current()
+                .filter(|lease| lease.issued_at <= at && at < lease.expires_at)
+        }
         fn issued(&self, _: &str) -> Option<LeaseSnapshot> {
             self.current()
         }
@@ -240,5 +258,89 @@ mod tests {
         let rows = queue.dequeue_pending(500, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].projection_json.contains("tool_input"));
+    }
+
+    #[test]
+    fn finding_uses_lease_current_at_detection_after_refresh() {
+        struct LeaseHistory;
+        impl LeaseHistory {
+            fn lease(
+                id: &str,
+                issued_at: DateTime<Utc>,
+                expires_at: DateTime<Utc>,
+            ) -> LeaseSnapshot {
+                LeaseSnapshot {
+                    lease_id: id.into(),
+                    bundle_digest: if id == "older" {
+                        "a".repeat(64)
+                    } else {
+                        "b".repeat(64)
+                    },
+                    issued_at,
+                    expires_at,
+                    data_settings: SecurityDataSettings::ALL_OFF,
+                }
+            }
+
+            fn history() -> [LeaseSnapshot; 2] {
+                [
+                    Self::lease(
+                        "older",
+                        Utc.with_ymd_and_hms(2026, 10, 17, 0, 0, 0).unwrap(),
+                        Utc.with_ymd_and_hms(2026, 10, 17, 11, 0, 0).unwrap(),
+                    ),
+                    Self::lease(
+                        "newer",
+                        Utc.with_ymd_and_hms(2026, 10, 17, 11, 0, 0).unwrap(),
+                        Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, 0).unwrap(),
+                    ),
+                ]
+            }
+        }
+        impl SecurityLeaseContext for LeaseHistory {
+            fn current(&self) -> Option<LeaseSnapshot> {
+                Self::history().into_iter().last()
+            }
+
+            fn lease_at(&self, at: DateTime<Utc>) -> Option<LeaseSnapshot> {
+                Self::history()
+                    .into_iter()
+                    .find(|lease| lease.issued_at <= at && at < lease.expires_at)
+            }
+
+            fn issued(&self, lease_id: &str) -> Option<LeaseSnapshot> {
+                Self::history()
+                    .into_iter()
+                    .find(|lease| lease.lease_id == lease_id)
+            }
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let records = temp.path().join("records.ndjson");
+        std::fs::write(&records, finding()).unwrap();
+        let mut queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
+        let binding = MetricDeliveryHealthBinding {
+            tenant_id: "tenant".into(),
+            api_base_url: "https://trackai.example".into(),
+            credential_key_id: "ABCDEFGHIJKLMNOP".into(),
+        };
+
+        poll_security_records(
+            &records,
+            &mut queue,
+            &LeaseHistory,
+            Some(&binding),
+            &HashMap::new(),
+            &mut PermissionJoinTracker::default(),
+            10,
+        )
+        .unwrap();
+
+        let rows = queue.dequeue_pending(500, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].lease_id, "older");
+        let projection: Value = serde_json::from_str(&rows[0].projection_json).unwrap();
+        assert_eq!(projection["lease_id"], "older");
+        assert_eq!(projection["bundle_digest"], "a".repeat(64));
     }
 }

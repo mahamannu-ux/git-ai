@@ -8,7 +8,7 @@ use crate::security::delivery_queue::{QueuedSecurityRecord, SecurityRecordQueue}
 use crate::security::records::minimize_queued;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 const MAX_RECORDS: usize = 500;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -94,7 +94,8 @@ where
             queue.delete_counted(&invalid_ids, "invalid_local_record")?;
             summary.dropped += invalid_ids.len();
         }
-        for batch in batches {
+        let mut pending_batches = VecDeque::from(batches);
+        while let Some(mut batch) = pending_batches.pop_front() {
             let values = batch
                 .iter()
                 .map(|(_, value)| value.clone())
@@ -113,6 +114,26 @@ where
                 }
             };
             let problem_code = problem_code(&response.body);
+            let split_failure = (response.status == 400
+                && matches!(
+                    problem_code.as_deref(),
+                    Some("SECURITY_V2_INVALID_BODY" | "SECURITY_V2_UNKNOWN_FIELD")
+                ))
+                || response.status == 413;
+            if split_failure {
+                if batch.len() == 1 {
+                    let code = problem_code
+                        .as_deref()
+                        .unwrap_or("SECURITY_V2_PAYLOAD_TOO_LARGE");
+                    queue.delete_counted(&[batch[0].0.id], code)?;
+                    summary.dropped += 1;
+                } else {
+                    let right = batch.split_off(batch.len() / 2);
+                    pending_batches.push_front(right);
+                    pending_batches.push_front(batch);
+                }
+                continue;
+            }
             if response.status == 429 {
                 let ids = batch
                     .iter()
@@ -141,12 +162,7 @@ where
             if response.status != 200
                 && matches!(
                     problem_code.as_deref(),
-                    Some(
-                        "SECURITY_V2_LEASE_MISMATCH"
-                            | "SECURITY_V2_RECORD_CONFLICT"
-                            | "SECURITY_V2_INVALID_BODY"
-                            | "SECURITY_V2_UNKNOWN_FIELD"
-                    )
+                    Some("SECURITY_V2_LEASE_MISMATCH" | "SECURITY_V2_RECORD_CONFLICT")
                 )
             {
                 let ids = batch
@@ -367,6 +383,10 @@ mod tests {
                 data_settings: self.0.clone(),
             })
         }
+        fn lease_at(&self, at: chrono::DateTime<Utc>) -> Option<LeaseSnapshot> {
+            self.current()
+                .filter(|lease| lease.issued_at <= at && at < lease.expires_at)
+        }
         fn issued(&self, _lease_id: &str) -> Option<LeaseSnapshot> {
             self.current()
         }
@@ -579,5 +599,101 @@ mod tests {
             assert_eq!(result.retrying, 1);
             assert_eq!(queue.dequeue_pending(500, 1_000).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn whole_request_failure_isolates_one_bad_record_and_delivers_the_rest() {
+        let values = (0..500)
+            .map(|_| json!({"kind":"scan_summary"}))
+            .collect::<Vec<_>>();
+        let bad_record_id = format!("sha256:{:064x}", 247);
+        let (_temp, mut queue) = queue_with(values);
+
+        let result = flush_security_records_with(
+            &mut queue,
+            &Lease(SecurityDataSettings::ALL_OFF),
+            10,
+            |_| Some("credential".into()),
+            |_, _, body| {
+                let records = body["records"].as_array().unwrap();
+                if records
+                    .iter()
+                    .any(|record| record["record_id"] == bad_record_id)
+                {
+                    return Ok(UploadHttpResponse {
+                        status: 400,
+                        retry_after_seconds: None,
+                        body: json!({"code":"SECURITY_V2_INVALID_BODY"}).to_string(),
+                    });
+                }
+                Ok(UploadHttpResponse {
+                    status: 200,
+                    retry_after_seconds: None,
+                    body: json!({
+                        "schema_version":"trackai.security-upload-result/2",
+                        "results": records.iter().map(|record| json!({
+                            "record_id":record["record_id"],
+                            "result":"accepted"
+                        })).collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.delivered, 499);
+        assert_eq!(result.dropped, 1);
+        assert_eq!(result.retrying, 0);
+        assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        assert_eq!(queue.counter("terminal:SECURITY_V2_INVALID_BODY"), 1);
+    }
+
+    #[test]
+    fn payload_too_large_splits_and_drops_only_a_bad_singleton() {
+        let bad_record_id = format!("sha256:{:064x}", 1);
+        let (_temp, mut queue) = queue_with(vec![
+            json!({"kind":"scan_summary"}),
+            json!({"kind":"scan_summary"}),
+        ]);
+
+        let result = flush_security_records_with(
+            &mut queue,
+            &Lease(SecurityDataSettings::ALL_OFF),
+            10,
+            |_| Some("credential".into()),
+            |_, _, body| {
+                let records = body["records"].as_array().unwrap();
+                if records
+                    .iter()
+                    .any(|record| record["record_id"] == bad_record_id)
+                {
+                    return Ok(UploadHttpResponse {
+                        status: 413,
+                        retry_after_seconds: None,
+                        body: json!({"code":"SECURITY_V2_PAYLOAD_TOO_LARGE"}).to_string(),
+                    });
+                }
+                Ok(UploadHttpResponse {
+                    status: 200,
+                    retry_after_seconds: None,
+                    body: json!({
+                        "schema_version":"trackai.security-upload-result/2",
+                        "results":[{
+                            "record_id":records[0]["record_id"],
+                            "result":"accepted"
+                        }]
+                    })
+                    .to_string(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.delivered, 1);
+        assert_eq!(result.dropped, 1);
+        assert_eq!(result.retrying, 0);
+        assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        assert_eq!(queue.counter("terminal:SECURITY_V2_PAYLOAD_TOO_LARGE"), 1);
     }
 }

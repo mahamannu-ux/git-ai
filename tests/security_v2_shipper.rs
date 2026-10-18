@@ -42,6 +42,11 @@ impl SecurityLeaseContext for Lease {
         })
     }
 
+    fn lease_at(&self, at: chrono::DateTime<Utc>) -> Option<LeaseSnapshot> {
+        self.current()
+            .filter(|lease| lease.issued_at <= at && at < lease.expires_at)
+    }
+
     fn issued(&self, _lease_id: &str) -> Option<LeaseSnapshot> {
         self.current()
     }
