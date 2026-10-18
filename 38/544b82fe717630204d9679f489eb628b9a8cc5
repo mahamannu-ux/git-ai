@@ -1,0 +1,21 @@
+src/daemon/telemetry_worker.rs
+  s_614a018723afbe::t_7106af3c45c64b 31,485-488,491,495,500
+src/fleet/mod.rs
+  s_614a018723afbe::t_00cb333a446bdb 128-152,158,166,174,182,190,198,206,214,220-228,236,244,252,257-261,460,497-516,838-849,894-897,904-929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "38544b82fe717630204d9679f489eb628b9a8cc5",
+  "prompts": {},
+  "sessions": {
+    "s_614a018723afbe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14f00-52b1-7563-875b-e7576212aed2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
