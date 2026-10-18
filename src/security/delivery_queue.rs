@@ -351,7 +351,7 @@ impl SecurityRecordQueue {
     }
 
     #[cfg(test)]
-    fn counter(&self, name: &str) -> u64 {
+    pub(crate) fn counter(&self, name: &str) -> u64 {
         self.connection
             .query_row(
                 "SELECT value FROM security_shipper_counters WHERE name=?1",
