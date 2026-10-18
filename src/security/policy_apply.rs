@@ -390,8 +390,31 @@ struct LeasePayload {
     mode: LeaseMode,
     agents: Vec<String>,
     bundle_digest: String,
-    data_settings: SecurityDataSettings,
+    data_settings: LeaseDataSettings,
     day_one_scan: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseDataSettings {
+    schema_version: String,
+    command_previews: bool,
+    file_paths: bool,
+    urls: bool,
+    host_identity: bool,
+    user_identity: bool,
+}
+
+impl LeaseDataSettings {
+    fn projection(&self) -> SecurityDataSettings {
+        SecurityDataSettings {
+            command_previews: self.command_previews,
+            file_paths: self.file_paths,
+            urls: self.urls,
+            host_identity: self.host_identity,
+            user_identity: self.user_identity,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,7 +523,11 @@ impl PolicyApplier<'_> {
             Ok(value) => value,
             Err(_) => return self.refuse_unparsed(RefusalCode::UnsupportedSchema, now),
         };
-        if before.acknowledgements.contains_key(&lease.lease_id) {
+        if before
+            .acknowledgements
+            .get(&lease.lease_id)
+            .is_some_and(|ack| ack.body.get("result").and_then(Value::as_str) == Some("refused"))
+        {
             return Ok(RefreshOutcome::NoChange);
         }
         if lease.schema_version != "trackai.security-activation-lease/2" {
@@ -931,7 +958,7 @@ impl PolicyApplier<'_> {
             bundle_digest: lease.bundle_digest.clone(),
             issued_at: lease.issued_at,
             expires_at: lease.expires_at,
-            data_settings: lease.data_settings,
+            data_settings: lease.data_settings.projection(),
             mode: lease.mode,
             agents: lease.agents,
             day_one_scan: lease.day_one_scan,
@@ -951,15 +978,15 @@ impl PolicyApplier<'_> {
         }
         advance_trust(&mut state, verdict);
         let body = acknowledgement(&lease.lease_id, &lease.bundle_digest, None);
-        state.acknowledgements.insert(
-            lease.lease_id.clone(),
-            PersistedAcknowledgement {
+        state
+            .acknowledgements
+            .entry(lease.lease_id.clone())
+            .or_insert(PersistedAcknowledgement {
                 body: body.clone(),
                 sent: false,
                 attempts: 0,
                 next_retry_at: 0,
-            },
-        );
+            });
         self.state.replace(state, now)?;
         self.send_ack(&lease.lease_id, &body, now)?;
         Ok(RefreshOutcome::Applied {
@@ -1200,7 +1227,8 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_lease(lease: &LeasePayload) -> bool {
-    !lease.tenant_id.is_empty()
+    lease.data_settings.schema_version == "trackai.security-data-settings/1"
+        && !lease.tenant_id.is_empty()
         && lease.tenant_id.len() <= 128
         && !lease.tenant_id.chars().any(char::is_whitespace)
         && !lease.machine_id.is_empty()
@@ -1226,7 +1254,7 @@ fn accepted_matches(accepted: &AcceptedLease, lease: &LeasePayload) -> bool {
         && accepted.bundle_digest == lease.bundle_digest
         && accepted.issued_at == lease.issued_at
         && accepted.expires_at == lease.expires_at
-        && accepted.data_settings == lease.data_settings
+        && accepted.data_settings == lease.data_settings.projection()
         && accepted.mode == lease.mode
         && accepted.agents == lease.agents
         && accepted.day_one_scan == lease.day_one_scan
@@ -1347,7 +1375,7 @@ mod tests {
             "schema_version":"trackai.security-activation-lease/2","tenant_id":"tenant-a","machine_id":machine,"lease_id":"lease-1",
             "issued_at":(now-chrono::Duration::minutes(1)).to_rfc3339(),"expires_at":(now+chrono::Duration::hours(1)).to_rfc3339(),
             "mode":mode,"agents":if mode=="off" {json!([])} else {json!(["codex"])},"bundle_digest":digest,
-            "data_settings":{"command_previews":false,"file_paths":false,"urls":false,"host_identity":false,"user_identity":false},"day_one_scan":false
+            "data_settings":{"schema_version":"trackai.security-data-settings/1","command_previews":false,"file_paths":false,"urls":false,"host_identity":false,"user_identity":false},"day_one_scan":false
         })).unwrap();
         (
             envelope(&lease, LEASE_PAYLOAD_TYPE),
@@ -1372,11 +1400,11 @@ mod tests {
         let http = FakeHttp {
             lease: HttpResponse {
                 status: 200,
-                body: lease,
+                body: lease.clone(),
             },
             bundle: Some(HttpResponse {
                 status: 200,
-                body: bundle,
+                body: bundle.clone(),
             }),
             posts: Mutex::new(Vec::new()),
         };
@@ -1462,6 +1490,50 @@ mod tests {
         assert_eq!(
             http.posts.lock().unwrap()[0]["refusal_code"],
             "MACHINE_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn lease_requires_closed_versioned_data_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let (signed_lease, _, now, _) = fixture("machine-a", "monitor");
+        let signed: DsseEnvelope = serde_json::from_slice(&signed_lease).unwrap();
+        let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+        let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+        payload["data_settings"]["schema_version"] = Value::String("wrong/1".into());
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE),
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let verifier = verifier(1);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            apply.refresh(now).unwrap(),
+            RefreshOutcome::Refused {
+                code: RefusalCode::UnsupportedSchema,
+                ..
+            }
+        ));
+        assert_eq!(
+            http.posts.lock().unwrap()[0]["refusal_code"],
+            "UNSUPPORTED_SCHEMA"
         );
     }
 
@@ -1841,11 +1913,11 @@ mod tests {
         let http = FakeHttp {
             lease: HttpResponse {
                 status: 200,
-                body: lease,
+                body: lease.clone(),
             },
             bundle: Some(HttpResponse {
                 status: 200,
-                body: bundle,
+                body: bundle.clone(),
             }),
             posts: Mutex::new(Vec::new()),
         };
@@ -1914,6 +1986,37 @@ mod tests {
         assert!(restored.snapshot().accepted_leases.is_empty());
         assert!(restored.snapshot().acknowledgements["lease-1"].sent);
         assert!(no_lease.posts.lock().unwrap().is_empty());
+
+        let recovered_http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let recovered_verifier = verifier(2);
+        let recovered = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &recovered_http,
+            verifier: &recovered_verifier,
+            checker: &passed,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            recovered.refresh(now).unwrap(),
+            RefreshOutcome::Applied { .. }
+        ));
+        assert!(restored.current().is_some());
+        assert!(recovered_http.posts.lock().unwrap().is_empty());
     }
 
     #[test]

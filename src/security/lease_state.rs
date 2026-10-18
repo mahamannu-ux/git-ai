@@ -171,7 +171,10 @@ impl LeaseStateStore {
     }
 
     pub fn discard_untrusted(&self) -> Result<(), GitAiError> {
-        let empty = DurableSecurityState::default();
+        let empty = DurableSecurityState {
+            acknowledgements: self.snapshot().acknowledgements,
+            ..Default::default()
+        };
         self.write_atomic(&empty)?;
         *self
             .state
