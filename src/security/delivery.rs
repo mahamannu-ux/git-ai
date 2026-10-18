@@ -3,7 +3,7 @@
 use crate::api::client::ApiContext;
 use crate::error::GitAiError;
 use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
-use crate::security::activation::{SecurityLeaseContext, UNAVAILABLE_LEASE_CONTEXT};
+use crate::security::activation::{SecurityLeaseContext, configured_lease_context};
 use crate::security::delivery_queue::{QueuedSecurityRecord, SecurityRecordQueue};
 use crate::security::records::minimize_queued;
 use serde::Deserialize;
@@ -356,7 +356,7 @@ pub fn flush_configured_security_records(now: u64) -> Result<SecurityFlushResult
     let mut queue = SecurityRecordQueue::open_at_path(&path)?;
     flush_security_records_with(
         &mut queue,
-        &UNAVAILABLE_LEASE_CONTEXT,
+        configured_lease_context(),
         now,
         |binding| runtime.credential_for_health_binding(binding).ok(),
         upload_security_records,

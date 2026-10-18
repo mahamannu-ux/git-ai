@@ -126,10 +126,36 @@ pub struct ConfigurationEnvelopeV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecurityLeaseReference {
+    pub lease_id: String,
+    pub bundle_digest: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigurationEnvelopeV3 {
+    pub schema_version: u8,
+    pub configuration_id: String,
+    pub epoch: u64,
+    pub issued_at: String,
+    pub valid_until: Option<String>,
+    pub client_compatibility: ClientCompatibility,
+    pub desired_release: DesiredRelease,
+    pub channel: FleetChannel,
+    pub ring: Option<String>,
+    pub repository_policies: Vec<RepositoryPolicy>,
+    pub security_lease: SecurityLeaseReference,
+    pub verification: VerificationMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConfigurationEnvelope {
     V1(ConfigurationEnvelopeV1),
     V2(ConfigurationEnvelopeV2),
+    V3(ConfigurationEnvelopeV3),
 }
 
 impl ConfigurationEnvelope {
@@ -137,6 +163,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => value.schema_version,
             Self::V2(value) => value.schema_version,
+            Self::V3(value) => value.schema_version,
         }
     }
 
@@ -144,6 +171,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => &value.configuration_id,
             Self::V2(value) => &value.configuration_id,
+            Self::V3(value) => &value.configuration_id,
         }
     }
 
@@ -151,6 +179,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => value.epoch,
             Self::V2(value) => value.epoch,
+            Self::V3(value) => value.epoch,
         }
     }
 
@@ -158,6 +187,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => &value.issued_at,
             Self::V2(value) => &value.issued_at,
+            Self::V3(value) => &value.issued_at,
         }
     }
 
@@ -165,6 +195,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => value.valid_until.as_deref(),
             Self::V2(value) => value.valid_until.as_deref(),
+            Self::V3(value) => value.valid_until.as_deref(),
         }
     }
 
@@ -172,6 +203,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => &value.repository_policies,
             Self::V2(value) => &value.repository_policies,
+            Self::V3(value) => &value.repository_policies,
         }
     }
 
@@ -179,13 +211,21 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => &mut value.repository_policies,
             Self::V2(value) => &mut value.repository_policies,
+            Self::V3(value) => &mut value.repository_policies,
         }
     }
 
     pub fn security_activation(&self) -> &SecurityActivation {
         match self {
-            Self::V1(value) => &value.security_activation,
-            Self::V2(value) => &value.security_activation,
+            Self::V1(_) | Self::V2(_) => &OFF_SECURITY_ACTIVATION,
+            Self::V3(_) => &OFF_SECURITY_ACTIVATION,
+        }
+    }
+
+    pub fn security_lease(&self) -> Option<&SecurityLeaseReference> {
+        match self {
+            Self::V3(value) => Some(&value.security_lease),
+            Self::V1(_) | Self::V2(_) => None,
         }
     }
 
@@ -193,6 +233,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => value.ring.as_deref(),
             Self::V2(value) => value.ring.as_deref(),
+            Self::V3(value) => value.ring.as_deref(),
         }
     }
 
@@ -200,6 +241,7 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(value) => &value.verification,
             Self::V2(value) => &value.verification,
+            Self::V3(value) => &value.verification,
         }
     }
 
@@ -207,9 +249,15 @@ impl ConfigurationEnvelope {
         match self {
             Self::V1(_) => None,
             Self::V2(value) => Some(&value.desired_release),
+            Self::V3(value) => Some(&value.desired_release),
         }
     }
 }
+
+static OFF_SECURITY_ACTIVATION: SecurityActivation = SecurityActivation {
+    mode: SecurityMode::Off,
+    version: 1,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationResult {
@@ -409,7 +457,7 @@ pub fn parse_and_validate(
     }
     let envelope: ConfigurationEnvelope =
         serde_json::from_slice(raw).map_err(|_| AcknowledgementResult::RejectedInvalid)?;
-    if !matches!(envelope.schema_version(), 1 | 2)
+    if !matches!(envelope.schema_version(), 1 | 2 | 3)
         || envelope.epoch() == 0
         || !valid_uuid(envelope.configuration_id())
         || envelope
@@ -431,6 +479,26 @@ pub fn parse_and_validate(
         }
         ConfigurationEnvelope::V2(value) => {
             if value.schema_version != 2 || !valid_desired_release(&value.desired_release) {
+                return Err(AcknowledgementResult::RejectedInvalid);
+            }
+            let minimum = canonical_version(&value.client_compatibility.minimum_version)
+                .ok_or(AcknowledgementResult::RejectedInvalid)?;
+            let maximum = canonical_version(&value.client_compatibility.maximum_version)
+                .ok_or(AcknowledgementResult::RejectedInvalid)?;
+            let client = canonical_version(client_version)
+                .ok_or(AcknowledgementResult::RejectedIncompatible)?;
+            if minimum > maximum {
+                return Err(AcknowledgementResult::RejectedInvalid);
+            }
+            if client < minimum || client > maximum {
+                return Err(AcknowledgementResult::RejectedIncompatible);
+            }
+        }
+        ConfigurationEnvelope::V3(value) => {
+            if value.schema_version != 3
+                || !valid_desired_release(&value.desired_release)
+                || !valid_security_lease(&value.security_lease)
+            {
                 return Err(AcknowledgementResult::RejectedInvalid);
             }
             let minimum = canonical_version(&value.client_compatibility.minimum_version)
@@ -767,6 +835,18 @@ fn valid_desired_release(release: &DesiredRelease) -> bool {
         })
 }
 
+fn valid_security_lease(lease: &SecurityLeaseReference) -> bool {
+    !lease.lease_id.is_empty()
+        && lease.lease_id.len() <= 128
+        && !lease.lease_id.chars().any(char::is_whitespace)
+        && lease.bundle_digest.len() == 64
+        && lease
+            .bundle_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && parse_time(&lease.expires_at).is_some()
+}
+
 fn valid_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
@@ -811,10 +891,40 @@ mod tests {
         format!(r#"{{"schemaVersion":2,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","clientCompatibility":{{"minimumVersion":"1.6.18","maximumVersion":"1.6.20"}},"desiredRelease":{{"version":"9.8.7","releaseTag":"v9.8.7","manifestUrl":"https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"channel":"enterprise-latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityActivation":{{"mode":"monitor","version":1}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
     }
 
+    fn v3_raw(epoch: u64, id: &str) -> Vec<u8> {
+        format!(r#"{{"schemaVersion":3,"configurationId":"{id}","epoch":{epoch},"issuedAt":"2026-10-10T00:00:00Z","validUntil":"2026-10-12T00:00:00Z","clientCompatibility":{{"minimumVersion":"1.6.18","maximumVersion":"1.6.20"}},"desiredRelease":{{"version":"9.8.7","releaseTag":"v9.8.7","manifestUrl":"https://github.com/mahamannu-ux/git-ai/releases/download/v9.8.7/SHA256SUMS","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"channel":"enterprise-latest","ring":null,"repositoryPolicies":[{{"repositoryId":"11111111-1111-4111-8111-111111111111","enrollmentId":"22222222-2222-4222-8222-222222222222","grantId":"33333333-3333-4333-8333-333333333333","branchPatterns":["main"],"effectiveFrom":"2026-10-10T00:00:00Z","effectiveUntil":null}}],"securityLease":{{"leaseId":"44444444-4444-4444-8444-444444444444","bundleDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expiresAt":"2026-10-11T00:00:00Z"}},"verification":{{"required":true,"state":"unavailable"}}}}"#).into_bytes()
+    }
+
     fn repositories() -> Repositories {
         Repositories(HashSet::from([
             "11111111-1111-4111-8111-111111111111".to_string()
         ]))
+    }
+
+    #[test]
+    fn fleet_v3_parses_lease_hint_and_v1_v2_remain_fail_closed() {
+        let now = "2026-10-10T01:00:00Z".parse().unwrap();
+        let v3 = parse_and_validate(
+            &v3_raw(3, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            now,
+            env!("CARGO_PKG_VERSION"),
+            &repositories(),
+        )
+        .unwrap();
+        assert_eq!(v3.schema_version(), 3);
+        assert_eq!(v3.security_activation().mode, SecurityMode::Off);
+        assert_eq!(
+            v3.security_lease().unwrap().lease_id,
+            "44444444-4444-4444-8444-444444444444"
+        );
+        for raw in [
+            raw(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            v2_raw(2, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        ] {
+            let parsed =
+                parse_and_validate(&raw, now, env!("CARGO_PKG_VERSION"), &repositories()).unwrap();
+            assert!(parsed.security_lease().is_none());
+        }
     }
 
     #[test]
