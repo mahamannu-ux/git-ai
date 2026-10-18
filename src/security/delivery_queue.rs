@@ -14,7 +14,7 @@ use std::path::Path;
 
 const MAX_ATTEMPTS: u32 = 6;
 const PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
-const FIRST_RETRY_DELAY_SECS: u64 = 60;
+pub(crate) const FIRST_RETRY_DELAY_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedSecurityRecord {

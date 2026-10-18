@@ -12,6 +12,7 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub const SECURITY_STATE_FILE: &str = "state.json";
@@ -65,6 +66,8 @@ pub struct DurableSecurityState {
     pub applied_epoch: Option<u64>,
     pub applied_digest: Option<String>,
     #[serde(default)]
+    pub applied_bundle_bytes: Option<Vec<u8>>,
+    #[serde(default)]
     pub acknowledgements: BTreeMap<String, PersistedAcknowledgement>,
     #[serde(default)]
     pub last_trusted: BTreeMap<String, TrustedDocumentRef>,
@@ -76,12 +79,17 @@ pub struct DurableSecurityState {
 pub struct PersistedAcknowledgement {
     pub body: serde_json::Value,
     pub sent: bool,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_retry_at: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct LeaseStateStore {
     path: PathBuf,
     state: Arc<RwLock<DurableSecurityState>>,
+    validated: Arc<AtomicBool>,
 }
 
 impl LeaseStateStore {
@@ -95,6 +103,7 @@ impl LeaseStateStore {
         Self {
             path,
             state: Arc::new(RwLock::new(state)),
+            validated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -103,6 +112,7 @@ impl LeaseStateStore {
         Self {
             path: state_dir.join(SECURITY_STATE_FILE),
             state: Arc::new(RwLock::new(state)),
+            validated: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -130,6 +140,25 @@ impl LeaseStateStore {
             .state
             .write()
             .map_err(|_| GitAiError::Generic("security state lock poisoned".into()))? = next;
+        self.validated.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn is_validated(&self) -> bool {
+        self.validated.load(Ordering::Acquire)
+    }
+
+    pub fn mark_validated(&self) {
+        self.validated.store(true, Ordering::Release);
+    }
+
+    pub fn discard_untrusted(&self) -> Result<(), GitAiError> {
+        *self
+            .state
+            .write()
+            .map_err(|_| GitAiError::Generic("security state lock poisoned".into()))? =
+            DurableSecurityState::default();
+        self.validated.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -160,16 +189,16 @@ impl LeaseStateStore {
     }
 
     fn current_at(&self, now: DateTime<Utc>) -> Option<LeaseSnapshot> {
-        self.state
-            .read()
-            .ok()?
+        if !self.is_validated() {
+            return None;
+        }
+        let state = self.state.read().ok()?;
+        let lease = state
             .accepted_leases
             .iter()
-            .rev()
-            .find(|lease| {
-                lease.mode != LeaseMode::Off && lease.issued_at <= now && now < lease.expires_at
-            })
-            .map(AcceptedLease::snapshot)
+            .filter(|lease| lease.issued_at <= now)
+            .max_by_key(|lease| lease.issued_at)?;
+        (lease.mode != LeaseMode::Off && now < lease.expires_at).then(|| lease.snapshot())
     }
 }
 
@@ -179,19 +208,22 @@ impl SecurityLeaseContext for LeaseStateStore {
     }
 
     fn lease_at(&self, at: DateTime<Utc>) -> Option<LeaseSnapshot> {
-        self.state
-            .read()
-            .ok()?
+        if !self.is_validated() {
+            return None;
+        }
+        let state = self.state.read().ok()?;
+        let lease = state
             .accepted_leases
             .iter()
-            .rev()
-            .find(|lease| {
-                lease.mode != LeaseMode::Off && lease.issued_at <= at && at < lease.expires_at
-            })
-            .map(AcceptedLease::snapshot)
+            .filter(|lease| lease.issued_at <= at)
+            .max_by_key(|lease| lease.issued_at)?;
+        (lease.mode != LeaseMode::Off && at < lease.expires_at).then(|| lease.snapshot())
     }
 
     fn issued(&self, lease_id: &str) -> Option<LeaseSnapshot> {
+        if !self.is_validated() {
+            return None;
+        }
         let cutoff = Utc::now() - Duration::days(LEASE_HISTORY_DAYS);
         self.state
             .read()
@@ -199,7 +231,11 @@ impl SecurityLeaseContext for LeaseStateStore {
             .accepted_leases
             .iter()
             .rev()
-            .find(|lease| lease.lease_id == lease_id && lease.expires_at >= cutoff)
+            .find(|lease| {
+                lease.lease_id == lease_id
+                    && lease.mode != LeaseMode::Off
+                    && lease.expires_at >= cutoff
+            })
             .map(AcceptedLease::snapshot)
     }
 }
@@ -255,6 +291,12 @@ mod tests {
             .replace(state, Utc.timestamp_opt(100, 0).unwrap())
             .unwrap();
         let restored = LeaseStateStore::load(temp.path());
+        assert!(
+            restored
+                .current_at(Utc.timestamp_opt(100, 0).unwrap())
+                .is_none()
+        );
+        restored.mark_validated();
         assert_eq!(
             restored
                 .current_at(Utc.timestamp_opt(100, 0).unwrap())
@@ -290,7 +332,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.snapshot().accepted_leases.len(), MAX_ACCEPTED_LEASES);
-        assert_ne!(store.current_at(now).unwrap().lease_id, "lease-30");
+        assert!(store.current_at(now).is_none());
         assert!(
             store
                 .current_at(Utc.timestamp_opt(3_000_000, 0).unwrap())

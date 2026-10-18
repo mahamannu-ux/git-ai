@@ -147,7 +147,7 @@ fn response_bytes(response: ureq::http::Response<ureq::Body>) -> Result<HttpResp
 pub fn refresh_configured_security_policy(
     now: DateTime<Utc>,
 ) -> Result<RefreshOutcome, GitAiError> {
-    static REFRESH: Mutex<(i64, Option<String>)> = Mutex::new((0, None));
+    static REFRESH: Mutex<(i64, Option<String>, u32)> = Mutex::new((0, None, 0));
     let Some(runtime) = crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
         .map_err(|error| GitAiError::Generic(error.to_string()))?
     else {
@@ -196,17 +196,34 @@ pub fn refresh_configured_security_policy(
         checker: &checker,
         lease_hint: hint,
     }
-    .refresh(now)?;
-    let retry_seconds = if outcome == RefreshOutcome::Retry {
-        60
+    .refresh(now);
+    let mut guard = REFRESH
+        .lock()
+        .map_err(|_| GitAiError::Generic("security refresh lock poisoned".into()))?;
+    let retryable = matches!(&outcome, Err(_) | Ok(RefreshOutcome::Retry));
+    let mut delay = if retryable {
+        let delay = crate::security::delivery_queue::FIRST_RETRY_DELAY_SECS
+            .saturating_mul(1_u64 << guard.2.min(5));
+        guard.2 = guard.2.saturating_add(1);
+        delay as i64
     } else {
+        guard.2 = 0;
         3_600
     };
-    *REFRESH
-        .lock()
-        .map_err(|_| GitAiError::Generic("security refresh lock poisoned".into()))? =
-        (now.timestamp().saturating_add(retry_seconds), hint_id);
-    Ok(outcome)
+    if let Some(next_ack) = crate::security::activation::configured_lease_context()
+        .snapshot()
+        .acknowledgements
+        .values()
+        .filter(|ack| !ack.sent)
+        .map(|ack| ack.next_retry_at)
+        .min()
+    {
+        delay = delay.min(next_ack.saturating_sub(now.timestamp()).max(1));
+    }
+    guard.0 = now.timestamp().saturating_add(delay);
+    guard.1 = hint_id;
+    drop(guard);
+    outcome
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,7 +432,10 @@ pub struct PolicyApplier<'a> {
 
 impl PolicyApplier<'_> {
     pub fn refresh(&self, now: DateTime<Utc>) -> Result<RefreshOutcome, GitAiError> {
-        self.retry_acknowledgements()?;
+        if !self.state.is_validated() && !self.revalidate_cached(now)? {
+            self.state.discard_untrusted()?;
+        }
+        self.retry_acknowledgements(now)?;
         let response = match self.http.get("/worker/security/v2/lease") {
             Ok(value) => value,
             Err(_) => return Ok(RefreshOutcome::Retry),
@@ -473,10 +493,14 @@ impl PolicyApplier<'_> {
             };
             return self.refuse_unparsed(code, now);
         }
+        self.persist_trust(verdict.clone(), now)?;
         let lease: LeasePayload = match serde_json::from_slice(&payload) {
             Ok(value) => value,
             Err(_) => return self.refuse_unparsed(RefusalCode::UnsupportedSchema, now),
         };
+        if before.acknowledgements.contains_key(&lease.lease_id) {
+            return Ok(RefreshOutcome::NoChange);
+        }
         if lease.schema_version != "trackai.security-activation-lease/2" {
             return self.refuse(&lease, RefusalCode::UnsupportedSchema, now);
         }
@@ -510,10 +534,17 @@ impl PolicyApplier<'_> {
             }
         }
         if lease.mode == LeaseMode::Off {
-            return self.accept(lease, response.body, None, verdict, now);
+            return self.accept(lease, response.body, None, verdict, None, now);
         }
         if before.applied_digest.as_deref() == Some(&lease.bundle_digest) {
-            return self.accept(lease, response.body, before.applied_epoch, verdict, now);
+            return self.accept(
+                lease,
+                response.body,
+                before.applied_epoch,
+                verdict,
+                None,
+                now,
+            );
         }
         let bundle_response = match self.http.get(&format!(
             "/worker/security/v2/bundles/{}",
@@ -544,6 +575,7 @@ impl PolicyApplier<'_> {
         let Some(bundle_signed_at) = bundle_signed_at else {
             return self.refuse(&lease, RefusalCode::SignatureRejected, now);
         };
+        let after_lease_trust = self.state.snapshot();
         let bundle_verdict = self.verifier.verify(PolicyVerifyInput {
             envelope: &bundle_envelope,
             payload: &bundle_bytes,
@@ -551,7 +583,7 @@ impl PolicyApplier<'_> {
             purpose: ArtifactPurpose::PolicyBundle,
             signed_at: &bundle_signed_at,
             now,
-            persisted: &before,
+            persisted: &after_lease_trust,
         });
         if bundle_verdict.status != TrustStatus::Verified {
             let code = if bundle_verdict.status == TrustStatus::Unavailable {
@@ -561,6 +593,7 @@ impl PolicyApplier<'_> {
             };
             return self.refuse(&lease, code, now);
         }
+        self.persist_trust(bundle_verdict.clone(), now)?;
         let bundle: BundlePayload = match serde_json::from_slice(&bundle_bytes) {
             Ok(value) => value,
             Err(_) => return self.refuse(&lease, RefusalCode::UnsupportedSchema, now),
@@ -602,8 +635,105 @@ impl PolicyApplier<'_> {
             response.body,
             Some(bundle.epoch),
             bundle_verdict,
+            Some(bundle_response.body),
             now,
         )
+    }
+
+    fn revalidate_cached(&self, now: DateTime<Utc>) -> Result<bool, GitAiError> {
+        let mut state = self.state.snapshot();
+        let Some(accepted) = state
+            .accepted_leases
+            .iter()
+            .max_by_key(|lease| lease.issued_at)
+            .cloned()
+        else {
+            self.state.mark_validated();
+            return Ok(true);
+        };
+        let Ok(envelope) = serde_json::from_slice::<DsseEnvelope>(&accepted.signed_bytes) else {
+            return Ok(false);
+        };
+        let Some(payload) = decode_base64_strict(&envelope.payload, MAX_SIGNED_BYTES) else {
+            return Ok(false);
+        };
+        let Ok(lease) = serde_json::from_slice::<LeasePayload>(&payload) else {
+            return Ok(false);
+        };
+        if !valid_lease(&lease)
+            || lease.schema_version != "trackai.security-activation-lease/2"
+            || lease.tenant_id != self.identity.tenant_id
+            || state.enrolled_tenant_id.as_deref() != Some(lease.tenant_id.as_str())
+            || state.enrolled_machine_id.as_deref() != Some(lease.machine_id.as_str())
+            || !accepted_matches(&accepted, &lease)
+        {
+            return Ok(false);
+        }
+        let lease_verdict = self.verifier.verify(PolicyVerifyInput {
+            envelope: &envelope,
+            payload: &payload,
+            payload_type: LEASE_PAYLOAD_TYPE,
+            purpose: ArtifactPurpose::ActivationLease,
+            signed_at: &lease.issued_at.to_rfc3339(),
+            now,
+            persisted: &state,
+        });
+        if lease_verdict.status != TrustStatus::Verified {
+            return Ok(false);
+        }
+        advance_trust(&mut state, lease_verdict);
+        if accepted.mode == LeaseMode::Off {
+            self.state.replace(state, now)?;
+            return Ok(true);
+        }
+        let Some(bundle_signed_bytes) = state.applied_bundle_bytes.clone() else {
+            return Ok(false);
+        };
+        let Ok(bundle_envelope) = serde_json::from_slice::<DsseEnvelope>(&bundle_signed_bytes)
+        else {
+            return Ok(false);
+        };
+        let Some(bundle_bytes) = decode_base64_strict(&bundle_envelope.payload, MAX_SIGNED_BYTES)
+        else {
+            return Ok(false);
+        };
+        if hex_digest(&bundle_bytes) != accepted.bundle_digest {
+            return Ok(false);
+        }
+        let Ok(bundle) = serde_json::from_slice::<BundlePayload>(&bundle_bytes) else {
+            return Ok(false);
+        };
+        if !valid_bundle(&bundle)
+            || bundle.schema_version != "trackai.security-rule-bundle/1"
+            || bundle.numbat_pin != "20a5a52"
+            || bundle.tenant_id != self.identity.tenant_id
+            || state.applied_epoch != Some(bundle.epoch)
+            || state.applied_digest.as_deref() != Some(accepted.bundle_digest.as_str())
+        {
+            return Ok(false);
+        }
+        let bundle_verdict = self.verifier.verify(PolicyVerifyInput {
+            envelope: &bundle_envelope,
+            payload: &bundle_bytes,
+            payload_type: BUNDLE_PAYLOAD_TYPE,
+            purpose: ArtifactPurpose::PolicyBundle,
+            signed_at: &bundle.issued_at.to_rfc3339(),
+            now,
+            persisted: &state,
+        });
+        if bundle_verdict.status != TrustStatus::Verified {
+            return Ok(false);
+        }
+        let staged = self.stage_bundle(&bundle, &accepted.bundle_digest)?;
+        if self.checker.check(&staged.agent_dirs) != RulesCheck::Passed {
+            let _ = fs::remove_dir_all(staged.version_dir);
+            return Ok(false);
+        }
+        self.switch_current(&staged.version_dir)?;
+        self.prune_rules(&staged.version_dir)?;
+        advance_trust(&mut state, bundle_verdict);
+        self.state.replace(state, now)?;
+        Ok(true)
     }
 
     fn stage_bundle(
@@ -695,6 +825,7 @@ impl PolicyApplier<'_> {
         signed_bytes: Vec<u8>,
         epoch: Option<u64>,
         verdict: TrustVerdict,
+        bundle_signed_bytes: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<RefreshOutcome, GitAiError> {
         let mut state = self.state.snapshot();
@@ -719,6 +850,9 @@ impl PolicyApplier<'_> {
             state.applied_epoch = Some(epoch);
             state.applied_digest = Some(lease.bundle_digest.clone());
         }
+        if let Some(bundle_signed_bytes) = bundle_signed_bytes {
+            state.applied_bundle_bytes = Some(bundle_signed_bytes);
+        }
         advance_trust(&mut state, verdict);
         let body = acknowledgement(&lease.lease_id, &lease.bundle_digest, None);
         state.acknowledgements.insert(
@@ -726,6 +860,8 @@ impl PolicyApplier<'_> {
             PersistedAcknowledgement {
                 body: body.clone(),
                 sent: false,
+                attempts: 0,
+                next_retry_at: 0,
             },
         );
         self.state.replace(state, now)?;
@@ -743,6 +879,12 @@ impl PolicyApplier<'_> {
         now: DateTime<Utc>,
     ) -> Result<RefreshOutcome, GitAiError> {
         self.refuse_hint(Some(&lease.lease_id), Some(&lease.bundle_digest), code, now)
+    }
+
+    fn persist_trust(&self, verdict: TrustVerdict, now: DateTime<Utc>) -> Result<(), GitAiError> {
+        let mut state = self.state.snapshot();
+        advance_trust(&mut state, verdict);
+        self.state.replace(state, now)
     }
 
     fn refuse_unparsed(
@@ -778,6 +920,8 @@ impl PolicyApplier<'_> {
                 .or_insert(PersistedAcknowledgement {
                     body: body.clone(),
                     sent: false,
+                    attempts: 0,
+                    next_retry_at: 0,
                 });
             self.state.replace(state, now)?;
             self.send_ack(lease_id, &body, now)?;
@@ -789,32 +933,38 @@ impl PolicyApplier<'_> {
     }
 
     fn send_ack(&self, lease_id: &str, body: &Value, now: DateTime<Utc>) -> Result<(), GitAiError> {
-        if self
+        let existing = self
             .state
             .snapshot()
             .acknowledgements
             .get(lease_id)
-            .is_some_and(|ack| ack.sent)
+            .cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|ack| ack.sent || now.timestamp() < ack.next_retry_at)
         {
             return Ok(());
         }
-        let Ok(response) = self
+        let delivered = self
             .http
             .post_json("/worker/security/v2/acknowledgements", body)
-        else {
-            return Ok(());
-        };
-        if (200..300).contains(&response.status) {
-            let mut state = self.state.snapshot();
-            if let Some(ack) = state.acknowledgements.get_mut(lease_id) {
+            .is_ok_and(|response| (200..300).contains(&response.status));
+        let mut state = self.state.snapshot();
+        if let Some(ack) = state.acknowledgements.get_mut(lease_id) {
+            if delivered {
                 ack.sent = true;
+            } else {
+                let delay = crate::security::delivery_queue::FIRST_RETRY_DELAY_SECS
+                    .saturating_mul(1_u64 << ack.attempts.min(5));
+                ack.attempts = ack.attempts.saturating_add(1);
+                ack.next_retry_at = now.timestamp().saturating_add(delay as i64);
             }
-            self.state.replace(state, now)?;
         }
+        self.state.replace(state, now)?;
         Ok(())
     }
 
-    fn retry_acknowledgements(&self) -> Result<(), GitAiError> {
+    fn retry_acknowledgements(&self, now: DateTime<Utc>) -> Result<(), GitAiError> {
         let pending = self
             .state
             .snapshot()
@@ -823,7 +973,7 @@ impl PolicyApplier<'_> {
             .filter(|(_, ack)| !ack.sent)
             .collect::<Vec<_>>();
         for (lease_id, ack) in pending {
-            self.send_ack(&lease_id, &ack.body, Utc::now())?;
+            self.send_ack(&lease_id, &ack.body, now)?;
         }
         Ok(())
     }
@@ -909,6 +1059,17 @@ fn valid_lease(lease: &LeasePayload) -> bool {
         && (lease.mode == LeaseMode::Off || !lease.agents.is_empty())
         && (lease.mode != LeaseMode::Off || lease.agents.is_empty())
         && lease.expires_at > lease.issued_at
+}
+
+fn accepted_matches(accepted: &AcceptedLease, lease: &LeasePayload) -> bool {
+    accepted.lease_id == lease.lease_id
+        && accepted.bundle_digest == lease.bundle_digest
+        && accepted.issued_at == lease.issued_at
+        && accepted.expires_at == lease.expires_at
+        && accepted.data_settings == lease.data_settings
+        && accepted.mode == lease.mode
+        && accepted.agents == lease.agents
+        && accepted.day_one_scan == lease.day_one_scan
 }
 
 fn valid_bundle(bundle: &BundlePayload) -> bool {
@@ -1060,7 +1221,7 @@ mod tests {
             posts: Mutex::new(Vec::new()),
         };
         let state = LeaseStateStore::load(temp.path());
-        let verifier = verifier(2);
+        let initial_verifier = verifier(2);
         let checker = FakeChecker(RulesCheck::Passed);
         let apply = PolicyApplier {
             state_dir: temp.path().to_path_buf(),
@@ -1070,7 +1231,7 @@ mod tests {
             },
             state: &state,
             http: &http,
-            verifier: &verifier,
+            verifier: &initial_verifier,
             checker: &checker,
             lease_hint: None,
         };
@@ -1084,13 +1245,23 @@ mod tests {
         assert_eq!(http.posts.lock().unwrap().len(), 1);
         assert_eq!(state.current().unwrap().bundle_digest, digest);
         assert!(temp.path().join("rules/current/codex/rule.yaml").exists());
-        assert_eq!(
-            LeaseStateStore::load(temp.path())
-                .current()
-                .unwrap()
-                .lease_id,
-            "lease-1"
-        );
+        let restored = LeaseStateStore::load(temp.path());
+        assert!(restored.current().is_none());
+        let restart_verifier = verifier(2);
+        let restart = PolicyApplier {
+            state_dir: temp.path().to_path_buf(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &http,
+            verifier: &restart_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert_eq!(restored.current().unwrap().lease_id, "lease-1");
     }
 
     #[test]
@@ -1283,5 +1454,142 @@ mod tests {
             }
         ));
         assert_eq!(http.posts.lock().unwrap()[0]["lease_id"], "lease-hint");
+    }
+
+    #[test]
+    fn refused_lease_advances_trust_and_is_never_acknowledged_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, _, now, _) = fixture("machine-b", "monitor");
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            PLATFORM_SCOPE.to_string(),
+            crate::trust::TrustedDocumentRef {
+                version: 2,
+                digest: format!("sha256:{}", "c".repeat(64)),
+            },
+        );
+        let verdict = TrustVerdict {
+            status: TrustStatus::Verified,
+            code: TrustCode::Verified,
+            keyid: None,
+            trusted: Some(trusted),
+            trusted_time: Some(now.to_rfc3339()),
+        };
+        let first_verifier = FakeVerifier(Mutex::new(VecDeque::from([verdict])));
+        let checker = FakeChecker(RulesCheck::Passed);
+        let state = LeaseStateStore::load(temp.path());
+        let first = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &first_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            first.refresh(now).unwrap(),
+            RefreshOutcome::Refused {
+                code: RefusalCode::MachineMismatch,
+                ..
+            }
+        ));
+        assert_eq!(state.snapshot().last_trusted[PLATFORM_SCOPE].version, 2);
+        assert_eq!(
+            state.snapshot().trusted_time_floor.as_deref(),
+            Some(now.to_rfc3339().as_str())
+        );
+        let second_verifier = verifier(1);
+        let second = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-b".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &second_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert_eq!(second.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert_eq!(http.posts.lock().unwrap().len(), 1);
+        assert!(state.current().is_none());
+    }
+
+    #[test]
+    fn tampered_persisted_state_is_discarded_before_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let initial_verifier = verifier(2);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &initial_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            apply.refresh(now).unwrap(),
+            RefreshOutcome::Applied { .. }
+        ));
+        let mut persisted: Value =
+            serde_json::from_slice(&fs::read(state.state_path()).unwrap()).unwrap();
+        persisted["accepted_leases"][0]["bundle_digest"] = Value::String("d".repeat(64));
+        fs::write(state.state_path(), serde_json::to_vec(&persisted).unwrap()).unwrap();
+        let restored = LeaseStateStore::load(temp.path());
+        let no_lease = FakeHttp {
+            lease: HttpResponse {
+                status: 404,
+                body: serde_json::to_vec(&json!({"code":"SECURITY_V2_LEASE_NOT_ISSUED"})).unwrap(),
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let cached_verifier = verifier(2);
+        let restart = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &restored,
+            http: &no_lease,
+            verifier: &cached_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert!(restored.current().is_none());
+        assert!(restored.snapshot().accepted_leases.is_empty());
     }
 }
