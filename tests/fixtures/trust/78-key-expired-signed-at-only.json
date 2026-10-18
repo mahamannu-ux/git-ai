@@ -1,0 +1,49 @@
+{
+  "vector_version": 1,
+  "name": "key-expired-signed-at-only",
+  "description": "Active key past not_after at now; signedAt inside its validity is only a claim.",
+  "input": {
+    "payload_type": "application/vnd.in-toto+json",
+    "payload_b64": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJub3RlIjoic3ludGhldGljIHRydXN0IHZlY3RvciBzdGF0ZW1lbnQifQ==",
+    "envelope": {
+      "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJub3RlIjoic3ludGhldGljIHRydXN0IHZlY3RvciBzdGF0ZW1lbnQifQ==",
+      "payloadType": "application/vnd.in-toto+json",
+      "signatures": [
+        {
+          "keyid": "sha256:5963e86dfaec51dffdfc0cb409e9ebe3a5933ccb58f8f8b12a6bc8776f9c181c",
+          "sig": "MEUCIQDqRUEOb3vV7AQ8Ymhl8iTIHnxnXigRcqlc5iTI/PGIUgIgMIIZVstGI7QwtireR6Pb5MQFRkJZ0uuwr8DxEC/U0Xg="
+        }
+      ]
+    },
+    "purpose": "statement",
+    "audience": "0a0a0a0a-0000-4000-8000-00000000000a",
+    "signed_at": "2026-10-16T00:00:00.000Z",
+    "state": {
+      "pinned_root_keyids": [],
+      "pinned_root_threshold": 1,
+      "root_documents": [],
+      "keyset_documents": {},
+      "last_trusted": {},
+      "now": "2026-10-20T12:00:00.000Z",
+      "clock_skew_ms": 300000,
+      "production": true,
+      "allow_unpinned_root": false,
+      "customer_pins": {
+        "0a0a0a0a-0000-4000-8000-00000000000a": [
+          {
+            "keyid": "sha256:5963e86dfaec51dffdfc0cb409e9ebe3a5933ccb58f8f8b12a6bc8776f9c181c",
+            "purpose": "statement",
+            "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEXRzarM5j5H9JIP20QPTm4AbVqWkcE1mNyM+4BNOGTnvSZaspVGevZ5cxs0xh0LT99hpN8qSczfjCn420yx+hEA==",
+            "not_before": "2026-10-15T00:00:00.000Z",
+            "not_after": "2026-10-18T00:00:00.000Z",
+            "status": "active"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "status": "rejected",
+    "code": "ATTESTA_TRUST_KEY_NOT_VALID_AT"
+  }
+}
