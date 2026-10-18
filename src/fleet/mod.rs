@@ -457,7 +457,7 @@ pub fn parse_and_validate(
     }
     let envelope: ConfigurationEnvelope =
         serde_json::from_slice(raw).map_err(|_| AcknowledgementResult::RejectedInvalid)?;
-    if !matches!(envelope.schema_version(), 1 | 2 | 3)
+    if !matches!(envelope.schema_version(), 1..=3)
         || envelope.epoch() == 0
         || !valid_uuid(envelope.configuration_id())
         || envelope

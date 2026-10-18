@@ -233,16 +233,17 @@ impl RulesChecker for NumbatRulesChecker {
 }
 
 pub trait PolicyTrustVerifier: Send + Sync {
-    fn verify(
-        &self,
-        envelope: &DsseEnvelope,
-        payload: &[u8],
-        payload_type: &str,
-        purpose: ArtifactPurpose,
-        signed_at: &str,
-        now: DateTime<Utc>,
-        persisted: &DurableSecurityState,
-    ) -> TrustVerdict;
+    fn verify(&self, input: PolicyVerifyInput<'_>) -> TrustVerdict;
+}
+
+pub struct PolicyVerifyInput<'a> {
+    pub envelope: &'a DsseEnvelope,
+    pub payload: &'a [u8],
+    pub payload_type: &'a str,
+    pub purpose: ArtifactPurpose,
+    pub signed_at: &'a str,
+    pub now: DateTime<Utc>,
+    pub persisted: &'a DurableSecurityState,
 }
 
 pub struct FileTrustVerifier {
@@ -280,16 +281,7 @@ impl FileTrustVerifier {
 }
 
 impl PolicyTrustVerifier for FileTrustVerifier {
-    fn verify(
-        &self,
-        envelope: &DsseEnvelope,
-        payload: &[u8],
-        payload_type: &str,
-        purpose: ArtifactPurpose,
-        signed_at: &str,
-        now: DateTime<Utc>,
-        persisted: &DurableSecurityState,
-    ) -> TrustVerdict {
+    fn verify(&self, input: PolicyVerifyInput<'_>) -> TrustVerdict {
         let root_documents = Self::load_documents(&self.trust_dir.join("root.json"));
         let mut keyset_documents = BTreeMap::new();
         if let Ok(entries) = fs::read_dir(&self.trust_dir) {
@@ -305,12 +297,12 @@ impl PolicyTrustVerifier for FileTrustVerifier {
             }
         }
         verify_trusted(&VerifyTrustedInput {
-            payload_type: payload_type.to_string(),
-            payload: payload.to_vec(),
-            envelope: envelope.clone(),
-            purpose,
+            payload_type: input.payload_type.to_string(),
+            payload: input.payload.to_vec(),
+            envelope: input.envelope.clone(),
+            purpose: input.purpose,
             audience: PLATFORM_SCOPE.to_string(),
-            signed_at: signed_at.to_string(),
+            signed_at: input.signed_at.to_string(),
             time_evidence: None,
             state: TrustState {
                 pinned_root_keyids: self.pins(),
@@ -318,9 +310,11 @@ impl PolicyTrustVerifier for FileTrustVerifier {
                 root_documents,
                 keyset_documents,
                 customer_pins: None,
-                last_trusted: persisted.last_trusted.clone(),
-                now: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                trusted_time_floor: persisted.trusted_time_floor.clone(),
+                last_trusted: input.persisted.last_trusted.clone(),
+                now: input
+                    .now
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                trusted_time_floor: input.persisted.trusted_time_floor.clone(),
                 clock_skew_ms: None,
                 production: true,
                 allow_unpinned_root: None,
@@ -419,15 +413,15 @@ impl PolicyApplier<'_> {
             return self.refuse_hint(None, None, RefusalCode::SignatureRejected, now);
         };
         let before = self.state.snapshot();
-        let verdict = self.verifier.verify(
-            &envelope,
-            &payload,
-            LEASE_PAYLOAD_TYPE,
-            ArtifactPurpose::ActivationLease,
-            &signed_at,
+        let verdict = self.verifier.verify(PolicyVerifyInput {
+            envelope: &envelope,
+            payload: &payload,
+            payload_type: LEASE_PAYLOAD_TYPE,
+            purpose: ArtifactPurpose::ActivationLease,
+            signed_at: &signed_at,
             now,
-            &before,
-        );
+            persisted: &before,
+        });
         if verdict.status != TrustStatus::Verified {
             let code = if verdict.status == TrustStatus::Unavailable {
                 RefusalCode::VerificationUnavailable
@@ -504,15 +498,15 @@ impl PolicyApplier<'_> {
         let Some(bundle_signed_at) = bundle_signed_at else {
             return self.refuse(&lease, RefusalCode::SignatureRejected, now);
         };
-        let bundle_verdict = self.verifier.verify(
-            &bundle_envelope,
-            &bundle_bytes,
-            BUNDLE_PAYLOAD_TYPE,
-            ArtifactPurpose::PolicyBundle,
-            &bundle_signed_at,
+        let bundle_verdict = self.verifier.verify(PolicyVerifyInput {
+            envelope: &bundle_envelope,
+            payload: &bundle_bytes,
+            payload_type: BUNDLE_PAYLOAD_TYPE,
+            purpose: ArtifactPurpose::PolicyBundle,
+            signed_at: &bundle_signed_at,
             now,
-            &before,
-        );
+            persisted: &before,
+        });
         if bundle_verdict.status != TrustStatus::Verified {
             let code = if bundle_verdict.status == TrustStatus::Unavailable {
                 RefusalCode::VerificationUnavailable
@@ -789,14 +783,13 @@ fn advance_trust(state: &mut DurableSecurityState, verdict: TrustVerdict) {
             }
         }
     }
-    if let Some(time) = verdict.trusted_time {
-        if state
+    if let Some(time) = verdict.trusted_time
+        && state
             .trusted_time_floor
             .as_ref()
             .is_none_or(|floor| time >= *floor)
-        {
-            state.trusted_time_floor = Some(time);
-        }
+    {
+        state.trusted_time_floor = Some(time);
     }
 }
 
@@ -924,16 +917,7 @@ mod tests {
     struct FakeVerifier(Mutex<VecDeque<TrustVerdict>>);
 
     impl PolicyTrustVerifier for FakeVerifier {
-        fn verify(
-            &self,
-            _: &DsseEnvelope,
-            _: &[u8],
-            _: &str,
-            _: ArtifactPurpose,
-            _: &str,
-            _: DateTime<Utc>,
-            _: &DurableSecurityState,
-        ) -> TrustVerdict {
+        fn verify(&self, _: PolicyVerifyInput<'_>) -> TrustVerdict {
             self.0
                 .lock()
                 .unwrap()
