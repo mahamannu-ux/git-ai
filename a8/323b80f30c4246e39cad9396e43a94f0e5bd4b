@@ -1,0 +1,19 @@
+src/security/lease_state.rs
+  s_614a018723afbe::t_d6b7a9a16f425a 1-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "a8323b80f30c4246e39cad9396e43a94f0e5bd4b",
+  "prompts": {},
+  "sessions": {
+    "s_614a018723afbe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14f00-52b1-7563-875b-e7576212aed2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
