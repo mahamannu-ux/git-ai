@@ -1,0 +1,21 @@
+src/security/lease_state.rs
+  s_614a018723afbe::t_cb23dd016c4cff 15,69-70,82-85,92,106,115,143-161,192-196,199-201,211-215,218-220,224-226,234-238,294-299,335
+src/security/policy_apply.rs
+  s_614a018723afbe::t_0b048730ccec74 150,199-208,210,213-226,435-438,496,501-503,537,540-547,578,586,596,638,643-738,828,853-855,863-864,884-889,923-924,936,941-944,948,951-954,956-960,963,967,976,1064-1074,1224,1234,1248-1264,1458-1594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "a5f22876a935171ed13024559228f1ea69f65ac8",
+  "prompts": {},
+  "sessions": {
+    "s_614a018723afbe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14f00-52b1-7563-875b-e7576212aed2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
