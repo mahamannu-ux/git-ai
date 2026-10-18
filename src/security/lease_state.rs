@@ -35,6 +35,8 @@ pub struct AcceptedLease {
     pub expires_at: DateTime<Utc>,
     pub data_settings: SecurityDataSettings,
     pub mode: LeaseMode,
+    pub agents: Vec<String>,
+    pub day_one_scan: bool,
     /// The exact DSSE JSON bytes returned by the server.
     pub signed_bytes: Vec<u8>,
 }
@@ -55,14 +57,25 @@ impl AcceptedLease {
 #[serde(deny_unknown_fields)]
 pub struct DurableSecurityState {
     #[serde(default)]
+    pub enrolled_tenant_id: Option<String>,
+    #[serde(default)]
+    pub enrolled_machine_id: Option<String>,
+    #[serde(default)]
     pub accepted_leases: Vec<AcceptedLease>,
     pub applied_epoch: Option<u64>,
     pub applied_digest: Option<String>,
     #[serde(default)]
-    pub acknowledgements: BTreeMap<String, bool>,
+    pub acknowledgements: BTreeMap<String, PersistedAcknowledgement>,
     #[serde(default)]
     pub last_trusted: BTreeMap<String, TrustedDocumentRef>,
     pub trusted_time_floor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedAcknowledgement {
+    pub body: serde_json::Value,
+    pub sent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +217,12 @@ mod tests {
             expires_at: Utc.timestamp_opt(expires, 0).unwrap(),
             data_settings: SecurityDataSettings::ALL_OFF,
             mode,
+            agents: if mode == LeaseMode::Off {
+                Vec::new()
+            } else {
+                vec!["codex".into()]
+            },
+            day_one_scan: false,
             signed_bytes: vec![id as u8],
         }
     }
