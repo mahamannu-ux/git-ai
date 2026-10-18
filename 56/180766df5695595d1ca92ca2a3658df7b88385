@@ -1,0 +1,19 @@
+src/security/policy_apply.rs
+  s_614a018723afbe::t_2c6935484ffdc1 393,397-419,526-530,961,981-984,989,1230-1231,1257,1378,1403,1407,1496-1539,1916,1920,1989-2019
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "56180766df5695595d1ca92ca2a3658df7b88385",
+  "prompts": {},
+  "sessions": {
+    "s_614a018723afbe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14f00-52b1-7563-875b-e7576212aed2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
