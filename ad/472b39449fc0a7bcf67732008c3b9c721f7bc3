@@ -1,0 +1,31 @@
+packaging/README.md
+  s_a560b75b87d1a8::t_fd734e3fe262b0 5-6,13-14
+src/security/delivery.rs
+  s_a560b75b87d1a8::t_2a8599d2e86c0b 104,130-132,177-182,226-228,252-257,271-273,287-293,475,505-510
+src/security/delivery_queue.rs
+  s_a560b75b87d1a8::t_6d553f32491a8c 35-50,82-87,123-172,237,315-323,571,593,634,653,663-698
+src/security/health.rs
+  s_a560b75b87d1a8::t_24d69371387aea 6,70-71,90-124,136-137,181-184,221-222,237-238,242-290
+src/security/policy_apply.rs
+  s_a560b75b87d1a8::t_12011f2cce9ffe 543,593-610,616,731-783,1754-1764,1768,1770,1800-1890
+src/security/shipper.rs
+  s_a560b75b87d1a8::t_4c285419f1342a 6,47-48,51-54,58,61-84,153-163,301-329
+tests/security_v2_contract.rs
+  s_a560b75b87d1a8::t_c8d990284af34b 25-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "ad472b39449fc0a7bcf67732008c3b9c721f7bc3",
+  "prompts": {},
+  "sessions": {
+    "s_a560b75b87d1a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a150a5-1916-7e53-82a6-84434f436e11",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
