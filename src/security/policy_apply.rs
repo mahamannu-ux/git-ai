@@ -596,6 +596,13 @@ impl PolicyApplier<'_> {
             match self.reconcile_current(&before, &lease) {
                 RulesCheck::Unavailable => return Ok(RefreshOutcome::Retry),
                 RulesCheck::Failed => {
+                    let stale_version = before.applied_epoch.and_then(|epoch| {
+                        lease.bundle_digest.get(..12).map(|prefix| {
+                            self.state_dir
+                                .join("rules")
+                                .join(format!("{epoch}-{prefix}"))
+                        })
+                    });
                     let mut state = self.state.snapshot();
                     state.applied_digest = None;
                     state.applied_epoch = None;
@@ -604,6 +611,13 @@ impl PolicyApplier<'_> {
                     before.applied_digest = None;
                     before.applied_epoch = None;
                     ensure_placeholder_current(&self.state_dir)?;
+                    if let Some(version_dir) = stale_version
+                        && fs::symlink_metadata(&version_dir)
+                            .ok()
+                            .is_some_and(|metadata| metadata.file_type().is_dir())
+                    {
+                        fs::remove_dir_all(version_dir)?;
+                    }
                 }
                 RulesCheck::Passed => {}
             }
@@ -613,7 +627,9 @@ impl PolicyApplier<'_> {
             .iter()
             .max_by_key(|entry| entry.issued_at)
         {
-            if newest.signed_bytes == response.body && before.applied_digest.is_some() {
+            if newest.signed_bytes == response.body
+                && (lease.mode == LeaseMode::Off || before.applied_digest.is_some())
+            {
                 return Ok(RefreshOutcome::NoChange);
             }
             if lease.issued_at < newest.issued_at {
@@ -765,10 +781,17 @@ impl PolicyApplier<'_> {
         {
             return RulesCheck::Failed;
         }
-        let Ok(staged) = self.stage_bundle(&bundle, &lease.bundle_digest) else {
+        // Validate the cached bytes against the signed bundle before checking
+        // the same folders that current will target.
+        if self.stage_bundle(&bundle, &lease.bundle_digest).is_err() {
             return RulesCheck::Failed;
-        };
-        let result = self.checker.check(&staged.agent_dirs);
+        }
+        let agent_dirs = bundle
+            .agents
+            .keys()
+            .map(|agent| version_dir.join(agent))
+            .collect::<Vec<_>>();
+        let result = self.checker.check(&agent_dirs);
         if result == RulesCheck::Passed
             && fs::read_link(self.state_dir.join("rules/current"))
                 .ok()
@@ -1746,6 +1769,10 @@ mod tests {
         assert_eq!(state.snapshot().applied_digest, None);
         assert_eq!(state.snapshot().applied_bundle_bytes, None);
         assert_eq!(http.posts.lock().unwrap().len(), 1);
+        assert_eq!(state.snapshot().accepted_leases.len(), 1);
+        assert_eq!(apply.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert_eq!(state.snapshot().accepted_leases.len(), 1);
+        assert_eq!(http.posts.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1852,6 +1879,25 @@ mod tests {
             first.refresh(now).unwrap(),
             RefreshOutcome::Applied { epoch: Some(1), .. }
         ));
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            expected
+        );
+
+        // A cached folder with changed bytes must be replaced from the bundle.
+        let rule_path = temp
+            .path()
+            .join("rules")
+            .join(&expected)
+            .join("codex/rule.yaml");
+        let original_rule = fs::read(&rule_path).unwrap();
+        fs::write(&rule_path, b"corrupted rule").unwrap();
+        ensure_placeholder_current(temp.path()).unwrap();
+        assert!(matches!(
+            first.refresh(now).unwrap(),
+            RefreshOutcome::Applied { epoch: Some(1), .. }
+        ));
+        assert_eq!(fs::read(&rule_path).unwrap(), original_rule);
         assert_eq!(
             fs::read_link(temp.path().join("rules/current")).unwrap(),
             expected

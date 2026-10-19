@@ -1,6 +1,6 @@
 # Task20h-a: what the Mac package does, and how to check it
 
-**Audience:** the founder running the first real Mac check. **Status:** implementation and local tests are complete; the Task20 lead review and the founder's live install are pending. This page is a walkthrough, not a record of a passed live test.
+**Audience:** the founder running the first real Mac check. **Status:** the Task20 lead cleared the host gate after the two follow-up fixes and local checks; the founder's live install is pending. This page is a walkthrough, not a record of a passed live test.
 
 ## The idea in one picture
 
