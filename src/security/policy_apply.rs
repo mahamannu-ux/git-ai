@@ -206,7 +206,7 @@ pub fn refresh_configured_security_policy(
         checker: &checker,
         lease_hint: hint,
     }
-    .refresh(now);
+    .refresh_with_clock(now, Utc::now);
     let mut guard = REFRESH
         .lock()
         .map_err(|_| GitAiError::Generic("security refresh lock poisoned".into()))?;
@@ -494,6 +494,14 @@ pub struct PolicyApplier<'a> {
 
 impl PolicyApplier<'_> {
     pub fn refresh(&self, now: DateTime<Utc>) -> Result<RefreshOutcome, GitAiError> {
+        self.refresh_with_clock(now, || now)
+    }
+
+    fn refresh_with_clock(
+        &self,
+        now: DateTime<Utc>,
+        validation_time: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<RefreshOutcome, GitAiError> {
         if !self.state.is_validated() && !self.revalidate_cached(now)? {
             self.state.discard_untrusted()?;
         }
@@ -521,6 +529,9 @@ impl PolicyApplier<'_> {
         if response.status != 200 {
             return Ok(RefreshOutcome::Retry);
         }
+        // The server can issue a new lease during this GET. Validate it against
+        // the time after the response, rather than the time before the request.
+        let now = validation_time();
         let envelope: DsseEnvelope = match serde_json::from_slice(&response.body) {
             Ok(value) => value,
             Err(_) => return self.refuse_unparsed(RefusalCode::SignatureRejected, now),
@@ -2047,6 +2058,50 @@ mod tests {
         assert_eq!(second.refresh(now).unwrap(), RefreshOutcome::NoChange);
         assert_eq!(http.posts.lock().unwrap().len(), 1);
         assert!(state.current().is_none());
+    }
+
+    #[test]
+    fn newly_issued_lease_uses_time_after_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+        let signed: DsseEnvelope = serde_json::from_slice(&lease).unwrap();
+        let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+        let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+        let issued_at = now + chrono::Duration::milliseconds(100);
+        payload["issued_at"] = json!(issued_at.to_rfc3339());
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE),
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let verifier = verifier(2);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            apply
+                .refresh_with_clock(now, || issued_at + chrono::Duration::milliseconds(100))
+                .unwrap(),
+            RefreshOutcome::Applied { epoch: Some(1), .. }
+        ));
+        assert_eq!(http.posts.lock().unwrap()[0]["result"], "applied");
     }
 
     #[test]
