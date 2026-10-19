@@ -1,0 +1,19 @@
+src/security/policy_apply.rs
+  s_a560b75b87d1a8::t_18df3ac7c26f63 209,497-504,532-534,2063-2106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "50d29d36b48e8a94b7659571f6dd8e7b2a291d9e",
+  "prompts": {},
+  "sessions": {
+    "s_a560b75b87d1a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a150a5-1916-7e53-82a6-84434f436e11",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
