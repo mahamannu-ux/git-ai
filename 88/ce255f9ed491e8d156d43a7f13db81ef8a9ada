@@ -1,0 +1,35 @@
+mdm/macos/cleanup-endpoint.sh
+  s_a560b75b87d1a8::t_0be60f677ccbfe 5,8-9,11-13,18-20,25,27-28,43,50-63,76,81-90,94-121
+packaging/macos/build-pkg.sh
+  s_a560b75b87d1a8::t_5f09db44384989 6,14-16,24-26,31,33-38,41,44-47,58-76
+packaging/macos/scripts/postinstall
+  s_a560b75b87d1a8::t_156ece772899dc 11-13,23-27,40-75,78,82-91
+src/daemon/telemetry_worker.rs
+  s_a560b75b87d1a8::t_031c301557633e 31,487-499,503,511-514
+src/security/delivery_queue.rs
+  s_a560b75b87d1a8::t_dc1fd83ed7b7d7 101-128,452-475
+src/security/health.rs
+  s_a560b75b87d1a8::t_e158adb8ee612c 1-199
+src/security/mod.rs
+  s_a560b75b87d1a8::t_0ffcef622db882 6
+tests/mdm_scripts.rs
+  s_a560b75b87d1a8::t_7b266b274d2421 45-62,322-326
+tests/security_v2_contract.rs
+  s_a560b75b87d1a8::t_3515fce75a18c0 5,13-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "88ce255f9ed491e8d156d43a7f13db81ef8a9ada",
+  "prompts": {},
+  "sessions": {
+    "s_a560b75b87d1a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a150a5-1916-7e53-82a6-84434f436e11",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
