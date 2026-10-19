@@ -303,7 +303,7 @@ The measurement script uses a throwaway home and repository; it does not use eit
 
 ```sh
 cd /Users/manishmahajan/AIProjects/TrackAI-wt/Task20h-a-endpoint-package-install-gitai
-packaging/numbat/measure.sh \
+GIT_AI_MEASURE=1 sh packaging/numbat/measure.sh \
   packaging/numbat/out/numbat_v0.2.0-trackai.1_darwin_amd64/numbat \
   target/debug/git-ai
 ```

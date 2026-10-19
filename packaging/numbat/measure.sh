@@ -49,6 +49,9 @@ git_ai_bin=${2:-}
 if [ -z "$git_ai_bin" ] && [ -x "$HOME/.git-ai/bin/git-ai" ]; then
     git_ai_bin="$HOME/.git-ai/bin/git-ai"
 fi
+if [ -n "$git_ai_bin" ] && [ -x "$git_ai_bin" ]; then
+    git_ai_bin=$(CDPATH='' cd -- "$(dirname -- "$git_ai_bin")" && pwd)/$(basename -- "$git_ai_bin")
+fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/trackai-measure.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
