@@ -28,6 +28,7 @@ use crate::metrics::types::MetricEventId;
 use crate::metrics::{MetricEvent, MetricsBatch};
 use crate::observability::MAX_METRICS_PER_ENVELOPE;
 use crate::security::delivery::flush_configured_security_records;
+use crate::security::health::queue_configured_security_status;
 use crate::security::policy_apply::refresh_configured_security_policy;
 use crate::security::records::PermissionJoinTracker;
 use crate::security::shipper::poll_configured_security_records;
@@ -483,19 +484,33 @@ fn spawn_security_shipper_worker() {
             let joins = joins.clone();
             if let Err(error) = tokio::task::spawn_blocking(move || {
                 let now = chrono::Utc::now();
-                if let Err(error) = refresh_configured_security_policy(now) {
-                    tracing::warn!(%error, "security policy refresh failed");
-                }
+                let applied = match refresh_configured_security_policy(now) {
+                    Ok(crate::security::policy_apply::RefreshOutcome::Applied { .. }) => true,
+                    Ok(_) => false,
+                    Err(error) => {
+                        tracing::warn!(%error, "security policy refresh failed");
+                        false
+                    }
+                };
+                let binding =
+                    crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
+                        .ok()
+                        .flatten()
+                        .and_then(|runtime| runtime.fleet_binding().ok());
                 if let Ok(mut joins) = joins.lock()
                     && let Err(error) = poll_configured_security_records(
                         crate::security::activation::configured_lease_context(),
-                        None,
+                        binding.as_ref(),
                         &std::collections::HashMap::new(),
                         &mut joins,
                         now.timestamp() as u64,
                     )
                 {
                     tracing::warn!(%error, "security record polling failed");
+                }
+                if let Err(error) = queue_configured_security_status(now, applied, binding.as_ref())
+                {
+                    tracing::warn!(%error, "security status queue failed");
                 }
                 if let Err(error) = flush_configured_security_records(now.timestamp() as u64) {
                     tracing::warn!(%error, "security record delivery failed");

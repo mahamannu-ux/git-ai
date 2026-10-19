@@ -98,6 +98,34 @@ impl SecurityRecordQueue {
         self.legacy_rows_dropped
     }
 
+    /// Queue one Endpoint-generated projection without moving the Numbat tail.
+    pub fn enqueue_generated(
+        &self,
+        record: &ProjectedRecord,
+        binding: &MetricDeliveryHealthBinding,
+        queued_at: u64,
+    ) -> Result<(), GitAiError> {
+        validate_binding(binding)?;
+        self.connection.execute(
+            "INSERT INTO security_record_queue(
+                kind,record_id,projection_json,lease_id,queued_at,next_retry_at,
+                delivery_tenant_id,delivery_api_base_url,delivery_credential_key_id)
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8)
+             ON CONFLICT(record_id) DO NOTHING",
+            params![
+                record.kind,
+                record.record_id,
+                serde_json::to_string(&record.json)?,
+                record.lease_id,
+                sql_i64(queued_at, "timestamp")?,
+                binding.tenant_id,
+                binding.api_base_url,
+                binding.credential_key_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn checkpoint(&self) -> Result<TailCheckpoint, GitAiError> {
         self.connection
             .query_row(
@@ -419,6 +447,30 @@ mod tests {
             lease_id: "lease".into(),
             json: json!({"kind":"finding","record_id":format!("sha256:{}", "a".repeat(64))}),
         }
+    }
+
+    #[test]
+    fn generated_status_queues_without_advancing_numbat_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
+        let status = crate::security::records::project_security_status(
+            json!({
+                "observed_at":"2026-10-19T00:00:00Z",
+                "numbat_version":"v0.2.0-trackai.1",
+                "wired_agents":[],"active_bundle_digest":null,
+                "lease_id":null,"last_record_at":null,
+                "health":{"hook_status":"unavailable","agent_effective_view":"unavailable",
+                    "local_record":"unavailable","forwarder_ack":"unavailable"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        queue.enqueue_generated(&status, &binding(), 100).unwrap();
+        queue.enqueue_generated(&status, &binding(), 100).unwrap();
+        assert_eq!(queue.count(), 1);
+        assert_eq!(queue.checkpoint().unwrap().offset, 0);
     }
 
     #[test]

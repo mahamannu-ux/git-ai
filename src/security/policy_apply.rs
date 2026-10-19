@@ -1,6 +1,7 @@
 //! Fetch, verify, stage and acknowledge signed Endpoint security policy.
 
 use crate::error::GitAiError;
+use crate::security::activation::SecurityLeaseContext;
 use crate::security::lease_state::{
     AcceptedLease, DurableSecurityState, LeaseMode, LeaseStateStore, PersistedAcknowledgement,
 };
@@ -24,6 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const LEASE_PAYLOAD_TYPE: &str = "application/vnd.trackai.security-activation-lease+json";
 pub const BUNDLE_PAYLOAD_TYPE: &str = "application/vnd.trackai.security-rule-bundle+json";
 pub const SECURITY_STATE_DIR: &str = "security";
+pub const NUMBAT_ADMIN_BINARY: &str = "/Library/Application Support/TrackAI/Endpoint/bin/numbat";
+const PLACEHOLDER_RULE: &str = include_str!("../../packaging/macos/placeholder.yaml");
+pub const MANAGED_AGENT_MAP: &str = include_str!("../../packaging/macos/agents.tsv");
 const MAX_SIGNED_BYTES: usize = 4 * 1024 * 1024 + 1024;
 const PINNED_ROOT_KEYIDS: &[&str] = &[];
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +154,13 @@ pub fn refresh_configured_security_policy(
     now: DateTime<Utc>,
 ) -> Result<RefreshOutcome, GitAiError> {
     static REFRESH: Mutex<(i64, Option<String>, u32)> = Mutex::new((0, None, 0));
+    let state_dir = crate::config::internal_dir_path()
+        .ok_or_else(|| GitAiError::Generic("security state directory unavailable".into()))?
+        .join(SECURITY_STATE_DIR);
+    let state = crate::security::activation::configured_lease_context();
+    if state.lease_at(now).is_none() {
+        ensure_placeholder_current(&state_dir)?;
+    }
     let Some(runtime) = crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
         .map_err(|error| GitAiError::Generic(error.to_string()))?
     else {
@@ -174,9 +185,6 @@ pub fn refresh_configured_security_policy(
             return Ok(RefreshOutcome::NoChange);
         }
     }
-    let state_dir = crate::config::internal_dir_path()
-        .ok_or_else(|| GitAiError::Generic("security state directory unavailable".into()))?
-        .join(SECURITY_STATE_DIR);
     let http = ManagedPolicyHttp {
         base_url: binding.api_base_url,
         credential,
@@ -245,9 +253,8 @@ pub struct NumbatRulesChecker {
 
 impl NumbatRulesChecker {
     pub fn installed() -> Self {
-        let binary = dirs::home_dir()
-            .map(|home| home.join(".git-ai/bin/numbat"))
-            .filter(|path| path.is_file());
+        let binary = PathBuf::from(NUMBAT_ADMIN_BINARY);
+        let binary = binary.is_file().then_some(binary);
         Self { binary }
     }
 
@@ -284,6 +291,36 @@ impl RulesChecker for NumbatRulesChecker {
         }
         RulesCheck::Passed
     }
+}
+
+/// Keep hook callbacks loadable before a bundle and whenever no verified lease
+/// is active. The one enabled predicate can never match or enforce an action.
+pub fn ensure_placeholder_current(state_dir: &Path) -> Result<(), GitAiError> {
+    let rules = state_dir.join("rules");
+    let placeholder = rules.join("placeholder");
+    for agent in MANAGED_AGENT_MAP
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+    {
+        let directory = placeholder.join(agent);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("placeholder.yaml");
+        if fs::read_to_string(&path).ok().as_deref() != Some(PLACEHOLDER_RULE) {
+            fs::write(path, PLACEHOLDER_RULE)?;
+        }
+    }
+    let current = rules.join("current");
+    if fs::read_link(&current).ok().as_deref() == Some(Path::new("placeholder")) {
+        return Ok(());
+    }
+    let pending = rules.join("current.next");
+    let _ = fs::remove_file(&pending);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("placeholder", &pending)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&placeholder, &pending)?;
+    fs::rename(pending, current)?;
+    Ok(())
 }
 
 pub trait PolicyTrustVerifier: Send + Sync {
@@ -459,6 +496,9 @@ impl PolicyApplier<'_> {
     pub fn refresh(&self, now: DateTime<Utc>) -> Result<RefreshOutcome, GitAiError> {
         if !self.state.is_validated() && !self.revalidate_cached(now)? {
             self.state.discard_untrusted()?;
+        }
+        if self.state.lease_at(now).is_none() {
+            ensure_placeholder_current(&self.state_dir)?;
         }
         self.retry_acknowledgements(now)?;
         let response = match self.http.get("/worker/security/v2/lease") {
@@ -748,6 +788,7 @@ impl PolicyApplier<'_> {
             state.applied_digest = None;
             state.applied_bundle_bytes = None;
             self.state.replace(state, now)?;
+            ensure_placeholder_current(&self.state_dir)?;
             return Ok(true);
         }
         let Some(bundle_signed_bytes) = state.applied_bundle_bytes.clone() else {
@@ -819,6 +860,7 @@ impl PolicyApplier<'_> {
             },
             now,
         )?;
+        ensure_placeholder_current(&self.state_dir)?;
         Ok(true)
     }
 
@@ -919,7 +961,10 @@ impl PolicyApplier<'_> {
         for entry in fs::read_dir(&rules)? {
             let entry = entry?;
             let path = entry.path();
-            if matches!(entry.file_name().to_str(), Some("current" | "current.next")) {
+            if matches!(
+                entry.file_name().to_str(),
+                Some("current" | "current.next" | "placeholder")
+            ) {
                 continue;
             }
             if !path.is_dir() || path == keep {
@@ -968,6 +1013,7 @@ impl PolicyApplier<'_> {
             state.applied_epoch = None;
             state.applied_digest = None;
             state.applied_bundle_bytes = None;
+            ensure_placeholder_current(&self.state_dir)?;
         }
         if let Some(epoch) = epoch {
             state.applied_epoch = Some(epoch);
@@ -1450,6 +1496,11 @@ mod tests {
         };
         assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
         assert_eq!(restored.current().unwrap().lease_id, "lease-1");
+        let _ = restart.refresh(now + chrono::Duration::hours(2)).unwrap();
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            PathBuf::from("placeholder")
+        );
     }
 
     #[test]
@@ -1612,6 +1663,14 @@ mod tests {
             RefreshOutcome::Applied { epoch: None, .. }
         ));
         assert!(state.current().is_none());
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            PathBuf::from("placeholder")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("rules/current/copilot/placeholder.yaml")).unwrap(),
+            PLACEHOLDER_RULE
+        );
         assert_eq!(state.snapshot().applied_epoch, None);
         assert_eq!(state.snapshot().applied_digest, None);
         assert_eq!(state.snapshot().applied_bundle_bytes, None);
@@ -1938,6 +1997,7 @@ mod tests {
         };
         apply.refresh(now).unwrap();
         let installed = temp.path().join("rules/current/codex/rule.yaml");
+        let installed_version = fs::canonicalize(&installed).unwrap();
         let installed_bytes = fs::read(&installed).unwrap();
 
         let mut trusted = BTreeMap::new();
@@ -1981,7 +2041,11 @@ mod tests {
             lease_hint: None,
         };
         assert_eq!(restart.refresh(now).unwrap(), RefreshOutcome::NoChange);
-        assert_eq!(fs::read(installed).unwrap(), installed_bytes);
+        assert_eq!(fs::read(installed_version).unwrap(), installed_bytes);
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            PathBuf::from("placeholder")
+        );
         assert_eq!(restored.snapshot().last_trusted[PLATFORM_SCOPE].version, 7);
         assert!(restored.snapshot().accepted_leases.is_empty());
         assert!(restored.snapshot().acknowledgements["lease-1"].sent);

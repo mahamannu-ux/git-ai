@@ -2,6 +2,7 @@
 mod security_v2_schema;
 
 use chrono::{TimeZone, Utc};
+use git_ai::security::health::build_security_status;
 use git_ai::security::records::{
     PermissionJoinTracker, ProjectedRecord, ProjectionLease, SecurityDataSettings,
     project_agent_inventory, project_numbat_record, project_security_status,
@@ -9,6 +10,23 @@ use git_ai::security::records::{
 use security_v2_schema::{fixture, validates};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::path::Path;
+
+#[test]
+fn generated_endpoint_status_matches_frozen_upload_contract() {
+    let schema = fixture("security-upload-v2.schema.json");
+    let temp = tempfile::tempdir().unwrap();
+    let fields = build_security_status(
+        Utc.timestamp_opt(1_760_698_800, 0).unwrap(),
+        &temp.path().join("missing-numbat"),
+        Path::new("/nonexistent/records.ndjson"),
+        "lease-placeholder",
+        Some(&"a".repeat(64)),
+    );
+    let record = project_security_status(fields).unwrap();
+    let upload = json!({"schema_version":"trackai.security-upload/2","records":[record.json]});
+    assert!(validates(&schema, &upload));
+}
 
 fn lease() -> ProjectionLease {
     let mut data_settings = SecurityDataSettings::ALL_OFF;
