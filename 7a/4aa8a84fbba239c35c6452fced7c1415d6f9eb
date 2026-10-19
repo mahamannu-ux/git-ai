@@ -1,0 +1,21 @@
+packaging/macos/FOUNDER_WALKTHROUGH.md
+  s_a560b75b87d1a8::t_27cac380b2d5a3 3
+src/security/policy_apply.rs
+  s_a560b75b87d1a8::t_c220c5200c31ff 599-605,614-620,630-632,784-786,788-794,1772-1775,1887-1905
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "7a4aa8a84fbba239c35c6452fced7c1415d6f9eb",
+  "prompts": {},
+  "sessions": {
+    "s_a560b75b87d1a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a150a5-1916-7e53-82a6-84434f436e11",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
