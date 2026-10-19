@@ -3,7 +3,7 @@
 use crate::error::GitAiError;
 use crate::metrics::delivery::MetricDeliveryHealthBinding;
 use crate::security::activation::{SecurityLeaseContext, configured_lease_context};
-use crate::security::delivery_queue::SecurityRecordQueue;
+use crate::security::delivery_queue::{SecurityHealthEvidence, SecurityRecordQueue};
 use crate::security::policy_apply::{MANAGED_AGENT_MAP, NUMBAT_ADMIN_BINARY};
 use crate::security::records::project_security_status;
 use crate::security::shipper::configured_records_path;
@@ -67,6 +67,8 @@ pub fn build_security_status(
     records: &Path,
     lease_id: &str,
     active_bundle_digest: Option<&str>,
+    installed_at: Option<i64>,
+    evidence: &SecurityHealthEvidence,
 ) -> Map<String, Value> {
     let statuses = managed_agents()
         .map(|(agent, source)| (source, hook_status(binary, agent)))
@@ -85,6 +87,41 @@ pub fn build_security_status(
     let active_digest = active_bundle_digest
         .filter(|digest| digest.len() == 64)
         .map_or(Value::Null, |digest| json!(digest));
+    let recent = |timestamp: i64| {
+        timestamp >= now.timestamp().saturating_sub(86_400) && timestamp <= now.timestamp()
+    };
+    let file_modified_at = fs::metadata(records)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|modified| DateTime::<Utc>::from(modified).timestamp());
+    let local_record = if evidence
+        .last_valid_record_at
+        .is_some_and(|at| recent(at) && installed_at.is_some_and(|installed| at >= installed))
+    {
+        "ok"
+    } else if evidence.last_rejected_record_at.is_some_and(|at| {
+        recent(at)
+            && installed_at.is_some_and(|installed| {
+                at >= installed && file_modified_at.is_some_and(|modified| modified >= installed)
+            })
+    }) {
+        "failed"
+    } else {
+        "unavailable"
+    };
+    let forwarder_ack = if evidence.last_refusal_at.is_some_and(|refused| {
+        evidence.last_refusal_code.is_some()
+            && evidence.last_acked_at.is_none_or(|acked| refused > acked)
+    }) || evidence
+        .oldest_numbat_queued_at
+        .is_some_and(|queued| now.timestamp().saturating_sub(queued) > 86_400)
+    {
+        "failed"
+    } else if evidence.last_acked_at.is_some_and(recent) {
+        "ok"
+    } else {
+        "unavailable"
+    };
     let fields = json!({
         "observed_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),
         "numbat_version": numbat_version(binary),
@@ -96,10 +133,8 @@ pub fn build_security_status(
             "hook_status": hook_layer,
             // No agent-independent API proves an installed hook is effective.
             "agent_effective_view": "unavailable",
-            // File existence does not prove a known action produced the record.
-            "local_record": "unavailable",
-            // Task20e does not retain a per-record remote acknowledgement.
-            "forwarder_ack": "unavailable"
+            "local_record": local_record,
+            "forwarder_ack": forwarder_ack
         }
     });
     fields.as_object().cloned().expect("status fields object")
@@ -143,6 +178,10 @@ pub fn queue_configured_security_status(
         &configured_records_path()?,
         &lease.lease_id,
         active_digest,
+        fs::read_to_string(config.internal_dir.join("security/hooks-installed-at"))
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+        &queue.health_evidence()?,
     );
     let record = project_security_status(fields)
         .ok_or_else(|| GitAiError::Generic("security status projection failed".into()))?;
@@ -179,6 +218,8 @@ mod tests {
             &temp.path().join("missing-records"),
             "lease",
             Some(&"a".repeat(64)),
+            None,
+            &SecurityHealthEvidence::default(),
         );
         let health = &fields["health"];
         assert_eq!(health["hook_status"], "unavailable");
@@ -193,7 +234,58 @@ mod tests {
             &temp.path().join("missing-records"),
             "lease",
             None,
+            None,
+            &SecurityHealthEvidence::default(),
         );
         assert!(placeholder["active_bundle_digest"].is_null());
+    }
+
+    #[test]
+    fn recent_tail_and_remote_evidence_distinguish_ok_failed_and_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let timestamp = now.timestamp();
+        let records = temp.path().join("records.ndjson");
+        fs::write(&records, b"rejected line\n").unwrap();
+        let status = |evidence: &SecurityHealthEvidence| {
+            build_security_status(
+                now,
+                &temp.path().join("missing-numbat"),
+                &records,
+                "lease",
+                None,
+                Some(timestamp - 60),
+                evidence,
+            )
+        };
+        let green = status(&SecurityHealthEvidence {
+            last_valid_record_at: Some(timestamp - 10),
+            last_acked_at: Some(timestamp),
+            ..Default::default()
+        });
+        assert_eq!(green["health"]["local_record"], "ok");
+        assert_eq!(green["health"]["forwarder_ack"], "ok");
+
+        let rejected = status(&SecurityHealthEvidence {
+            last_rejected_record_at: Some(timestamp - 10),
+            last_refusal_at: Some(timestamp),
+            last_refusal_code: Some("SECURITY_V2_RECORD_CONFLICT".into()),
+            ..Default::default()
+        });
+        assert_eq!(rejected["health"]["local_record"], "failed");
+        assert_eq!(rejected["health"]["forwarder_ack"], "failed");
+
+        let idle = status(&SecurityHealthEvidence {
+            last_valid_record_at: Some(timestamp - 100),
+            last_acked_at: Some(timestamp - 86_401),
+            ..Default::default()
+        });
+        assert_eq!(idle["health"]["local_record"], "unavailable");
+        assert_eq!(idle["health"]["forwarder_ack"], "unavailable");
+        let stuck = status(&SecurityHealthEvidence {
+            oldest_numbat_queued_at: Some(timestamp - 86_401),
+            ..Default::default()
+        });
+        assert_eq!(stuck["health"]["forwarder_ack"], "failed");
     }
 }

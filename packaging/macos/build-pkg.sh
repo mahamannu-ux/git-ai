@@ -62,7 +62,17 @@ done
 SUM_ENTRY="$(awk -v name="$(basename "$NUMBAT_DIR")/numbat" '$2 == name { print; count++ } END { if (count != 1) exit 1 }' "$(dirname "$NUMBAT_DIR")/SHA256SUMS")" || { echo "Numbat checksum entry missing or duplicated" >&2; exit 1; }
 ACTUAL_SHA="$(shasum -a 256 "$NUMBAT_DIR/numbat" | awk '{print $1}')"
 [ "${SUM_ENTRY%% *}" = "$ACTUAL_SHA" ] || { echo "Numbat checksum mismatch" >&2; exit 1; }
-printf '%s\n' "$SUM_ENTRY" > "$SCRIPTS/SHA256SUMS"
+printf '\nUnsigned reproducible Numbat SHA-256: %s\n' "$ACTUAL_SHA" >> "$SCRIPTS/PROVENANCE.txt"
+if [ -n "${APPLE_DEVELOPER_ID_APPLICATION_IDENTITY:-}" ]; then
+  sign_args=(--force --timestamp --options runtime --sign "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY")
+  if [ -n "${APPLE_APPLICATION_KEYCHAIN:-}" ]; then
+    sign_args+=(--keychain "$APPLE_APPLICATION_KEYCHAIN")
+  fi
+  codesign "${sign_args[@]}" "$SCRIPTS/numbat"
+  codesign --verify --strict --verbose=2 "$SCRIPTS/numbat"
+fi
+SIGNED_SHA="$(shasum -a 256 "$SCRIPTS/numbat" | awk '{print $1}')"
+printf '%s  %s/numbat\n' "$SIGNED_SHA" "$(basename "$NUMBAT_DIR")" > "$SCRIPTS/SHA256SUMS"
 install -m 0644 "$ROOT/packaging/macos/placeholder.yaml" "$SCRIPTS/placeholder.yaml"
 install -m 0644 "$ROOT/packaging/macos/agents.tsv" "$SCRIPTS/agents.tsv"
 mkdir -p "$SCRIPTS/trust"

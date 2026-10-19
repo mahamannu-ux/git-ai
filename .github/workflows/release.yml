@@ -461,6 +461,39 @@ jobs:
           set -euo pipefail
           python3 packaging/macos/unpack-release-trust.py
 
+      - name: Import Apple application certificate for Numbat
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64}" || -z "${APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD}" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "::warning::Numbat remains unsigned in this dry-run PKG."
+              exit 0
+            fi
+            echo "::error::Missing Apple Developer ID Application signing secrets."
+            exit 1
+          fi
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          APPLE_APPLICATION_KEYCHAIN="$GITHUB_WORKSPACE/application-signing.keychain"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$APPLE_APPLICATION_KEYCHAIN"
+          echo "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64" | base64 --decode > application-signing.p12
+          security import application-signing.p12 -k "$APPLE_APPLICATION_KEYCHAIN" -P "$APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f application-signing.p12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          APPLE_DEVELOPER_ID_APPLICATION_IDENTITY="$(security find-identity -v -p codesigning "$APPLE_APPLICATION_KEYCHAIN" | awk -F'"' '/Developer ID Application:/ { print $2; exit }')"
+          if [[ -z "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" ]]; then
+            echo "::error::Imported P12 does not contain a Developer ID Application signing identity."
+            exit 1
+          fi
+          echo "APPLE_APPLICATION_KEYCHAIN=$APPLE_APPLICATION_KEYCHAIN" >> "$GITHUB_ENV"
+          echo "APPLE_DEVELOPER_ID_APPLICATION_IDENTITY=$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" >> "$GITHUB_ENV"
+
       - name: Import Apple installer certificate
         shell: bash
         env:
@@ -637,6 +670,9 @@ jobs:
             mach_arch=arm64
             if [ "$arch" = x64 ]; then mach_arch=x86_64; fi
             lipo "$expanded/Scripts/numbat" -verify_arch "$mach_arch"
+            if [[ "${{ inputs.dry_run }}" != "true" ]]; then
+              codesign --verify --strict --verbose=2 "$expanded/Scripts/numbat"
+            fi
             expected_sha="$(awk 'NF == 2 && $2 ~ /\/numbat$/ {print $1}' "$expanded/Scripts/SHA256SUMS")"
             actual_sha="$(shasum -a 256 "$expanded/Scripts/numbat" | awk '{print $1}')"
             test -n "$expected_sha" && test "$expected_sha" = "$actual_sha"
@@ -645,7 +681,7 @@ jobs:
           console_user="$(/usr/bin/stat -f%Su /dev/console)"
           case "$console_user" in
             ''|root|loginwindow|_mbsetupuser)
-              echo "PKG payload verified; hosted runner has no console user for installation. IT-T20h-01 covers the live install."
+              echo "::warning::PKG payload verified; hosted runner has no console user for installation. IT-T20h-01 covers the live install."
               exit 0
               ;;
           esac

@@ -101,6 +101,7 @@ where
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
             let body = json!({"schema_version":"trackai.security-upload/2","records":values});
+            let has_numbat = batch.iter().any(|(record, _)| is_numbat_kind(&record.kind));
             let response = match upload(&binding, &credential, &body) {
                 Ok(response) => response,
                 Err(_) => {
@@ -126,6 +127,9 @@ where
                         .as_deref()
                         .unwrap_or("SECURITY_V2_PAYLOAD_TOO_LARGE");
                     queue.delete_counted(&[batch[0].0.id], code)?;
+                    if has_numbat {
+                        queue.record_upload_refusal(now, code)?;
+                    }
                     summary.dropped += 1;
                 } else {
                     let right = batch.split_off(batch.len() / 2);
@@ -170,6 +174,12 @@ where
                     .map(|(record, _)| record.id)
                     .collect::<Vec<_>>();
                 queue.delete_counted(&ids, problem_code.as_deref().unwrap_or("terminal"))?;
+                if has_numbat {
+                    queue.record_upload_refusal(
+                        now,
+                        problem_code.as_deref().unwrap_or("terminal"),
+                    )?;
+                }
                 summary.dropped += ids.len();
                 continue;
             }
@@ -213,6 +223,9 @@ where
                 summary.retrying += ids.len();
                 continue;
             }
+            if has_numbat {
+                queue.record_upload_ack(now)?;
+            }
             for (result, (record, value)) in envelope.results.iter().zip(batch.iter()) {
                 match (result.result.as_str(), result.code.as_deref()) {
                     ("accepted" | "duplicate", None) => {
@@ -236,6 +249,12 @@ where
                         } else {
                             queue
                                 .delete_counted(&[record.id], "SECURITY_V2_FIELD_NOT_PERMITTED")?;
+                            if is_numbat_kind(&record.kind) {
+                                queue.record_upload_refusal(
+                                    now,
+                                    "SECURITY_V2_FIELD_NOT_PERMITTED",
+                                )?;
+                            }
                             summary.dropped += 1;
                         }
                     }
@@ -249,6 +268,9 @@ where
                         ),
                     ) => {
                         queue.delete_counted(&[record.id], result.code.as_deref().unwrap())?;
+                        if is_numbat_kind(&record.kind) {
+                            queue.record_upload_refusal(now, result.code.as_deref().unwrap())?;
+                        }
                         summary.dropped += 1;
                     }
                     _ => {
@@ -260,6 +282,13 @@ where
         }
     }
     Ok(summary)
+}
+
+fn is_numbat_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "finding" | "enforcement" | "indicator" | "permission_event" | "scan_summary"
+    )
 }
 
 fn split_batches(
@@ -443,6 +472,7 @@ mod tests {
                 &refs,
                 &BTreeMap::new(),
                 10,
+                crate::security::delivery_queue::TailHealthObservation::default(),
             )
             .unwrap();
         (temp, queue)
@@ -472,6 +502,12 @@ mod tests {
         assert_eq!(result.delivered, 2);
         assert_eq!(result.dropped, 4);
         assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        let evidence = queue.health_evidence().unwrap();
+        assert_eq!(evidence.last_acked_at, Some(10));
+        assert_eq!(
+            evidence.last_refusal_code.as_deref(),
+            Some("SECURITY_V2_RECORD_CONFLICT")
+        );
     }
 
     #[test]

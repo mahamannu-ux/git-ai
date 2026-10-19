@@ -540,7 +540,7 @@ impl PolicyApplier<'_> {
         let Some(signed_at) = signed_at else {
             return self.refuse_unparsed(RefusalCode::SignatureRejected, now);
         };
-        let before = self.state.snapshot();
+        let mut before = self.state.snapshot();
         let verdict = self.verifier.verify(PolicyVerifyInput {
             envelope: &envelope,
             payload: &payload,
@@ -590,12 +590,30 @@ impl PolicyApplier<'_> {
         if !(lease.issued_at <= now && now < lease.expires_at) {
             return self.refuse(&lease, RefusalCode::LeaseExpired, now);
         }
+        if lease.mode != LeaseMode::Off
+            && before.applied_digest.as_deref() == Some(lease.bundle_digest.as_str())
+        {
+            match self.reconcile_current(&before, &lease) {
+                RulesCheck::Unavailable => return Ok(RefreshOutcome::Retry),
+                RulesCheck::Failed => {
+                    let mut state = self.state.snapshot();
+                    state.applied_digest = None;
+                    state.applied_epoch = None;
+                    state.applied_bundle_bytes = None;
+                    self.state.replace(state, now)?;
+                    before.applied_digest = None;
+                    before.applied_epoch = None;
+                    ensure_placeholder_current(&self.state_dir)?;
+                }
+                RulesCheck::Passed => {}
+            }
+        }
         if let Some(newest) = before
             .accepted_leases
             .iter()
             .max_by_key(|entry| entry.issued_at)
         {
-            if newest.signed_bytes == response.body {
+            if newest.signed_bytes == response.body && before.applied_digest.is_some() {
                 return Ok(RefreshOutcome::NoChange);
             }
             if lease.issued_at < newest.issued_at {
@@ -708,6 +726,59 @@ impl PolicyApplier<'_> {
             Some(bundle_response.body),
             now,
         )
+    }
+
+    /// A package upgrade or an expired lease may have moved current back to
+    /// placeholder without deleting the verified bundle metadata.
+    fn reconcile_current(&self, state: &DurableSecurityState, lease: &LeasePayload) -> RulesCheck {
+        let (Some(epoch), Some(signed)) = (state.applied_epoch, &state.applied_bundle_bytes) else {
+            return RulesCheck::Failed;
+        };
+        let Some(payload) = serde_json::from_slice::<DsseEnvelope>(signed)
+            .ok()
+            .and_then(|envelope| decode_base64_strict(&envelope.payload, MAX_SIGNED_BYTES))
+        else {
+            return RulesCheck::Failed;
+        };
+        if hex_digest(&payload) != lease.bundle_digest {
+            return RulesCheck::Failed;
+        }
+        let Ok(bundle) = serde_json::from_slice::<BundlePayload>(&payload) else {
+            return RulesCheck::Failed;
+        };
+        if bundle.epoch != epoch
+            || bundle.tenant_id != self.identity.tenant_id
+            || !valid_bundle(&bundle)
+        {
+            return RulesCheck::Failed;
+        }
+        let Some(prefix) = lease.bundle_digest.get(..12) else {
+            return RulesCheck::Failed;
+        };
+        let version_dir = self
+            .state_dir
+            .join("rules")
+            .join(format!("{epoch}-{prefix}"));
+        if !fs::symlink_metadata(&version_dir)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_dir())
+        {
+            return RulesCheck::Failed;
+        }
+        let Ok(staged) = self.stage_bundle(&bundle, &lease.bundle_digest) else {
+            return RulesCheck::Failed;
+        };
+        let result = self.checker.check(&staged.agent_dirs);
+        if result == RulesCheck::Passed
+            && fs::read_link(self.state_dir.join("rules/current"))
+                .ok()
+                .as_deref()
+                != version_dir.file_name().map(Path::new)
+            && self.switch_current(&version_dir).is_err()
+        {
+            return RulesCheck::Failed;
+        }
+        result
     }
 
     fn revalidate_cached(&self, now: DateTime<Utc>) -> Result<bool, GitAiError> {
@@ -1680,12 +1751,23 @@ mod tests {
     #[test]
     fn new_lease_reuses_already_applied_bundle_without_refetch() {
         let temp = tempfile::tempdir().unwrap();
-        let (lease, _, now, digest) = fixture("machine-a", "monitor");
+        let (lease, bundle, now, digest) = fixture("machine-a", "monitor");
+        let signed: DsseEnvelope = serde_json::from_slice(&bundle).unwrap();
+        let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+        let bundle_payload: BundlePayload = serde_json::from_slice(&payload).unwrap();
+        let version_dir = temp.path().join(format!("rules/1-{}", &digest[..12]));
+        fs::create_dir_all(version_dir.join("codex")).unwrap();
+        fs::write(
+            version_dir.join("codex/rule.yaml"),
+            b"id: test\nenabled: true\n",
+        )
+        .unwrap();
         let state = LeaseStateStore::from_state(
             temp.path(),
             DurableSecurityState {
-                applied_epoch: Some(1),
+                applied_epoch: Some(bundle_payload.epoch),
                 applied_digest: Some(digest),
+                applied_bundle_bytes: Some(bundle),
                 ..Default::default()
             },
         );
@@ -1715,6 +1797,97 @@ mod tests {
             apply.refresh(now).unwrap(),
             RefreshOutcome::Applied { epoch: Some(1), .. }
         ));
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            version_dir.file_name().unwrap()
+        );
+    }
+
+    #[test]
+    fn placeholder_after_reinstall_or_expiry_is_repaired_before_no_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, digest) = fixture("machine-a", "monitor");
+        let state = LeaseStateStore::load(temp.path());
+        let checker = FakeChecker(RulesCheck::Passed);
+        let first_http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease.clone(),
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let first_verifier = verifier(2);
+        let first = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &first_http,
+            verifier: &first_verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            first.refresh(now).unwrap(),
+            RefreshOutcome::Applied { .. }
+        ));
+        let expected = PathBuf::from(format!("1-{}", &digest[..12]));
+        ensure_placeholder_current(temp.path()).unwrap(); // postinstall reset
+        assert_eq!(first.refresh(now).unwrap(), RefreshOutcome::NoChange);
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            expected
+        );
+
+        // Losing the cached folder clears the applied marker and refetches it.
+        fs::remove_dir_all(temp.path().join("rules").join(&expected)).unwrap();
+        ensure_placeholder_current(temp.path()).unwrap();
+        assert!(matches!(
+            first.refresh(now).unwrap(),
+            RefreshOutcome::Applied { epoch: Some(1), .. }
+        ));
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            expected
+        );
+
+        // The old lease expires while offline; the next lease keeps its digest.
+        ensure_placeholder_current(temp.path()).unwrap();
+        let signed: DsseEnvelope = serde_json::from_slice(&lease).unwrap();
+        let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+        let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+        payload["lease_id"] = json!("lease-2");
+        payload["issued_at"] = json!((now + chrono::Duration::hours(2)).to_rfc3339());
+        payload["expires_at"] = json!((now + chrono::Duration::hours(3)).to_rfc3339());
+        let renewal = envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE);
+        let renewal_http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: renewal,
+            },
+            bundle: None,
+            posts: Mutex::new(Vec::new()),
+        };
+        let renewal_verifier = verifier(1);
+        let renew = PolicyApplier {
+            http: &renewal_http,
+            verifier: &renewal_verifier,
+            ..first
+        };
+        assert!(matches!(
+            renew.refresh(now + chrono::Duration::hours(2)).unwrap(),
+            RefreshOutcome::Applied { epoch: Some(1), .. }
+        ));
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            expected
+        );
     }
 
     #[test]

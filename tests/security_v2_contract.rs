@@ -22,6 +22,8 @@ fn generated_endpoint_status_matches_frozen_upload_contract() {
         Path::new("/nonexistent/records.ndjson"),
         "lease-placeholder",
         Some(&"a".repeat(64)),
+        None,
+        &git_ai::security::delivery_queue::SecurityHealthEvidence::default(),
     );
     let record = project_security_status(fields).unwrap();
     let upload = json!({"schema_version":"trackai.security-upload/2","records":[record.json]});

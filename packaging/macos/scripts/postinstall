@@ -52,6 +52,7 @@ for notice in LICENSE THIRD_PARTY_LICENSES.txt PROVENANCE.txt SHA256SUMS agents.
 done
 /usr/bin/install -d -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0700 "$SECURITY_DIR" "$RULES_DIR" "$RULES_DIR/placeholder" "$TRUST_DIR"
 while read -r numbat_agent source_agent; do
+  [ -n "$numbat_agent" ] || continue
   folder="$RULES_DIR/placeholder/$source_agent"
   /usr/bin/install -d -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0755 "$folder"
   /usr/bin/install -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0644 "$SCRIPT_DIR/placeholder.yaml" "$folder/placeholder.yaml"
@@ -88,5 +89,9 @@ while read -r numbat_agent source_agent; do
     --rules-dir "\$HOME/.git-ai/internal/security/rules/current/$source_agent" \
     --output-file '$HOME/.numbat/records.ndjson' || fail "managed hook install failed for $numbat_agent"
 done < "$SCRIPT_DIR/agents.tsv"
+
+/bin/date -u +%s > "$SECURITY_DIR/hooks-installed-at"
+/usr/sbin/chown "$CONSOLE_USER:$USER_GROUP" "$SECURITY_DIR/hooks-installed-at"
+/bin/chmod 0600 "$SECURITY_DIR/hooks-installed-at"
 
 exit 0
