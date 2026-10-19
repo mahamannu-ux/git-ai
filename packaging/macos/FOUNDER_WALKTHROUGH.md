@@ -66,6 +66,14 @@ test -f "$LIVE_DIR/private/credential.txt" && echo 'machine credential: ready'
 
 **1.3 Start the API with those matching development keys.** Keep this Terminal open while testing.
 
+First confirm port 8080 has no listener:
+
+```sh
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+```
+
+**Expected:** no output. If a process is listed, stop here; a `/health` response from that process would not prove the disposable API started.
+
 ```sh
 export SECURITY_POLICY_BUNDLE_CREDENTIAL_ID=dev:task20f-policy-bundle
 export SECURITY_DEV_POLICY_BUNDLE_KEY_FILE="$LIVE_DIR/private/policy.pem"
@@ -74,10 +82,11 @@ export SECURITY_DEV_ACTIVATION_LEASE_KEY_FILE="$LIVE_DIR/private/lease.pem"
 PORT=8080 node --import tsx apps/api/src/index.ts > "$LIVE_DIR/api.log" 2>&1 &
 export TASK20H_API_PID=$!
 sleep 3
+lsof -nP -a -p "$TASK20H_API_PID" -iTCP:8080 -sTCP:LISTEN
 curl -fsS http://127.0.0.1:8080/health
 ```
 
-**Expected:** JSON containing `"status":"ok"`. If not, inspect `$LIVE_DIR/api.log` locally and stop. Port 8080 must be free before this step.
+**Expected:** `lsof` lists `TASK20H_API_PID` listening on 8080, then JSON containing `"status":"ok"`. If either fails, inspect `$LIVE_DIR/api.log` locally and stop.
 
 **1.4 Copy only the guest's bootstrap files into a private shared folder.** Run this in Terminal A. macOS asks for your main administrator password. Do not display `credential.txt`.
 
