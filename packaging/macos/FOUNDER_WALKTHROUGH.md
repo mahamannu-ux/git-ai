@@ -185,6 +185,8 @@ wc -l "$HOME/.numbat/records.ndjson" 2>/dev/null || echo 'no local records yet'
 copilot
 ```
 
+If Copilot says **“You must be logged in to send messages”**, enter `/login` inside Copilot and complete sign-in as the guest. A login prompt or a `session.end` record alone does not complete this check.
+
 Ask: **“Run `pwd` here and report the directory. Do not edit files.”** Approve only that harmless action, then exit Copilot. Run:
 
 ```sh
