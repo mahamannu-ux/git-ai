@@ -57,13 +57,13 @@ while read -r numbat_agent source_agent; do
   /usr/bin/install -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0644 "$SCRIPT_DIR/placeholder.yaml" "$folder/placeholder.yaml"
   "$NUMBAT_BIN" rules check --no-builtin-rules --rules-dir "$folder" >/dev/null || fail "placeholder rule failed for $source_agent"
 done < "$SCRIPT_DIR/agents.tsv"
-if [ -L "$RULES_DIR/current" ] && [ ! -e "$RULES_DIR/current" ]; then
-  /bin/rm -f "$RULES_DIR/current"
+if [ -e "$RULES_DIR/current" ] && [ ! -L "$RULES_DIR/current" ]; then
+  fail "rules/current must be a symlink"
 fi
-if [ ! -e "$RULES_DIR/current" ]; then
-  /bin/ln -s placeholder "$RULES_DIR/current"
-  /usr/sbin/chown -h "$CONSOLE_USER:$USER_GROUP" "$RULES_DIR/current"
-fi
+/bin/rm -f "$RULES_DIR/current.next"
+/bin/ln -s placeholder "$RULES_DIR/current.next"
+/usr/sbin/chown -h "$CONSOLE_USER:$USER_GROUP" "$RULES_DIR/current.next"
+/bin/mv -f "$RULES_DIR/current.next" "$RULES_DIR/current"
 for document in "$SCRIPT_DIR/trust"/*.json; do
   [ -f "$document" ] || continue
   /usr/bin/install -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0600 "$document" "$TRUST_DIR/$(/usr/bin/basename "$document")"
