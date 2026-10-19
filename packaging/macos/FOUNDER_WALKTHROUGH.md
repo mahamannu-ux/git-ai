@@ -34,7 +34,7 @@ The package puts Numbat at `/Library/Application Support/TrackAI/Endpoint/bin/nu
 
 Use Fast User Switching to keep your main account signed in, but let ongoing Claude Code and Copilot CLI work finish before the package install. Their new managed hooks can also run in the main account, whose `$HOME` may have no test rule folders. Avoid new Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI actions in the main account until offboarding removes the machine-wide hooks. OpenCode is outside this five-agent install. Switching back to the main account does not remove the hooks.
 
-Run one code block at a time and check its **Expected** result before moving on. These commands use the standard macOS account `TrackAiMDMtest`. Keep the main account's **Terminal A** open until Step 7: leaving it deletes the disposable database. Never paste the generated private keys, machine credential, or raw Numbat records into chat.
+Run one code block at a time and check its **Expected** result before moving on. These commands use the standard macOS account whose short name is `trackaimdmtest` (macOS may lowercase the name entered when creating the account). Keep the main account's **Terminal A** open until Step 7: leaving it deletes the disposable database. Never paste the generated private keys, machine credential, or raw Numbat records into chat.
 
 ### 1. Prepare the local server and test identity — main account, Terminal A
 
@@ -82,15 +82,15 @@ curl -fsS http://127.0.0.1:8080/health
 **1.4 Copy only the guest's bootstrap files into a private shared folder.** Run this in Terminal A. macOS asks for your main administrator password. Do not display `credential.txt`.
 
 ```sh
-sudo install -d -o TrackAiMDMtest -g staff -m 0700 /Users/Shared/TrackAiMDMtest
-sudo install -o TrackAiMDMtest -g staff -m 0600 \
+sudo install -d -o trackaimdmtest -g staff -m 0700 /Users/Shared/TrackAiMDMtest
+sudo install -o trackaimdmtest -g staff -m 0600 \
   "$LIVE_DIR/private/bootstrap.json" /Users/Shared/TrackAiMDMtest/bootstrap.json
-sudo install -o TrackAiMDMtest -g staff -m 0600 \
+sudo install -o trackaimdmtest -g staff -m 0600 \
   "$LIVE_DIR/private/credential.txt" /Users/Shared/TrackAiMDMtest/credential.txt
 ls -ld /Users/Shared/TrackAiMDMtest
 ```
 
-**Expected:** the folder is owned by `TrackAiMDMtest`, with `drwx------` permissions. Its files are not in the package.
+**Expected:** the folder is owned by `trackaimdmtest`, with `drwx------` permissions. Its files are not in the package.
 
 ### 2. Build the Intel debug package — main account, Terminal B
 
@@ -113,18 +113,18 @@ ls -lh /Users/Shared/trackai-endpoint-debug-x64.pkg
 
 **Expected:** `go version go1.26.9 darwin/amd64`, `Built PKG: /Users/Shared/trackai-endpoint-debug-x64.pkg`, and a nonempty file. Stop on a pin, checksum or architecture failure. This **unsigned debug** package contains the Endpoint (`git-ai`), Numbat, public trust documents and a debug root pin. It contains no private signing key or machine credential.
 
-### 3. Install and wire the guest — `TrackAiMDMtest` Terminal
+### 3. Install and wire the guest — `trackaimdmtest` Terminal
 
-**3.1 Fast switch to `TrackAiMDMtest` and confirm its console session.** Postinstall selects the console user, so a wrong result here is a stop.
+**3.1 Fast switch to `trackaimdmtest` and confirm its console session.** Postinstall selects the console user, so a wrong result here is a stop.
 
 ```sh
 whoami
 /usr/bin/stat -f%Su /dev/console
-test "$(/usr/bin/stat -f%Su /dev/console)" = TrackAiMDMtest && echo 'console user: correct'
+test "$(/usr/bin/stat -f%Su /dev/console)" = "$(whoami)" && echo 'console user: correct'
 test -f /Users/Shared/trackai-endpoint-debug-x64.pkg && echo 'package: present'
 ```
 
-**Expected:** both names are `TrackAiMDMtest`, followed by both confirmation lines. This is a standard account; `sudo installer` from its Terminal would fail.
+**Expected:** both names are `trackaimdmtest`, followed by both confirmation lines. This is a standard account; `sudo installer` from its Terminal would fail.
 
 **3.2 Install the package.** This command opens a graphical administrator-authentication prompt. Enter the main administrator account's name and password **in that prompt**, not in Terminal.
 
@@ -305,15 +305,15 @@ packaging/numbat/measure.sh \
 
 ```sh
 cd /Users/manishmahajan/AIProjects/TrackAI-wt/Task20h-a-endpoint-package-install-gitai
-sudo mdm/macos/cleanup-endpoint.sh --dry-run --user TrackAiMDMtest
+sudo mdm/macos/cleanup-endpoint.sh --dry-run --user trackaimdmtest
 ```
 
 **Expected:** it names five managed hooks, Numbat's admin path, the guest security folder and the guest `.numbat` folder as **preserved**. If it names another account, stop. Then run:
 
 ```sh
-sudo mdm/macos/cleanup-endpoint.sh --apply --user TrackAiMDMtest
+sudo mdm/macos/cleanup-endpoint.sh --apply --user trackaimdmtest
 test ! -e '/Library/Application Support/TrackAI/Endpoint/bin/numbat' && echo 'Numbat: removed'
-sudo -H -u TrackAiMDMtest sh -c 'test ! -e "$HOME/.git-ai/internal/security"' && echo 'guest security state: removed'
+sudo -H -u trackaimdmtest sh -c 'test ! -e "$HOME/.git-ai/internal/security"' && echo 'guest security state: removed'
 ```
 
 **Expected:** cleanup reports managed hooks removed and both confirmation lines appear. If cleanup reports a hook-uninstall or credential-store failure, preserve the remaining files for inspection; do not remove them by hand.
@@ -331,7 +331,7 @@ The guest's `.numbat` records and `$HOME/TrackAI-Task20h-live` remain. The latte
 
 | Item | Record without secrets |
 |---|---|
-| Install | Intel Mac, console user `TrackAiMDMtest`, package build/install result, both binary versions, five hook statuses |
+| Install | Intel Mac, console user `trackaimdmtest`, package build/install result, both binary versions, five hook statuses |
 | Placeholder | Copilot and Claude action result, local record counts before/after, no finding |
 | Monitor | Bundle digest, `applied` acknowledgement, harmless rule ID and finding, three health fields, hand-checked agent views |
 | Off | Placeholder pointer, `applied_digest=null`, unchanged server finding count, increased local record count |
