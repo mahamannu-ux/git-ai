@@ -1,0 +1,19 @@
+tests/mdm_scripts.rs
+  s_c76abc582bf3e4::t_561c2e24328626 90-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "cb026c53fce8e3fe643394658bb58e575fe3fc98",
+  "prompts": {},
+  "sessions": {
+    "s_c76abc582bf3e4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a159d1-581d-7f00-a582-78462de82e04",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
