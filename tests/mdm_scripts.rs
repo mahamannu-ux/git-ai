@@ -62,6 +62,39 @@ fn macos_package_installs_monitor_hooks_to_the_shipper_file() {
     assert_eq!(repo_file("packaging/macos/agents.tsv").lines().count(), 5);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_package_replaces_current_symlink_without_touching_bundle_directory() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    let postinstall = repo_file("packaging/macos/scripts/postinstall");
+    assert!(postinstall.contains("/bin/mv -fh \"$RULES_DIR/current.next\" \"$RULES_DIR/current\""));
+
+    let temp = tempfile::tempdir().unwrap();
+    let rules = temp.path();
+    fs::create_dir(rules.join("version")).unwrap();
+    symlink("version", rules.join("current")).unwrap();
+    symlink("placeholder", rules.join("current.next")).unwrap();
+    let status = Command::new("/bin/mv")
+        .args(["-fh"])
+        .arg(rules.join("current.next"))
+        .arg(rules.join("current"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_link(rules.join("current")).unwrap(),
+        PathBuf::from("placeholder")
+    );
+    assert!(
+        rules
+            .join("version/current.next")
+            .symlink_metadata()
+            .is_err()
+    );
+}
+
 /// Asserts that the plist `<key>` is immediately followed by `<value/>`,
 /// ignoring the whitespace between them.
 fn plist_key_has_value(plist: &str, key: &str, value: &str) -> bool {

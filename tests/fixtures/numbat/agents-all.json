@@ -1,0 +1,272 @@
+[
+  {
+    "agent": "Claude Code",
+    "present": true,
+    "detected": true,
+    "at_rest": "found transcripts",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent claude",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Claude Cowork",
+    "present": true,
+    "detected": true,
+    "at_rest": "none found",
+    "hook": "none",
+    "wired": "n/a",
+    "setup_hint": "scan only",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Codex",
+    "present": true,
+    "detected": true,
+    "at_rest": "found transcripts",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent codex",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Gemini CLI",
+    "present": true,
+    "detected": true,
+    "at_rest": "found transcripts",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent gemini",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Cursor",
+    "present": true,
+    "detected": true,
+    "at_rest": "none found; deferred SQLite",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent cursor",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Windsurf / Devin Desktop",
+    "present": false,
+    "detected": false,
+    "at_rest": "none found",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install shared Cascade hooks: numbat hook install --agent windsurf",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "GitHub Copilot CLI",
+    "present": true,
+    "detected": true,
+    "at_rest": "found transcripts; deferred SQLite",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent copilot",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "VS Code Copilot Chat",
+    "present": true,
+    "detected": true,
+    "at_rest": "n/a (hook-only)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent vscode",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "OpenCode",
+    "present": true,
+    "detected": true,
+    "at_rest": "none found; deferred SQLite",
+    "hook": "plugin",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent opencode",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "OpenClaw",
+    "present": false,
+    "detected": false,
+    "at_rest": "none found; deferred SQLite/WAL sessions in the OpenClaw 2026.7.2 beta/development line",
+    "hook": "plugin",
+    "wired": "no",
+    "setup_hint": "install package: numbat hook install --agent openclaw; then pin/allow it, restart, and verify the Gateway",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Pi",
+    "present": false,
+    "detected": false,
+    "at_rest": "none found",
+    "hook": "plugin",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent pi",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Kimi Code",
+    "present": false,
+    "detected": false,
+    "at_rest": "none found",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent kimi",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Qwen Code",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred conversation/checkpoint storage)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent qwen (Qwen Code 0.12.0+)",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Cline CLI",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred SQLite sessions)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent cline; restart Cline",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Amp",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred thread/history storage)",
+    "hook": "plugin",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent amp; reload Amp plugins",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Auggie",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred session/task storage)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent auggie",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Kiro IDE / CLI v3",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred SQLite sessions)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent kiro; with KIRO_HOME, wire IDE separately at ~/.kiro/hooks/numbat.json",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Goose",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred SQLite sessions)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent goose",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Kilo Code",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred SQLite/session storage)",
+    "hook": "plugin",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent kilo",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "OpenHands",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred conversation/event storage)",
+    "hook": "hooks",
+    "wired": "n/a",
+    "setup_hint": "project install: numbat hook install --agent openhands --settings /repo/.openhands/hooks.json",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Crush",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred project-local .crush/crush.db (SQLite/WAL))",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent crush; restart Crush",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Junie CLI (EAP)",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred local session state (schema/path not published))",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent junie; restart Junie EAP",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Antigravity",
+    "present": true,
+    "detected": true,
+    "at_rest": "n/a (hook-only; deferred JSONL transcript format)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent antigravity",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Factory Droid",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred JSONL transcript format)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent factory",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Grok Build",
+    "present": true,
+    "detected": true,
+    "at_rest": "n/a (hook-only; deferred sessions record format)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent grok",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Devin CLI",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only)",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent devin",
+    "at_rest_scan_incomplete": false
+  },
+  {
+    "agent": "Hermes",
+    "present": false,
+    "detected": false,
+    "at_rest": "n/a (hook-only; deferred state.db (SQLite/WAL))",
+    "hook": "hooks",
+    "wired": "no",
+    "setup_hint": "install: numbat hook install --agent hermes",
+    "at_rest_scan_incomplete": false
+  }
+]

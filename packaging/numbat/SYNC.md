@@ -45,7 +45,13 @@ All work happens in `~/AIProjects/numbat` (the local Numbat checkout with the
 
 7. **Run TrackAI's contract tests with Numbat checked out beside the TrackAI
    worktree** (`npm test` in TrackAI). The pinned-source assertions in
-   `v2-contract.test.ts` must not be skipped.
+   `v2-contract.test.ts` must not be skipped. Recheck the Endpoint's
+   no-artifacts scan case: at pin `20a5a52`, Numbat exits nonzero, writes
+   exactly one `scan_summary` with `status: error`, zero artifacts and zero
+   findings to the file sink, and writes one diagnostic to stderr starting
+   `no agent artifacts found for --agent <agent> `. If the wording, record
+   shape or output channel changes, update `src/security/day_one_scan.rs` and
+   its tests before releasing the new pin.
 
 8. **Extract the coverage table**:
    `sh packaging/numbat/extract-coverage.sh <numbat-checkout> \
