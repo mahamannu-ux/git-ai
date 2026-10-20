@@ -23,7 +23,7 @@ The package puts Numbat at `/Library/Application Support/TrackAI/Endpoint/bin/nu
 | Work in this session | What it achieves | How it works |
 |---|---|---|
 | Package and release build | A Mac receives the Endpoint and the right Numbat binary | Separate Intel (`x64`) and Apple Silicon (`arm64`) packages carry the pinned Numbat build, notices, checksum and trust documents. Install checks Numbat's SHA-256 before adding hooks. |
-| Managed agent hooks | Actions from five supported agents reach Numbat | Install registers a managed hook for each agent, with `--emit all --content preview --output file --no-builtin-rules` and an agent-specific rules folder. |
+| Managed agent hooks | Actions from five supported agents reach Numbat | Install registers a managed hook for each agent, with `--emit all --content preview --output file` and an agent-specific rules folder. |
 | Safe first start | An empty rule catalogue cannot break an agent | Each folder starts with one enabled rule whose expression is always `false`. It compiles but can never report a finding. `rules/current` points there before the first bundle and when the lease is off or expired. |
 | Signed activation and health | Operators can tell what is active | The Endpoint checks the signed lease and bundle, repairs the active rule pointer after expiry or reinstall, and sends hourly security status. The status includes Numbat version, hook wiring, lease, bundle digest, and recent local and server evidence. The agent's own hook view remains a hand check. |
 | Offboarding | Remove the managed installation | Root cleanup uninstalls the five hooks, removes the Numbat binary and security state, then runs fleet cleanup. It leaves the user's `~/.numbat` records for separate handling. |
@@ -155,7 +155,7 @@ for agent in claude codex cursor gemini copilot; do
   "$NUMBAT" hook status --agent "$agent" --managed
 done
 readlink "$HOME/.git-ai/internal/security/rules/current"
-"$NUMBAT" rules check --no-builtin-rules \
+"$NUMBAT" rules check \
   --rules-dir "$HOME/.git-ai/internal/security/rules/current/copilot"
 ```
 

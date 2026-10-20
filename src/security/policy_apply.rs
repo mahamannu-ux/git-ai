@@ -27,6 +27,7 @@ pub const BUNDLE_PAYLOAD_TYPE: &str = "application/vnd.trackai.security-rule-bun
 pub const SECURITY_STATE_DIR: &str = "security";
 pub const NUMBAT_ADMIN_BINARY: &str = "/Library/Application Support/TrackAI/Endpoint/bin/numbat";
 const PLACEHOLDER_RULE: &str = include_str!("../../packaging/macos/placeholder.yaml");
+const BUILTIN_RULE_IDS: &str = include_str!("../../packaging/macos/builtin-rule-ids.txt");
 pub const MANAGED_AGENT_MAP: &str = include_str!("../../packaging/macos/agents.tsv");
 const MAX_SIGNED_BYTES: usize = 4 * 1024 * 1024 + 1024;
 const PINNED_ROOT_KEYIDS: &[&str] = &[];
@@ -282,7 +283,7 @@ impl RulesChecker for NumbatRulesChecker {
         };
         for directory in agent_dirs {
             let status = Command::new(binary)
-                .args(["rules", "check", "--no-builtin-rules", "--rules-dir"])
+                .args(["rules", "check", "--rules-dir"])
                 .arg(directory)
                 .status();
             if !status.is_ok_and(|status| status.success()) {
@@ -307,6 +308,15 @@ pub fn ensure_placeholder_current(state_dir: &Path) -> Result<(), GitAiError> {
         let path = directory.join("placeholder.yaml");
         if fs::read_to_string(&path).ok().as_deref() != Some(PLACEHOLDER_RULE) {
             fs::write(path, PLACEHOLDER_RULE)?;
+        }
+        for id in BUILTIN_RULE_IDS.lines() {
+            let disabled = format!(
+                "id: {id}\nversion: \"1\"\ntitle: TrackAI disables {id}\nseverity: info\nexpr: 'false'\nenabled: false\n"
+            );
+            let path = directory.join(format!("builtin-{id}.yaml"));
+            if fs::read_to_string(&path).ok().as_deref() != Some(disabled.as_str()) {
+                fs::write(path, disabled)?;
+            }
         }
     }
     let current = rules.join("current");
@@ -1784,6 +1794,27 @@ mod tests {
         assert_eq!(apply.refresh(now).unwrap(), RefreshOutcome::NoChange);
         assert_eq!(state.snapshot().accepted_leases.len(), 1);
         assert_eq!(http.posts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn placeholder_disables_every_pinned_builtin_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_placeholder_current(temp.path()).unwrap();
+        let ids = BUILTIN_RULE_IDS.lines().collect::<Vec<_>>();
+        assert_eq!(ids.len(), 51);
+        for agent in ["claude-code", "codex", "cursor", "gemini-cli", "copilot"] {
+            let folder = temp.path().join("rules/placeholder").join(agent);
+            assert_eq!(fs::read_dir(&folder).unwrap().count(), ids.len() + 1);
+            assert_eq!(
+                fs::read_to_string(folder.join("placeholder.yaml")).unwrap(),
+                PLACEHOLDER_RULE
+            );
+            for id in &ids {
+                let rule = fs::read_to_string(folder.join(format!("builtin-{id}.yaml"))).unwrap();
+                assert!(rule.starts_with(&format!("id: {id}\n")));
+                assert!(rule.contains("\nexpr: 'false'\nenabled: false\n"));
+            }
+        }
     }
 
     #[test]

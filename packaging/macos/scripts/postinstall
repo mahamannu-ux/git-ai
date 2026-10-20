@@ -47,6 +47,10 @@ TRUST_DIR="$SECURITY_DIR/trust"
 /usr/sbin/chown "$CONSOLE_USER:$USER_GROUP" "$GIT_AI_HOME" "$GIT_AI_HOME/internal"
 /usr/bin/install -d -o root -g wheel -m 0755 "$NUMBAT_ADMIN_DIR" "$NUMBAT_ADMIN_DIR/bin"
 /usr/bin/install -o root -g wheel -m 0755 "$NUMBAT_SOURCE" "$NUMBAT_BIN"
+BUILTIN_LIST="$(/usr/bin/mktemp -t trackai-numbat-rules)"
+trap '/bin/rm -f "$BUILTIN_LIST"' EXIT
+"$NUMBAT_BIN" rules list > "$BUILTIN_LIST" || fail "cannot list Numbat built-in rules"
+/usr/bin/cmp -s "$BUILTIN_LIST" "$SCRIPT_DIR/builtin-rule-ids.txt" || fail "bundled Numbat built-in rules do not match the pinned list"
 for notice in LICENSE THIRD_PARTY_LICENSES.txt PROVENANCE.txt SHA256SUMS agents.tsv; do
   /usr/bin/install -o root -g wheel -m 0644 "$SCRIPT_DIR/$notice" "$NUMBAT_ADMIN_DIR/$notice"
 done
@@ -56,7 +60,16 @@ while read -r numbat_agent source_agent; do
   folder="$RULES_DIR/placeholder/$source_agent"
   /usr/bin/install -d -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0755 "$folder"
   /usr/bin/install -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0644 "$SCRIPT_DIR/placeholder.yaml" "$folder/placeholder.yaml"
-  "$NUMBAT_BIN" rules check --no-builtin-rules --rules-dir "$folder" >/dev/null || fail "placeholder rule failed for $source_agent"
+  while IFS= read -r id; do
+    case "$id" in
+      ""|*[!a-z0-9._-]*) fail "invalid pinned rule id" ;;
+    esac
+    path="$folder/builtin-$id.yaml"
+    /usr/bin/printf 'id: %s\nversion: "1"\ntitle: TrackAI disables %s\nseverity: info\nexpr: '\''false'\''\nenabled: false\n' "$id" "$id" > "$path"
+    /usr/sbin/chown "$CONSOLE_USER:$USER_GROUP" "$path"
+    /bin/chmod 0644 "$path"
+  done < "$SCRIPT_DIR/builtin-rule-ids.txt"
+  "$NUMBAT_BIN" rules check --rules-dir "$folder" >/dev/null || fail "placeholder rule failed for $source_agent"
 done < "$SCRIPT_DIR/agents.tsv"
 if [ -e "$RULES_DIR/current" ] && [ ! -L "$RULES_DIR/current" ]; then
   fail "rules/current must be a symlink"
@@ -85,7 +98,7 @@ fi
 while read -r numbat_agent source_agent; do
   [ -n "$numbat_agent" ] || continue
   "$NUMBAT_BIN" hook install --agent "$numbat_agent" --managed --emit all \
-    --content preview --output file --no-builtin-rules \
+    --content preview --output file \
     --rules-dir "\$HOME/.git-ai/internal/security/rules/current/$source_agent" \
     --output-file '$HOME/.numbat/records.ndjson' || fail "managed hook install failed for $numbat_agent"
 done < "$SCRIPT_DIR/agents.tsv"

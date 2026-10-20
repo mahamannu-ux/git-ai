@@ -74,6 +74,7 @@ fi
 SIGNED_SHA="$(shasum -a 256 "$SCRIPTS/numbat" | awk '{print $1}')"
 printf '%s  %s/numbat\n' "$SIGNED_SHA" "$(basename "$NUMBAT_DIR")" > "$SCRIPTS/SHA256SUMS"
 install -m 0644 "$ROOT/packaging/macos/placeholder.yaml" "$SCRIPTS/placeholder.yaml"
+install -m 0644 "$ROOT/packaging/macos/builtin-rule-ids.txt" "$SCRIPTS/builtin-rule-ids.txt"
 install -m 0644 "$ROOT/packaging/macos/agents.tsv" "$SCRIPTS/agents.tsv"
 mkdir -p "$SCRIPTS/trust"
 install -m 0644 "$TRUST_DIR/root.json" "$SCRIPTS/trust/root.json"
