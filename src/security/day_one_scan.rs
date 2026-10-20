@@ -113,7 +113,14 @@ fn run_agent(
     context: &LeaseStateStore,
     lease_id: &str,
 ) -> Result<AgentRun, GitAiError> {
-    let mut child = scan_command(binary, security_dir, agent.0, agent.1, output).spawn()?;
+    let diagnostics = output.with_extension("stderr.ndjson");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let stderr = options.open(&diagnostics)?;
+    let mut command = scan_command(binary, security_dir, agent.0, agent.1, output);
+    let mut child = command.stderr(Stdio::from(stderr)).spawn()?;
     let started = Instant::now();
     loop {
         if context
@@ -138,36 +145,46 @@ fn run_agent(
     }
 }
 
-fn no_artifacts_summary(path: &Path, agent: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+fn no_artifacts_summary(output: &Path, diagnostics: &Path, agent: &str) -> bool {
+    let Ok(file) = fs::File::open(output) else {
         return false;
     };
-    let mut diagnostic = false;
-    let mut summary = false;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { return false };
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            return false;
-        };
-        match value.get("record_type").and_then(Value::as_str) {
-            Some("diagnostic") => {
-                diagnostic |= value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|message| {
-                        message
-                            .starts_with(&format!("no agent artifacts found for --agent {agent} "))
-                    });
-            }
-            Some("scan_summary") => {
-                summary |= value.get("status").and_then(Value::as_str) == Some("error")
-                    && value.get("artifacts_scanned").and_then(Value::as_u64) == Some(0)
-                    && value.get("findings_emitted").and_then(Value::as_u64) == Some(0);
-            }
-            _ => return false,
-        }
+    let mut lines = BufReader::new(file).lines();
+    let Some(Ok(line)) = lines.next() else {
+        return false;
+    };
+    let Ok(summary) = serde_json::from_str::<Value>(&line) else {
+        return false;
+    };
+    if lines.next().is_some()
+        || summary.get("record_type").and_then(Value::as_str) != Some("scan_summary")
+        || summary.get("status").and_then(Value::as_str) != Some("error")
+        || summary.get("artifacts_scanned").and_then(Value::as_u64) != Some(0)
+        || summary.get("findings_emitted").and_then(Value::as_u64) != Some(0)
+    {
+        return false;
     }
-    diagnostic && summary
+
+    // Numbat@20a5a52:internal/output/output.go:228-242 sends file-sink
+    // diagnostics to stderr, separately from the scan_summary file record.
+    let Ok(file) = fs::File::open(diagnostics) else {
+        return false;
+    };
+    let mut lines = BufReader::new(file).lines();
+    let Some(Ok(line)) = lines.next() else {
+        return false;
+    };
+    let Ok(diagnostic) = serde_json::from_str::<Value>(&line) else {
+        return false;
+    };
+    lines.next().is_none()
+        && diagnostic.get("record_type").and_then(Value::as_str) == Some("diagnostic")
+        && diagnostic
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.starts_with(&format!("no agent artifacts found for --agent {agent} "))
+            })
 }
 
 fn queue_scan_file(
@@ -259,7 +276,9 @@ fn run_once(
     let mut all_ok = true;
     for (agent, source) in managed_agents() {
         let output = tmp_dir.join(format!("{agent}.ndjson"));
+        let diagnostics = output.with_extension("stderr.ndjson");
         let _ = fs::remove_file(&output);
+        let _ = fs::remove_file(&diagnostics);
         let result = run_agent(
             binary,
             &security_dir,
@@ -271,7 +290,8 @@ fn run_once(
         )
         .and_then(|result| {
             if matches!(result, AgentRun::Success)
-                || matches!(result, AgentRun::Nonzero) && no_artifacts_summary(&output, agent)
+                || matches!(result, AgentRun::Nonzero)
+                    && no_artifacts_summary(&output, &diagnostics, agent)
             {
                 queue_scan_file(
                     &output,
@@ -286,6 +306,7 @@ fn run_once(
             }
         });
         let _ = fs::remove_file(&output);
+        let _ = fs::remove_file(&diagnostics);
         match result {
             Ok(true) => {}
             Ok(false) => all_ok = false,
@@ -529,6 +550,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn no_artifacts_exit_queues_error_summary_and_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let security = tmp.path().join("security");
+        let rules = security.join("rules");
+        fs::create_dir_all(rules.join("1-aaaaaaaaaaaa")).unwrap();
+        std::os::unix::fs::symlink("1-aaaaaaaaaaaa", rules.join("current")).unwrap();
+        let fake = tmp.path().join("fake-numbat");
+        fs::write(&fake, concat!(
+            "#!/bin/sh\n",
+            "for arg do output=$arg; done\n",
+            "if [ \"$3\" = codex ]; then\n",
+            "  printf '%s\\n' '{\"record_type\":\"diagnostic\",\"message\":\"no agent artifacts found for --agent codex under home\"}' >&2\n",
+            "  printf '%s\\n' '{\"schema_version\":\"0.5.0\",\"record_type\":\"scan_summary\",\"run_id\":\"run-empty\",\"status\":\"error\",\"artifacts_scanned\":0,\"events_emitted\":0,\"findings_emitted\":0,\"indicators_emitted\":0,\"diagnostics\":1}' > \"$output\"\n",
+            "  exit 1\n",
+            "fi\n",
+            "printf '%s\\n' '{\"schema_version\":\"0.5.0\",\"record_type\":\"scan_summary\",\"run_id\":\"run-test\",\"status\":\"complete\",\"artifacts_scanned\":1,\"events_emitted\":0,\"findings_emitted\":0,\"indicators_emitted\":0,\"diagnostics\":0}' > \"$output\"\n"
+        )).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let context =
+            LeaseStateStore::from_state(&security, state(Utc::now(), LeaseMode::Monitor, true));
+        run_once(
+            &fake,
+            tmp.path(),
+            &context,
+            &binding(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(security.join("day-one-scan-done").exists());
+        assert_eq!(fs::read_dir(security.join("scan-tmp")).unwrap().count(), 0);
+        let database = rusqlite::Connection::open(tmp.path().join("security-findings.db")).unwrap();
+        let count: i64 = database
+            .query_row("SELECT count(*) FROM security_record_queue", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timed_out_agent_is_interrupted() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = tmp.path().join("slow-numbat");
@@ -587,16 +649,18 @@ mod tests {
     fn only_no_artifacts_nonzero_result_can_queue_its_summary() {
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join("scan.ndjson");
-        fs::write(&output, concat!(
-            "{\"record_type\":\"diagnostic\",\"message\":\"no agent artifacts found for --agent cursor under home\"}\n",
-            "{\"record_type\":\"scan_summary\",\"status\":\"error\",\"artifacts_scanned\":0,\"findings_emitted\":0}\n"
-        )).unwrap();
-        assert!(no_artifacts_summary(&output, "cursor"));
-        assert!(!no_artifacts_summary(&output, "codex"));
-        fs::write(&output, concat!(
+        let diagnostics = tmp.path().join("scan.stderr.ndjson");
+        fs::write(&output, "{\"record_type\":\"scan_summary\",\"status\":\"error\",\"artifacts_scanned\":0,\"findings_emitted\":0}\n").unwrap();
+        fs::write(&diagnostics, "{\"record_type\":\"diagnostic\",\"message\":\"no agent artifacts found for --agent cursor under home\"}\n").unwrap();
+        assert!(no_artifacts_summary(&output, &diagnostics, "cursor"));
+        assert!(!no_artifacts_summary(&output, &diagnostics, "codex"));
+        fs::write(
+            &diagnostics,
             "{\"record_type\":\"diagnostic\",\"message\":\"rule engine failed\"}\n",
-            "{\"record_type\":\"scan_summary\",\"status\":\"error\",\"artifacts_scanned\":0,\"findings_emitted\":0}\n"
-        )).unwrap();
-        assert!(!no_artifacts_summary(&output, "cursor"));
+        )
+        .unwrap();
+        assert!(!no_artifacts_summary(&output, &diagnostics, "cursor"));
+        fs::write(&output, "{\"record_type\":\"finding\"}\n{\"record_type\":\"scan_summary\",\"status\":\"error\",\"artifacts_scanned\":0,\"findings_emitted\":0}\n").unwrap();
+        assert!(!no_artifacts_summary(&output, &diagnostics, "cursor"));
     }
 }

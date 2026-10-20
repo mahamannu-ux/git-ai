@@ -77,7 +77,9 @@ fi
 /bin/rm -f "$RULES_DIR/current.next"
 /bin/ln -s placeholder "$RULES_DIR/current.next"
 /usr/sbin/chown -h "$CONSOLE_USER:$USER_GROUP" "$RULES_DIR/current.next"
-/bin/mv -f "$RULES_DIR/current.next" "$RULES_DIR/current"
+# -h replaces the current symlink itself. Without it, BSD mv follows an
+# existing current -> version directory and moves current.next inside it.
+/bin/mv -fh "$RULES_DIR/current.next" "$RULES_DIR/current"
 for document in "$SCRIPT_DIR/trust"/*.json; do
   [ -f "$document" ] || continue
   /usr/bin/install -o "$CONSOLE_USER" -g "$USER_GROUP" -m 0600 "$document" "$TRUST_DIR/$(/usr/bin/basename "$document")"
