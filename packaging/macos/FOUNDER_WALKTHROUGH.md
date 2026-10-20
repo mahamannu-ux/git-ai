@@ -1,6 +1,6 @@
 # Task20h-a: what the Mac package does, and how to check it
 
-**Audience:** the founder running the first real Mac check. **Status:** the Task20 lead cleared the host gate after the two follow-up fixes and local checks; the founder's live install is pending. This page is a walkthrough, not a record of a passed live test.
+**Audience:** the founder running the first real Mac check. **Status:** the Intel Mac debug-package run finished on 2026-10-20; its results and remaining gaps are in [IT_T20H01_EVIDENCE.md](IT_T20H01_EVIDENCE.md). This page is the repeatable walkthrough.
 
 ## The idea in one picture
 
@@ -24,7 +24,7 @@ The package puts Numbat at `/Library/Application Support/TrackAI/Endpoint/bin/nu
 |---|---|---|
 | Package and release build | A Mac receives the Endpoint and the right Numbat binary | Separate Intel (`x64`) and Apple Silicon (`arm64`) packages carry the pinned Numbat build, notices, checksum and trust documents. Install checks Numbat's SHA-256 before adding hooks. |
 | Managed agent hooks | Actions from five supported agents reach Numbat | Install registers a managed hook for each agent, with `--emit all --content preview --output file` and an agent-specific rules folder. |
-| Safe first start | An empty rule catalogue cannot break an agent | Each folder starts with one enabled rule whose expression is always `false`. It compiles but can never report a finding. `rules/current` points there before the first bundle and when the lease is off or expired. |
+| Safe first start | An empty rule catalogue cannot break an agent | Each folder starts with one enabled rule whose expression is always `false`, plus disabled overrides for Numbat's 51 built-in rules. The folder compiles one rule but can never report a finding. `rules/current` points there before the first bundle and when the lease is off or expired. |
 | Signed activation and health | Operators can tell what is active | The Endpoint checks the signed lease and bundle, repairs the active rule pointer after expiry or reinstall, and sends hourly security status. The status includes Numbat version, hook wiring, lease, bundle digest, and recent local and server evidence. The agent's own hook view remains a hand check. |
 | Offboarding | Remove the managed installation | Root cleanup uninstalls the five hooks, removes the Numbat binary and security state, then runs fleet cleanup. It leaves the user's `~/.numbat` records for separate handling. |
 
@@ -253,6 +253,30 @@ psql "$DATABASE_URL" -c "SELECT result, refusal_code, received_at FROM security_
 
 **Expected:** a recent `applied` row with no refusal code. A `refused` row is a failure, not a pass.
 
+If a previous debug package produced `RULES_CHECK_FAILED`, reinstall the corrected package before retrying. The Endpoint remembers the refusal for that lease ID, and the server may return the same lease for up to one hour. For this **disposable tenant only**, main Terminal A can issue a fresh lease. First dry-run and publish off:
+
+```sh
+npm run security:settings -w apps/api -- \
+  --tenant "$TENANT_ID" --operator task20h-founder-test \
+  --change "$LIVE_DIR/settings-off.json"
+npm run security:settings -w apps/api -- \
+  --tenant "$TENANT_ID" --operator task20h-founder-test \
+  --change "$LIVE_DIR/settings-off.json" --confirm
+```
+
+After both succeed, dry-run and publish monitor:
+
+```sh
+npm run security:settings -w apps/api -- \
+  --tenant "$TENANT_ID" --operator task20h-founder-test \
+  --change "$LIVE_DIR/settings-monitor.json"
+npm run security:settings -w apps/api -- \
+  --tenant "$TENANT_ID" --operator task20h-founder-test \
+  --change "$LIVE_DIR/settings-monitor.json" --confirm
+```
+
+Then fast switch to the guest, run `"$ENDPOINT" bg restart --hard`, wait 10 seconds, and check `rules/current` again. Check the latest acknowledgement in main Terminal A. It must say `applied`; earlier refusals remain in the history.
+
 **5.3 In the guest lab, trigger a real rule.** From `~/TrackAI-Task20h-lab`, start Claude Code and ask it to run **`cat .env`**. The file contains only `DUMMY_TEST_VALUE=not-a-secret`. The action should run; this is monitor mode, not blocking mode. After exiting Claude, check the local count:
 
 ```sh
@@ -289,7 +313,7 @@ readlink "$HOME/.git-ai/internal/security/rules/current"
 wc -l "$HOME/.numbat/records.ndjson"
 ```
 
-**Expected:** `placeholder`. Write down the local line count, ask Claude for another harmless `pwd`, and rerun the `wc -l` command: the count should rise. Fast switch back to main Terminal A and run:
+**Expected:** `placeholder`. Write down the local line count, ask Claude to run `cat .env` again (the file still contains only the dummy value), and rerun the `wc -l` command: the count should rise. This repeats the action that found a rule while monitoring was on. Fast switch back to main Terminal A and run:
 
 ```sh
 psql "$DATABASE_URL" -c "SELECT count(*) AS findings_after_off_action FROM security_findings WHERE tenant_id = '$TENANT_ID' AND record_generation = 'v2'"
@@ -327,7 +351,14 @@ test ! -e '/Library/Application Support/TrackAI/Endpoint/bin/numbat' && echo 'Nu
 sudo -H -u trackaimdmtest sh -c 'test ! -e "$HOME/.git-ai/internal/security"' && echo 'guest security state: removed'
 ```
 
-**Expected:** cleanup reports managed hooks removed and both confirmation lines appear. If cleanup reports a hook-uninstall or credential-store failure, preserve the remaining files for inspection; do not remove them by hand.
+**Expected:** cleanup reports managed hooks removed and both confirmation lines appear. If cleanup reports a hook-uninstall failure, preserve the remaining files for inspection; do not remove them by hand. If it reports `delete-credential ... result=locked` while the guest is fast-switched away, record the root cleanup as **incomplete**. The hook, binary and security-state removals may already have succeeded. Return to the guest's console session and run:
+
+```sh
+"$HOME/.git-ai/bin/git-ai" fleet cleanup --apply
+test ! -e "$HOME/.git-ai/trackai-delivery-policy.json" && echo 'guest bootstrap: removed'
+```
+
+**Expected:** `delete-credential ... result=ok` and `guest bootstrap: removed`. Record both the root failure and successful guest retry; this does not prove unattended MDM cleanup can access a locked guest Keychain.
 
 **7.2 In main Terminal A, save the safe counts, status results and latency figures.** Then stop the API and exit the `it-db.sh` shell; exiting removes the throwaway database:
 
