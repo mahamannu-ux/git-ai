@@ -87,7 +87,12 @@ fn macos_package_replaces_current_symlink_without_touching_bundle_directory() {
         fs::read_link(rules.join("current")).unwrap(),
         PathBuf::from("placeholder")
     );
-    assert!(rules.join("version/current.next").symlink_metadata().is_err());
+    assert!(
+        rules
+            .join("version/current.next")
+            .symlink_metadata()
+            .is_err()
+    );
 }
 
 /// Asserts that the plist `<key>` is immediately followed by `<value/>`,
