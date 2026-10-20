@@ -43,7 +43,7 @@ Builds the pin **twice** into two fresh directories with build.sh and exits 0 on
 
 ### `test-pin.sh`
 
-Clones the pin like build.sh does, then runs Numbat's own suite (`go test ./...`) inside it. On success prints exactly `numbat-tests: ok <n> packages`. On failure prints `numbat-tests: failed` plus the tail of the test log. One **targeted** retry is allowed: only when the first run's failure set is exactly `TestOpenClawGeneratedPluginRuntime` (upstream's OpenClaw Node-harness test with a hard-coded 500 ms child deadline, `openclaw_runtime_test.go:71-80` at the pin — a timing flake under machine load, verified passing in isolation). Any other failing test, a panic, or a build failure fails the gate with no retry, and the retry re-runs only that one test.
+Clones the pin like build.sh does, compares `numbat rules list` with `packaging/macos/builtin-rule-ids.txt`, then runs Numbat's own suite (`go test ./...`) inside it. On success prints exactly `numbat-tests: ok <n> packages`. On failure prints `numbat-tests: failed` plus the reason or tail of the test log. One **targeted** retry is allowed: only when the first run's failure set is exactly `TestOpenClawGeneratedPluginRuntime` (upstream's OpenClaw Node-harness test with a hard-coded 500 ms child deadline, `openclaw_runtime_test.go:71-80` at the pin — a timing flake under machine load, verified passing in isolation). Any other failing test, a panic, or a build failure fails the gate with no retry, and the retry re-runs only that one test.
 
 ### `measure.sh <numbat-binary> [<git-ai-binary>]`
 
@@ -63,7 +63,7 @@ Copies the "Matrix", "Permission and decision telemetry" and "Managed hooks" sec
 
 ### `SYNC.md`
 
-The monthly-sync runbook: fetch upstream into the mirror, choose the first upstream release containing the current pin (TASK20.md §1 item 1), re-tag as `v<upstream>-trackai.<n>`, update `pin.env`, re-run the pin checks and TrackAI's contract tests, re-extract coverage, re-check the licence (`NOTICE` existence, `THIRD_PARTY_LICENSES.txt` diff), diff the rule files, and hand the record to the Task20 lead.
+The monthly-sync runbook: fetch upstream into the mirror, choose the first upstream release containing the current pin (TASK20.md §1 item 1), re-tag as `v<upstream>-trackai.<n>`, update `pin.env`, regenerate the built-in ID list and TrackAI Task20f catalogue at the same pin, re-run the pin checks and TrackAI's contract tests, re-extract coverage, re-check the licence (`NOTICE` existence, `THIRD_PARTY_LICENSES.txt` diff), diff the rule files, and hand the record to the Task20 lead.
 
 ## Outputs in this repository
 

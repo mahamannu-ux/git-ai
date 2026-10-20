@@ -27,34 +27,44 @@ All work happens in `~/AIProjects/numbat` (the local Numbat checkout with the
    (the exact SHA), `NUMBAT_VERSION` (same as the tag) and `NUMBAT_GO_VERSION`
    if Numbat's `go.mod` moved. Commit this change with a `Task20b:` commit.
 
-5. **Run the pin checks** for both macOS architectures:
+5. **Sync the built-in catalogue at the new pin.** In the Numbat checkout at
+   `NUMBAT_COMMIT`, regenerate `packaging/macos/builtin-rule-ids.txt` in this
+   repository from `numbat rules list` (for example,
+   `go run ./cmd/numbat rules list > <gitai-worktree>/packaging/macos/builtin-rule-ids.txt`).
+   Review the added and removed IDs, then release this file in the **same
+   Endpoint build** as the new Numbat binary. Re-import TrackAI Task20f's
+   `catalogue/` from that same pin: the server compiles compact bundles against
+   it, while the Endpoint loads the binary's embedded catalogue. Include the
+   catalogue update in the corresponding TrackAI pin change.
+
+6. **Run the pin checks** for both macOS architectures:
    - `sh packaging/numbat/test-pin.sh` (expect `numbat-tests: ok <n> packages`);
    - `sh packaging/numbat/reproduce.sh darwin amd64` and
      `sh packaging/numbat/reproduce.sh darwin arm64`
      (expect identical digests across two fresh builds).
 
-6. **Run TrackAI's contract tests with Numbat checked out beside the TrackAI
+7. **Run TrackAI's contract tests with Numbat checked out beside the TrackAI
    worktree** (`npm test` in TrackAI). The pinned-source assertions in
    `v2-contract.test.ts` must not be skipped.
 
-7. **Extract the coverage table**:
+8. **Extract the coverage table**:
    `sh packaging/numbat/extract-coverage.sh <numbat-checkout> \
       packaging/numbat/coverage/<new-tag>.md`
    and commit the new file.
 
-8. **Check the licence**: does a `NOTICE` file exist at the new pin now
+9. **Check the licence**: does a `NOTICE` file exist at the new pin now
    (there is none at `20a5a52`)? Has `THIRD_PARTY_LICENSES.txt` changed
    (`git diff <old-pin> <new-pin> -- THIRD_PARTY_LICENSES.txt`)? Record both
    answers; notice-bearing dependencies inside the binary change the package's
    notices (TASK6 security/numbat licence plan, "Task20: binary redistribution").
 
-9. **Diff the rule files against the previous pin** (adapted-material
+10. **Diff the rule files against the previous pin** (adapted-material
    provenance for Task20f; 51 `.yaml` rule files at `20a5a52`, re-count at the
    new pin):
    `git diff --numstat <old-pin> <new-pin> -- rules/`
    and `git diff <old-pin> <new-pin> -- rules/` for the full review. Changed
    rule files update TrackAI's catalogue provenance.
 
-10. **Hand the record to the Task20 lead**: chosen release, new tag, test and
+11. **Hand the record to the Task20 lead**: chosen release, new tag, test and
     reproducibility results, the coverage file, the licence answers and the
     rule diff summary, so §1 item 1's pin move can be recorded.
