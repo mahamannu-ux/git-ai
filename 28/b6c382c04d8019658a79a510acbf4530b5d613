@@ -1,0 +1,19 @@
+packaging/macos/builtin-rule-ids.txt
+  s_a560b75b87d1a8::t_794ebf89b22afe 1-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "28b6c382c04d8019658a79a510acbf4530b5d613",
+  "prompts": {},
+  "sessions": {
+    "s_a560b75b87d1a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a150a5-1916-7e53-82a6-84434f436e11",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
