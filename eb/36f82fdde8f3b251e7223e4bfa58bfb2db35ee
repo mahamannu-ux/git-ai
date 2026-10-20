@@ -1,0 +1,25 @@
+src/daemon/telemetry_worker.rs
+  s_c76abc582bf3e4::t_b64f2f0bcbabfd 515-519,528
+src/security/inventory.rs
+  s_c76abc582bf3e4::t_5aa86cc778717a 1-321
+tests/fixtures/numbat/agents-all.json
+  s_c76abc582bf3e4::t_5b1bb5e3f1751e 1-272
+tests/security_v2_contract.rs
+  s_c76abc582bf3e4::t_4f9e7915ba7b34 6,34-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "eb36f82fdde8f3b251e7223e4bfa58bfb2db35ee",
+  "prompts": {},
+  "sessions": {
+    "s_c76abc582bf3e4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a159d1-581d-7f00-a582-78462de82e04",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
