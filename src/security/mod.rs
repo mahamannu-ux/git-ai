@@ -1,9 +1,11 @@
 //! TrackAI Endpoint security-v2 record shipping.
 
 pub mod activation;
+pub mod day_one_scan;
 pub mod delivery;
 pub mod delivery_queue;
 pub mod health;
+pub mod inventory;
 pub mod lease_state;
 pub mod policy_apply;
 pub mod records;

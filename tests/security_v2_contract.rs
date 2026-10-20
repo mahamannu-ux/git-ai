@@ -3,6 +3,7 @@ mod security_v2_schema;
 
 use chrono::{TimeZone, Utc};
 use git_ai::security::health::build_security_status;
+use git_ai::security::inventory::project_inventory;
 use git_ai::security::records::{
     PermissionJoinTracker, ProjectedRecord, ProjectionLease, SecurityDataSettings,
     project_agent_inventory, project_numbat_record, project_security_status,
@@ -28,6 +29,47 @@ fn generated_endpoint_status_matches_frozen_upload_contract() {
     let record = project_security_status(fields).unwrap();
     let upload = json!({"schema_version":"trackai.security-upload/2","records":[record.json]});
     assert!(validates(&schema, &upload));
+}
+
+#[test]
+fn captured_inventory_and_day_one_projections_match_contract() {
+    let schema = fixture("security-upload-v2.schema.json");
+    let captured = include_bytes!("fixtures/numbat/agents-all.json");
+    let (inventory, dropped) =
+        project_inventory(captured, Utc.timestamp_opt(1_760_698_800, 0).unwrap()).unwrap();
+    assert_eq!(dropped, 0);
+    assert_eq!(inventory.json["agents"].as_array().unwrap().len(), 27);
+    let upload = json!({"schema_version":"trackai.security-upload/2","records":[inventory.json]});
+    assert!(validates(&schema, &upload));
+
+    let sources = [
+        json!({"schema_version":"0.5.0","record_type":"finding","finding_id":"fnd-day-one",
+            "rule_id":"secrets.agent_read_env","rule_version":"1.3","severity":"medium",
+            "title":"Sensitive file access","source_agent":"codex","source_type":"artifact",
+            "confidence":"high","detected_at":"2026-10-17T10:00:00Z",
+            "observed_file_path":"/private/path","tool_input":"forbidden"}),
+        json!({"schema_version":"0.5.0","record_type":"scan_summary","run_id":"run-day-one",
+            "status":"complete","artifacts_scanned":1,"events_emitted":1,
+            "findings_emitted":1,"indicators_emitted":0,"diagnostics":0,
+            "project_path":"/private/path"}),
+    ];
+    for source in sources {
+        let projected = project_numbat_record(
+            source.to_string().as_bytes(),
+            &lease(),
+            &HashMap::new(),
+            &mut PermissionJoinTracker::default(),
+            true,
+        )
+        .unwrap();
+        let upload =
+            json!({"schema_version":"trackai.security-upload/2","records":[projected.json]});
+        assert!(validates(&schema, &upload), "{upload}");
+        assert!(!upload.to_string().contains("/private/path"));
+        if projected.kind == "finding" {
+            assert_eq!(upload["records"][0]["found_at_rest"], true);
+        }
+    }
 }
 
 fn lease() -> ProjectionLease {

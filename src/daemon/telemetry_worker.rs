@@ -512,6 +512,11 @@ fn spawn_security_shipper_worker() {
                 {
                     tracing::warn!(%error, "security status queue failed");
                 }
+                if let Err(error) =
+                    crate::security::inventory::queue_configured_inventory(now, binding.as_ref())
+                {
+                    tracing::warn!(%error, "security inventory queue failed");
+                }
                 if let Err(error) = flush_configured_security_records(now.timestamp() as u64) {
                     tracing::warn!(%error, "security record delivery failed");
                 }
@@ -520,6 +525,7 @@ fn spawn_security_shipper_worker() {
             {
                 tracing::warn!(%error, "security shipper task failed");
             }
+            crate::security::day_one_scan::spawn_if_due();
             tokio::time::sleep(SECURITY_SHIPPER_POLL_INTERVAL).await;
         }
     });
