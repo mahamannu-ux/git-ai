@@ -3,6 +3,7 @@
 pub mod activation;
 pub mod delivery;
 pub mod delivery_queue;
+pub mod health;
 pub mod lease_state;
 pub mod policy_apply;
 pub mod records;

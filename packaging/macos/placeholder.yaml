@@ -1,0 +1,6 @@
+id: trackai.placeholder.never_matches
+version: "1"
+title: TrackAI placeholder (no rules active)
+severity: info
+expr: 'false'
+enabled: true

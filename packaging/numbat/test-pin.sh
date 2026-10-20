@@ -41,6 +41,24 @@ if [ "$got_commit" != "$NUMBAT_COMMIT" ]; then
     exit 1
 fi
 
+# The installer and Endpoint placeholder compile this exact built-in ID list.
+# Catch catalogue drift at the pin, before building a package that would fail
+# postinstall (or leave the placeholder out of sync with Numbat).
+builtin_ids="$work_dir/builtin-rule-ids.txt"
+if ! (cd "$src_dir" && CGO_ENABLED=0 GOTOOLCHAIN=local \
+        go run ./cmd/numbat rules list) >"$builtin_ids" 2>"$work_dir/rules-list.log"; then
+    echo "numbat-tests: failed" >&2
+    echo "test-pin.sh: cannot list built-in rules at '$NUMBAT_TAG'" >&2
+    cat "$work_dir/rules-list.log" >&2
+    exit 1
+fi
+if ! cmp -s "$builtin_ids" "$script_dir/../macos/builtin-rule-ids.txt"; then
+    echo "numbat-tests: failed" >&2
+    echo "test-pin.sh: packaging/macos/builtin-rule-ids.txt differs from Numbat at '$NUMBAT_TAG'" >&2
+    diff -u "$script_dir/../macos/builtin-rule-ids.txt" "$builtin_ids" >&2 || true
+    exit 1
+fi
+
 log_file="$work_dir/test.log"
 if (cd "$src_dir" && CGO_ENABLED=0 GOTOOLCHAIN=local go test ./...) >"$log_file" 2>&1; then
     echo "numbat-tests: ok $(grep -c '^ok[[:space:]]' "$log_file" || true) packages"

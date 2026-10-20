@@ -32,6 +32,22 @@ pub struct SecurityRecordQueue {
     legacy_rows_dropped: usize,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SecurityHealthEvidence {
+    pub last_valid_record_at: Option<i64>,
+    pub last_rejected_record_at: Option<i64>,
+    pub last_acked_at: Option<i64>,
+    pub last_refusal_at: Option<i64>,
+    pub last_refusal_code: Option<String>,
+    pub oldest_numbat_queued_at: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TailHealthObservation {
+    pub valid_at: Option<i64>,
+    pub rejected: bool,
+}
+
 impl SecurityRecordQueue {
     pub fn open_at_path(path: &Path) -> Result<Self, GitAiError> {
         let connection = crate::sqlite::open_with_memory_limits(path)?;
@@ -62,6 +78,12 @@ impl SecurityRecordQueue {
             );
             CREATE TABLE IF NOT EXISTS security_shipper_counters (
                 name TEXT PRIMARY KEY, value INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS security_health_metadata (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_valid_record_at INTEGER, last_rejected_record_at INTEGER,
+                last_acked_at INTEGER, last_refusal_at INTEGER,
+                last_refusal_code TEXT
             );
             "#,
         )?;
@@ -96,6 +118,84 @@ impl SecurityRecordQueue {
 
     pub fn legacy_rows_dropped(&self) -> usize {
         self.legacy_rows_dropped
+    }
+
+    pub fn health_evidence(&self) -> Result<SecurityHealthEvidence, GitAiError> {
+        let mut evidence = self
+            .connection
+            .query_row(
+                "SELECT last_valid_record_at,last_rejected_record_at,last_acked_at,
+                    last_refusal_at,last_refusal_code
+               FROM security_health_metadata WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(SecurityHealthEvidence {
+                        last_valid_record_at: row.get(0)?,
+                        last_rejected_record_at: row.get(1)?,
+                        last_acked_at: row.get(2)?,
+                        last_refusal_at: row.get(3)?,
+                        last_refusal_code: row.get(4)?,
+                        oldest_numbat_queued_at: None,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        evidence.oldest_numbat_queued_at = self.connection.query_row(
+            "SELECT MIN(queued_at) FROM security_record_queue
+             WHERE kind IN ('finding','enforcement','indicator','permission_event','scan_summary')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(evidence)
+    }
+
+    pub fn record_upload_ack(&self, now: u64) -> Result<(), GitAiError> {
+        self.connection.execute(
+            "INSERT INTO security_health_metadata(singleton,last_acked_at) VALUES(1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET last_acked_at=excluded.last_acked_at,
+               last_refusal_at=NULL,last_refusal_code=NULL",
+            params![sql_i64(now, "timestamp")?],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_upload_refusal(&self, now: u64, code: &str) -> Result<(), GitAiError> {
+        self.connection.execute(
+            "INSERT INTO security_health_metadata(singleton,last_refusal_at,last_refusal_code) VALUES(1,?1,?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+               last_refusal_at=excluded.last_refusal_at,last_refusal_code=excluded.last_refusal_code",
+            params![sql_i64(now, "timestamp")?, code],
+        )?;
+        Ok(())
+    }
+
+    /// Queue one Endpoint-generated projection without moving the Numbat tail.
+    pub fn enqueue_generated(
+        &self,
+        record: &ProjectedRecord,
+        binding: &MetricDeliveryHealthBinding,
+        queued_at: u64,
+    ) -> Result<(), GitAiError> {
+        validate_binding(binding)?;
+        self.connection.execute(
+            "INSERT INTO security_record_queue(
+                kind,record_id,projection_json,lease_id,queued_at,next_retry_at,
+                delivery_tenant_id,delivery_api_base_url,delivery_credential_key_id)
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8)
+             ON CONFLICT(record_id) DO NOTHING",
+            params![
+                record.kind,
+                record.record_id,
+                serde_json::to_string(&record.json)?,
+                record.lease_id,
+                sql_i64(queued_at, "timestamp")?,
+                binding.tenant_id,
+                binding.api_base_url,
+                binding.credential_key_id,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn checkpoint(&self) -> Result<TailCheckpoint, GitAiError> {
@@ -134,6 +234,7 @@ impl SecurityRecordQueue {
         records: &[(&ProjectedRecord, &MetricDeliveryHealthBinding)],
         counters: &BTreeMap<String, u64>,
         queued_at: u64,
+        health: TailHealthObservation,
     ) -> Result<(), GitAiError> {
         let queued_at = sql_i64(queued_at, "timestamp")?;
         let tx = self.connection.transaction()?;
@@ -209,6 +310,15 @@ impl SecurityRecordQueue {
                 "INSERT INTO security_shipper_counters(name,value) VALUES(?1,?2)
                  ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
                 params![name, sql_i64(*value, "counter")?],
+            )?;
+        }
+        if health.valid_at.is_some() || health.rejected {
+            tx.execute(
+                "INSERT INTO security_health_metadata(singleton,last_valid_record_at,last_rejected_record_at)
+                 VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET
+                   last_valid_record_at=MAX(COALESCE(last_valid_record_at,0),COALESCE(excluded.last_valid_record_at,0)),
+                   last_rejected_record_at=MAX(COALESCE(last_rejected_record_at,0),COALESCE(excluded.last_rejected_record_at,0))",
+                params![health.valid_at, health.rejected.then_some(queued_at)],
             )?;
         }
         tx.commit()?;
@@ -422,6 +532,30 @@ mod tests {
     }
 
     #[test]
+    fn generated_status_queues_without_advancing_numbat_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
+        let status = crate::security::records::project_security_status(
+            json!({
+                "observed_at":"2026-10-19T00:00:00Z",
+                "numbat_version":"v0.2.0-trackai.1",
+                "wired_agents":[],"active_bundle_digest":null,
+                "lease_id":null,"last_record_at":null,
+                "health":{"hook_status":"unavailable","agent_effective_view":"unavailable",
+                    "local_record":"unavailable","forwarder_ack":"unavailable"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        queue.enqueue_generated(&status, &binding(), 100).unwrap();
+        queue.enqueue_generated(&status, &binding(), 100).unwrap();
+        assert_eq!(queue.count(), 1);
+        assert_eq!(queue.checkpoint().unwrap().offset, 0);
+    }
+
+    #[test]
     fn queue_commit_atomically_persists_minimized_projection_and_checkpoint() {
         let temp = tempfile::TempDir::new().unwrap();
         let mut queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
@@ -434,6 +568,7 @@ mod tests {
                 &[(&record, &binding)],
                 &BTreeMap::new(),
                 100,
+                TailHealthObservation::default(),
             )
             .unwrap();
         assert_eq!(queue.count(), 1);
@@ -455,6 +590,7 @@ mod tests {
                 &[],
                 &BTreeMap::from([("lease_absent".into(), 1)]),
                 100,
+                TailHealthObservation::default(),
             )
             .unwrap();
         assert_eq!(queue.count(), 0);
@@ -495,6 +631,7 @@ mod tests {
                 &[],
                 &BTreeMap::new(),
                 100,
+                TailHealthObservation::default(),
             )
             .unwrap();
         assert_eq!(queue.checkpoint().unwrap().identity, Some(tail.identity));
@@ -513,6 +650,7 @@ mod tests {
                 &[(&record, &binding)],
                 &BTreeMap::new(),
                 100,
+                TailHealthObservation::default(),
             )
             .unwrap();
         let id = queue.dequeue_pending(1, 100).unwrap()[0].id;
@@ -521,5 +659,41 @@ mod tests {
             .unwrap();
         assert_eq!(queue.count(), 0);
         assert_eq!(queue.counter("terminal:SECURITY_V2_UNKNOWN_FIELD"), 1);
+    }
+
+    #[test]
+    fn health_metadata_survives_reopen_and_excludes_generated_status_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("queue.db");
+        let mut queue = SecurityRecordQueue::open_at_path(&path).unwrap();
+        queue
+            .commit_poll(
+                &read(1),
+                NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+                &[],
+                &BTreeMap::new(),
+                100,
+                TailHealthObservation {
+                    valid_at: Some(99),
+                    rejected: true,
+                },
+            )
+            .unwrap();
+        queue
+            .record_upload_refusal(101, "SECURITY_V2_RECORD_CONFLICT")
+            .unwrap();
+        drop(queue);
+        let queue = SecurityRecordQueue::open_at_path(&path).unwrap();
+        let evidence = queue.health_evidence().unwrap();
+        assert_eq!(evidence.last_valid_record_at, Some(99));
+        assert_eq!(evidence.last_rejected_record_at, Some(100));
+        assert_eq!(
+            evidence.last_refusal_code.as_deref(),
+            Some("SECURITY_V2_RECORD_CONFLICT")
+        );
+        queue.record_upload_ack(102).unwrap();
+        let evidence = queue.health_evidence().unwrap();
+        assert_eq!(evidence.last_acked_at, Some(102));
+        assert_eq!(evidence.last_refusal_code, None);
     }
 }

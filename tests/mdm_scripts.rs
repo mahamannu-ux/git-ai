@@ -42,6 +42,26 @@ fn windows_cleanup_script() -> String {
     mdm_file("windows/cleanup-endpoint.ps1")
 }
 
+#[test]
+fn macos_package_installs_monitor_hooks_to_the_shipper_file() {
+    let postinstall = repo_file("packaging/macos/scripts/postinstall");
+    for flag in [
+        "hook install --agent \"$numbat_agent\" --managed --emit all",
+        "--content preview --output file",
+        "--rules-dir \"\\$HOME/.git-ai/internal/security/rules/current/$source_agent\"",
+        "--output-file '$HOME/.numbat/records.ndjson'",
+    ] {
+        assert!(
+            postinstall.contains(flag),
+            "missing managed hook argument: {flag}"
+        );
+    }
+    assert!(!postinstall.contains("--enforce"));
+    assert!(!postinstall.contains("--no-builtin-rules"));
+    assert!(postinstall.contains("builtin-rule-ids.txt"));
+    assert_eq!(repo_file("packaging/macos/agents.tsv").lines().count(), 5);
+}
+
 /// Asserts that the plist `<key>` is immediately followed by `<value/>`,
 /// ignoring the whitespace between them.
 fn plist_key_has_value(plist: &str, key: &str, value: &str) -> bool {
@@ -301,8 +321,11 @@ fn cleanup_wrappers_are_dry_run_first_and_explicit() {
         "Windows cleanup wrapper must default to dry-run"
     );
     assert!(
-        macos_cleanup_script().contains("not as root"),
-        "macOS cleanup wrapper must stay per-user like its login-start sibling"
+        macos_cleanup_script().contains("--user")
+            && macos_cleanup_script().contains("hook uninstall")
+            && macos_cleanup_script().contains("--managed")
+            && macos_cleanup_script().contains("run cleanup as root"),
+        "macOS cleanup must remove managed hooks as root and retain its user-scoped Task9 path"
     );
     assert!(
         !windows_cleanup_script().contains("-RunLevel Highest"),

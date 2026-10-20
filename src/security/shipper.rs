@@ -3,7 +3,7 @@
 use crate::error::GitAiError;
 use crate::metrics::delivery::MetricDeliveryHealthBinding;
 use crate::security::activation::SecurityLeaseContext;
-use crate::security::delivery_queue::SecurityRecordQueue;
+use crate::security::delivery_queue::{SecurityRecordQueue, TailHealthObservation};
 use crate::security::records::{PermissionJoinTracker, project_numbat_record};
 use crate::security::tail::{
     DEFAULT_MAX_ENTRIES_PER_POLL, TailEntryKind, delete_expired_rotations_except, read_available,
@@ -44,14 +44,44 @@ pub fn poll_security_records(
     let current_lease = leases.current();
     let mut projected = Vec::new();
     let mut counters = BTreeMap::<String, u64>::new();
+    let mut last_valid_record_at: Option<i64> = None;
+    let mut rejected_record = false;
     for entry in &read.entries {
         match &entry.kind {
-            TailEntryKind::Oversized => increment(&mut counters, "oversized_line"),
+            TailEntryKind::Oversized => {
+                increment(&mut counters, "oversized_line");
+                rejected_record = true;
+            }
             TailEntryKind::Record(raw) => {
                 let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(raw) else {
                     increment(&mut counters, "parse_error");
+                    rejected_record = true;
                     continue;
                 };
+                let timestamp = parsed
+                    .get("timestamp")
+                    .or_else(|| parsed.get("detected_at"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<DateTime<Utc>>().ok());
+                if parsed.get("schema_version").and_then(Value::as_str) == Some("0.5.0")
+                    && matches!(
+                        parsed.get("record_type").and_then(Value::as_str),
+                        Some("finding" | "enforcement" | "indicator" | "scan_summary" | "event")
+                    )
+                    && parsed
+                        .get("source_agent")
+                        .and_then(Value::as_str)
+                        .is_some_and(|agent| !agent.is_empty())
+                    && let Some(timestamp) = timestamp
+                {
+                    last_valid_record_at = Some(
+                        last_valid_record_at.map_or(timestamp.timestamp(), |previous| {
+                            previous.max(timestamp.timestamp())
+                        }),
+                    );
+                } else {
+                    rejected_record = true;
+                }
                 match parsed
                     .get("schema_version")
                     .and_then(serde_json::Value::as_str)
@@ -120,7 +150,17 @@ pub fn poll_security_records(
         .iter()
         .map(|(record, binding)| (record, *binding))
         .collect::<Vec<_>>();
-    queue.commit_poll(&read, local_date, &refs, &counters, now)?;
+    queue.commit_poll(
+        &read,
+        local_date,
+        &refs,
+        &counters,
+        now,
+        TailHealthObservation {
+            valid_at: last_valid_record_at,
+            rejected: rejected_record,
+        },
+    )?;
     let saved = queue.checkpoint()?;
     let mut rotation_checkpoint = saved.clone();
     // The transaction records today's poll date. Rotation must compare
@@ -258,6 +298,35 @@ mod tests {
         let rows = queue.dequeue_pending(500, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].projection_json.contains("tool_input"));
+        assert_eq!(
+            queue.health_evidence().unwrap().last_valid_record_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-17T10:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+    }
+
+    #[test]
+    fn rejected_tail_line_is_committed_as_health_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let records = temp.path().join("records.ndjson");
+        std::fs::write(&records, b"{\"schema_version\":\"wrong\"}\n").unwrap();
+        let mut queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
+        poll_security_records(
+            &records,
+            &mut queue,
+            &UnavailableLeaseContext,
+            None,
+            &HashMap::new(),
+            &mut PermissionJoinTracker::default(),
+            100,
+        )
+        .unwrap();
+        let evidence = queue.health_evidence().unwrap();
+        assert_eq!(evidence.last_rejected_record_at, Some(100));
+        assert_eq!(evidence.last_valid_record_at, None);
     }
 
     #[test]
