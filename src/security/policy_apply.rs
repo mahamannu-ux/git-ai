@@ -30,6 +30,7 @@ const PLACEHOLDER_RULE: &str = include_str!("../../packaging/macos/placeholder.y
 const BUILTIN_RULE_IDS: &str = include_str!("../../packaging/macos/builtin-rule-ids.txt");
 pub const MANAGED_AGENT_MAP: &str = include_str!("../../packaging/macos/agents.tsv");
 const MAX_SIGNED_BYTES: usize = 4 * 1024 * 1024 + 1024;
+const LEASE_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(60);
 const PINNED_ROOT_KEYIDS: &[&str] = &[];
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const SOURCE_AGENTS: &[&str] = &[
@@ -159,9 +160,7 @@ pub fn refresh_configured_security_policy(
         .ok_or_else(|| GitAiError::Generic("security state directory unavailable".into()))?
         .join(SECURITY_STATE_DIR);
     let state = crate::security::activation::configured_lease_context();
-    if state.lease_at(now).is_none() {
-        ensure_placeholder_current(&state_dir)?;
-    }
+    ensure_placeholder_if_inactive(&state, &state_dir, now)?;
     let Some(runtime) = crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
         .map_err(|error| GitAiError::Generic(error.to_string()))?
     else {
@@ -292,6 +291,20 @@ impl RulesChecker for NumbatRulesChecker {
         }
         RulesCheck::Passed
     }
+}
+
+// A server-ahead lease can be accepted before its historical activity window
+// begins. Keep its applied rules during that short gap; activity still uses
+// lease_at(now) and remains gated until issued_at.
+fn ensure_placeholder_if_inactive(
+    state: &LeaseStateStore,
+    state_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<(), GitAiError> {
+    if state.lease_at(now).is_none() && state.lease_at(now + LEASE_CLOCK_SKEW).is_none() {
+        ensure_placeholder_current(state_dir)?;
+    }
+    Ok(())
 }
 
 /// Keep hook callbacks loadable before a bundle and whenever no verified lease
@@ -515,9 +528,7 @@ impl PolicyApplier<'_> {
         if !self.state.is_validated() && !self.revalidate_cached(now)? {
             self.state.discard_untrusted()?;
         }
-        if self.state.lease_at(now).is_none() {
-            ensure_placeholder_current(&self.state_dir)?;
-        }
+        ensure_placeholder_if_inactive(self.state, &self.state_dir, now)?;
         self.retry_acknowledgements(now)?;
         let response = match self.http.get("/worker/security/v2/lease") {
             Ok(value) => value,
@@ -608,7 +619,9 @@ impl PolicyApplier<'_> {
         if enrolled_machine.is_some_and(|machine_id| lease.machine_id != *machine_id) {
             return self.refuse(&lease, RefusalCode::MachineMismatch, now);
         }
-        if !(lease.issued_at <= now && now < lease.expires_at) {
+        // Tolerate a small server-ahead clock skew when accepting a fresh lease.
+        // Historical record admission still uses issued_at <= activity time.
+        if !(lease.issued_at <= now + LEASE_CLOCK_SKEW && now < lease.expires_at) {
             return self.refuse(&lease, RefusalCode::LeaseExpired, now);
         }
         if lease.mode != LeaseMode::Off
@@ -1619,6 +1632,68 @@ mod tests {
     }
 
     #[test]
+    fn accepted_server_ahead_lease_keeps_bundle_during_clock_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (lease, bundle, now, digest) = fixture("machine-a", "monitor");
+        let signed: DsseEnvelope = serde_json::from_slice(&lease).unwrap();
+        let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+        let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+        payload["issued_at"] = json!((now + chrono::Duration::seconds(30)).to_rfc3339());
+        let lease = envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE);
+        let http = FakeHttp {
+            lease: HttpResponse {
+                status: 200,
+                body: lease,
+            },
+            bundle: Some(HttpResponse {
+                status: 200,
+                body: bundle,
+            }),
+            posts: Mutex::new(Vec::new()),
+        };
+        let state = LeaseStateStore::load(temp.path());
+        let verifier = verifier(2);
+        let checker = FakeChecker(RulesCheck::Passed);
+        let apply = PolicyApplier {
+            state_dir: temp.path().into(),
+            identity: PolicyIdentity {
+                tenant_id: "tenant-a".into(),
+                machine_id: Some("machine-a".into()),
+            },
+            state: &state,
+            http: &http,
+            verifier: &verifier,
+            checker: &checker,
+            lease_hint: None,
+        };
+        assert!(matches!(
+            apply.refresh(now).unwrap(),
+            RefreshOutcome::Applied { .. }
+        ));
+        let expected = PathBuf::from(format!("1-{}", &digest[..12]));
+        assert!(state.lease_at(now + chrono::Duration::seconds(1)).is_none());
+        ensure_placeholder_if_inactive(&state, temp.path(), now + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            state
+                .lease_at(now + chrono::Duration::seconds(30))
+                .unwrap()
+                .lease_id,
+            "lease-1"
+        );
+        ensure_placeholder_if_inactive(&state, temp.path(), now + chrono::Duration::hours(2))
+            .unwrap();
+        assert_eq!(
+            fs::read_link(temp.path().join("rules/current")).unwrap(),
+            PathBuf::from("placeholder")
+        );
+    }
+
+    #[test]
     fn foreign_lease_is_refused() {
         let temp = tempfile::tempdir().unwrap();
         let (lease, _, now, _) = fixture("machine-b", "monitor");
@@ -2133,6 +2208,57 @@ mod tests {
             RefreshOutcome::Applied { epoch: Some(1), .. }
         ));
         assert_eq!(http.posts.lock().unwrap()[0]["result"], "applied");
+    }
+
+    #[test]
+    fn server_ahead_lease_accepts_at_sixty_seconds_but_refuses_beyond() {
+        for (ahead_seconds, accepted) in [(60, true), (61, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+            let signed: DsseEnvelope = serde_json::from_slice(&lease).unwrap();
+            let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+            let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+            payload["issued_at"] =
+                json!((now + chrono::Duration::seconds(ahead_seconds)).to_rfc3339());
+            let http = FakeHttp {
+                lease: HttpResponse {
+                    status: 200,
+                    body: envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE),
+                },
+                bundle: Some(HttpResponse {
+                    status: 200,
+                    body: bundle,
+                }),
+                posts: Mutex::new(Vec::new()),
+            };
+            let state = LeaseStateStore::load(temp.path());
+            let verifier = verifier(2);
+            let checker = FakeChecker(RulesCheck::Passed);
+            let apply = PolicyApplier {
+                state_dir: temp.path().into(),
+                identity: PolicyIdentity {
+                    tenant_id: "tenant-a".into(),
+                    machine_id: Some("machine-a".into()),
+                },
+                state: &state,
+                http: &http,
+                verifier: &verifier,
+                checker: &checker,
+                lease_hint: None,
+            };
+            let outcome = apply.refresh(now).unwrap();
+            if accepted {
+                assert!(matches!(outcome, RefreshOutcome::Applied { .. }));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    RefreshOutcome::Refused {
+                        code: RefusalCode::LeaseExpired,
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]

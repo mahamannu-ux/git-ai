@@ -51,7 +51,10 @@ All work happens in `~/AIProjects/numbat` (the local Numbat checkout with the
    findings to the file sink, and writes one diagnostic to stderr starting
    `no agent artifacts found for --agent <agent> `. If the wording, record
    shape or output channel changes, update `src/security/day_one_scan.rs` and
-   its tests before releasing the new pin.
+   its tests before releasing the new pin. The Endpoint accepts this exact
+   no-artifacts diagnostic as a completed scan and shows it as “no session
+   files found”; other failures retry at most 24 times for the same tenant
+   and machine, then leave a `partial` marker naming the failed agents.
 
 8. **Extract the coverage table**:
    `sh packaging/numbat/extract-coverage.sh <numbat-checkout> \

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 const RETRY_SECONDS: i64 = 3_600;
+const MAX_FAILED_ATTEMPTS: u8 = 24;
 const AGENT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static NEXT_ATTEMPT_AT: AtomicI64 = AtomicI64::new(0);
@@ -30,6 +31,18 @@ struct DoneMarker {
     machine_id: String,
     bundle_digest: String,
     at: DateTime<Utc>,
+    #[serde(default)]
+    partial: bool,
+    #[serde(default)]
+    failed_agents: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttemptState {
+    tenant_id: String,
+    machine_id: String,
+    failed_attempts: u8,
+    failed_agents: Vec<String>,
 }
 
 fn managed_agents() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -60,7 +73,7 @@ fn done_for(path: &Path, tenant_id: &str, machine_id: &str) -> bool {
         .is_some_and(|marker| marker.tenant_id == tenant_id && marker.machine_id == machine_id)
 }
 
-fn write_done(path: &Path, marker: &DoneMarker) -> Result<(), GitAiError> {
+fn write_marker<T: Serialize>(path: &Path, marker: &T) -> Result<(), GitAiError> {
     let tmp = path.with_extension("tmp");
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -71,6 +84,14 @@ fn write_done(path: &Path, marker: &DoneMarker) -> Result<(), GitAiError> {
     file.sync_all()?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn failed_attempts(path: &Path, tenant_id: &str, machine_id: &str) -> u8 {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AttemptState>(&bytes).ok())
+        .filter(|state| state.tenant_id == tenant_id && state.machine_id == machine_id)
+        .map_or(0, |state| state.failed_attempts)
 }
 
 fn scan_command(
@@ -259,9 +280,29 @@ fn run_once(
     }
     let security_dir = internal_dir.join("security");
     let marker = security_dir.join("day-one-scan-done");
+    let attempts_path = security_dir.join("day-one-scan-attempts");
     if done_for(&marker, &tenant_id, &machine_id)
         || !applied_rules(&security_dir, &lease.bundle_digest)
     {
+        return Ok(());
+    }
+    let previous_failures = failed_attempts(&attempts_path, &tenant_id, &machine_id);
+    if previous_failures >= MAX_FAILED_ATTEMPTS {
+        if let Ok(bytes) = fs::read(&attempts_path)
+            && let Ok(state) = serde_json::from_slice::<AttemptState>(&bytes)
+        {
+            write_marker(
+                &marker,
+                &DoneMarker {
+                    tenant_id,
+                    machine_id,
+                    bundle_digest: lease.bundle_digest,
+                    at: Utc::now(),
+                    partial: true,
+                    failed_agents: state.failed_agents,
+                },
+            )?;
+        }
         return Ok(());
     }
     let tmp_dir = security_dir.join("scan-tmp");
@@ -274,6 +315,7 @@ fn run_once(
     fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700))?;
     let queue = SecurityRecordQueue::open_at_path(&internal_dir.join("security-findings.db"))?;
     let mut all_ok = true;
+    let mut failed_agents = Vec::new();
     for (agent, source) in managed_agents() {
         let output = tmp_dir.join(format!("{agent}.ndjson"));
         let diagnostics = output.with_extension("stderr.ndjson");
@@ -309,10 +351,14 @@ fn run_once(
         let _ = fs::remove_file(&diagnostics);
         match result {
             Ok(true) => {}
-            Ok(false) => all_ok = false,
+            Ok(false) => {
+                all_ok = false;
+                failed_agents.push(agent.to_owned());
+            }
             Err(error) => {
                 tracing::warn!(%error, agent, "day-one agent scan failed");
                 all_ok = false;
+                failed_agents.push(agent.to_owned());
             }
         }
         if context
@@ -324,22 +370,35 @@ fn run_once(
             return Ok(());
         }
     }
-    if all_ok
-        && context
-            .lease_at(Utc::now())
-            .as_ref()
-            .map(|active| active.lease_id.as_str())
-            == Some(&lease.lease_id)
+    if context
+        .lease_at(Utc::now())
+        .as_ref()
+        .map(|active| active.lease_id.as_str())
+        == Some(&lease.lease_id)
     {
-        write_done(
-            &marker,
-            &DoneMarker {
-                tenant_id,
-                machine_id,
-                bundle_digest: lease.bundle_digest,
-                at: Utc::now(),
-            },
-        )?;
+        if all_ok || previous_failures + 1 >= MAX_FAILED_ATTEMPTS {
+            write_marker(
+                &marker,
+                &DoneMarker {
+                    tenant_id,
+                    machine_id,
+                    bundle_digest: lease.bundle_digest,
+                    at: Utc::now(),
+                    partial: !all_ok,
+                    failed_agents,
+                },
+            )?;
+        } else {
+            write_marker(
+                &attempts_path,
+                &AttemptState {
+                    tenant_id,
+                    machine_id,
+                    failed_attempts: previous_failures + 1,
+                    failed_agents,
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -435,13 +494,15 @@ mod tests {
         assert!(!applied_rules(security, &"a".repeat(64)));
         let marker = security.join("day-one-scan-done");
         assert!(!done_for(&marker, "tenant-a", "machine-a"));
-        write_done(
+        write_marker(
             &marker,
             &DoneMarker {
                 tenant_id: "tenant-a".into(),
                 machine_id: "machine-a".into(),
                 bundle_digest: "a".repeat(64),
                 at: Utc.timestamp_opt(1, 0).unwrap(),
+                partial: false,
+                failed_agents: Vec::new(),
             },
         )
         .unwrap();
@@ -545,7 +606,62 @@ mod tests {
         )
         .unwrap();
         assert!(!security.join("day-one-scan-done").exists());
+        assert_eq!(
+            failed_attempts(
+                &security.join("day-one-scan-attempts"),
+                "tenant-a",
+                "machine-a"
+            ),
+            1
+        );
         assert_eq!(fs::read_dir(security.join("scan-tmp")).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn twenty_fourth_failed_attempt_marks_partial_and_stops_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let security = tmp.path().join("security");
+        let rules = security.join("rules");
+        fs::create_dir_all(rules.join("1-aaaaaaaaaaaa")).unwrap();
+        std::os::unix::fs::symlink("1-aaaaaaaaaaaa", rules.join("current")).unwrap();
+        let attempts = security.join("day-one-scan-attempts");
+        write_marker(
+            &attempts,
+            &AttemptState {
+                tenant_id: "tenant-a".into(),
+                machine_id: "machine-a".into(),
+                failed_attempts: 23,
+                failed_agents: vec!["codex".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(failed_attempts(&attempts, "tenant-b", "machine-a"), 0);
+        let fake = tmp.path().join("fake-numbat");
+        fs::write(&fake, "#!/bin/sh\nexit 2\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let context =
+            LeaseStateStore::from_state(&security, state(Utc::now(), LeaseMode::Monitor, true));
+        run_once(
+            &fake,
+            tmp.path(),
+            &context,
+            &binding(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let marker: DoneMarker =
+            serde_json::from_slice(&fs::read(security.join("day-one-scan-done")).unwrap()).unwrap();
+        assert!(marker.partial);
+        assert_eq!(marker.failed_agents.len(), managed_agents().count());
+        run_once(
+            Path::new("/nonexistent/numbat"),
+            tmp.path(),
+            &context,
+            &binding(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
