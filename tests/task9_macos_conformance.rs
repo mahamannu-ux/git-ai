@@ -179,3 +179,22 @@ fn endpoint_package_flavours_keep_product_names_and_support_boundaries_explicit(
         "packaging overview must use the product name and link the registry"
     );
 }
+
+#[test]
+fn task20j_note_pins_cross_task_sequence_and_separate_verdicts() {
+    let note = repo_file("docs/task20j-task9f-coordination-note.md");
+
+    for required in [
+        "((1 => 2) || 20j) => 3 (Intel + Jamf); (3 || 15n) => 4 => (5 || 6/Task9g)",
+        "Task19 `T19.9`",
+        "record their verdicts separately",
+        "trackai-endpoint-macos-x64.pkg",
+        "docs/task9-endpoint-package-flavours.md",
+        "Windows ARM64 remains build-only",
+    ] {
+        assert!(
+            note.contains(required),
+            "Task20j coordination note must retain boundary {required}"
+        );
+    }
+}
