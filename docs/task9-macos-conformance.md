@@ -88,7 +88,7 @@ configuration input:
 scripts/task9/macos-conformance.sh
 scripts/task9/macos-conformance.sh plan
 scripts/task9/macos-conformance.sh binary --binary /absolute/path/to/git-ai
-scripts/task9/macos-conformance.sh package --package /absolute/path/to/git-ai-macos-x64.pkg --checksum-file /absolute/path/to/PKG-SHA256SUMS
+scripts/task9/macos-conformance.sh package --package /absolute/path/to/trackai-endpoint-macos-x64.pkg --checksum-file /absolute/path/to/PKG-SHA256SUMS
 ```
 
 It refuses non-macOS hosts, creates an isolated temporary workspace, records
@@ -108,7 +108,7 @@ is privileged and must be run by the founder, never by Codex.
 ```bash
 set -euo pipefail
 REPO=/Users/manishmahajan/AIProjects/TrackAI-wt/Task9f-macos-conformance-gitai
-PKG=/absolute/path/to/git-ai-macos-x64.pkg
+PKG=/absolute/path/to/trackai-endpoint-macos-x64.pkg
 PKG_SUMS=/absolute/path/to/PKG-SHA256SUMS
 
 cd "$REPO"
@@ -143,7 +143,7 @@ does not change the signed/notarized artifact row, which remains pending.
 
 ```bash
 set -euo pipefail
-PKG=/absolute/path/to/git-ai-macos-x64.pkg
+PKG=/absolute/path/to/trackai-endpoint-macos-x64.pkg
 sudo installer -pkg "$PKG" -target /
 
 GIT_AI_BIN="$HOME/.git-ai/bin/git-ai"

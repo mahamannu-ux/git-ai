@@ -97,13 +97,14 @@ fn release_workflow_pins_intel_signing_notarization_and_checksums() {
     for required in [
         "runs-on: macos-15-intel",
         "targets: x86_64-apple-darwin",
-        "git-ai-macos-x64.pkg",
+        "trackai-endpoint-macos-x64.pkg",
+        "trackai-endpoint-macos-arm64.pkg",
         "productsign",
         "codesign --verify --strict",
         "xcrun notarytool submit",
         "xcrun stapler staple",
         "xcrun stapler validate",
-        "shasum -a 256 git-ai-macos-*.pkg",
+        "shasum -a 256 trackai-endpoint-macos-*.pkg",
         "PKG-SHA256SUMS",
     ] {
         assert!(
@@ -111,6 +112,13 @@ fn release_workflow_pins_intel_signing_notarization_and_checksums() {
             "release workflow must retain conformance gate {required}"
         );
     }
+
+    assert!(
+        !workflow.contains("git-ai-macos-x64.pkg")
+            && !workflow.contains("git-ai-macos-arm64.pkg")
+            && !workflow.contains("git-ai-macos-*.pkg"),
+        "combined macOS package filenames must use the TrackAI Endpoint product name"
+    );
 }
 
 #[test]
@@ -154,7 +162,7 @@ fn endpoint_package_flavours_keep_product_names_and_support_boundaries_explicit(
         "trackai-endpoint-macos-arm64.pkg",
         "trackai-endpoint-windows-x64.msi",
         "git-ai-windows-x64.msi",
-        "Not emitted today",
+        "not emitted today",
         "Build artifact only; no native or support claim.",
         "Task15n production trust documents",
         "does not imply APNs enrollment, Jamf validation",
