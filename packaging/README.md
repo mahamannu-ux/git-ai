@@ -1,6 +1,10 @@
-# Git AI packaging
+# TrackAI Endpoint packaging
 
-This directory contains MSI and PKG installer scaffolding for Git AI.
+This directory contains MSI and PKG installer scaffolding for the TrackAI
+Endpoint. Use **TrackAI Endpoint package** for the combined customer-facing
+installer; `git-ai` and `numbat` are its internal executable names. The
+[package flavour registry](../docs/task9-endpoint-package-flavours.md) records
+target public names, current workflow filenames and validation boundaries.
 
 Package outputs install `git-ai` and, on macOS, the TrackAI-managed Numbat
 binary. They must not install a `git`

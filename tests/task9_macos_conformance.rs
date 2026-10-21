@@ -142,3 +142,32 @@ fn runbook_keeps_all_live_claims_separate_and_pending() {
         );
     }
 }
+
+#[test]
+fn endpoint_package_flavours_keep_product_names_and_support_boundaries_explicit() {
+    let flavours = repo_file("docs/task9-endpoint-package-flavours.md");
+    let packaging = repo_file("packaging/README.md");
+
+    for required in [
+        "TrackAI Endpoint package",
+        "trackai-endpoint-macos-x64.pkg",
+        "trackai-endpoint-macos-arm64.pkg",
+        "trackai-endpoint-windows-x64.msi",
+        "git-ai-windows-x64.msi",
+        "Not emitted today",
+        "Build artifact only; no native or support claim.",
+        "Task15n production trust documents",
+        "does not imply APNs enrollment, Jamf validation",
+    ] {
+        assert!(
+            flavours.contains(required),
+            "package flavour registry must retain boundary {required}"
+        );
+    }
+
+    assert!(
+        packaging.contains("TrackAI Endpoint packaging")
+            && packaging.contains("package flavour registry"),
+        "packaging overview must use the product name and link the registry"
+    );
+}
