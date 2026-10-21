@@ -608,7 +608,9 @@ impl PolicyApplier<'_> {
         if enrolled_machine.is_some_and(|machine_id| lease.machine_id != *machine_id) {
             return self.refuse(&lease, RefusalCode::MachineMismatch, now);
         }
-        if !(lease.issued_at <= now && now < lease.expires_at) {
+        // Tolerate a small server-ahead clock skew when accepting a fresh lease.
+        // Historical record admission still uses issued_at <= activity time.
+        if !(lease.issued_at <= now + chrono::Duration::seconds(60) && now < lease.expires_at) {
             return self.refuse(&lease, RefusalCode::LeaseExpired, now);
         }
         if lease.mode != LeaseMode::Off
@@ -2133,6 +2135,57 @@ mod tests {
             RefreshOutcome::Applied { epoch: Some(1), .. }
         ));
         assert_eq!(http.posts.lock().unwrap()[0]["result"], "applied");
+    }
+
+    #[test]
+    fn server_ahead_lease_accepts_at_sixty_seconds_but_refuses_beyond() {
+        for (ahead_seconds, accepted) in [(60, true), (61, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (lease, bundle, now, _) = fixture("machine-a", "monitor");
+            let signed: DsseEnvelope = serde_json::from_slice(&lease).unwrap();
+            let payload = decode_base64_strict(&signed.payload, MAX_SIGNED_BYTES).unwrap();
+            let mut payload: Value = serde_json::from_slice(&payload).unwrap();
+            payload["issued_at"] =
+                json!((now + chrono::Duration::seconds(ahead_seconds)).to_rfc3339());
+            let http = FakeHttp {
+                lease: HttpResponse {
+                    status: 200,
+                    body: envelope(&serde_json::to_vec(&payload).unwrap(), LEASE_PAYLOAD_TYPE),
+                },
+                bundle: Some(HttpResponse {
+                    status: 200,
+                    body: bundle,
+                }),
+                posts: Mutex::new(Vec::new()),
+            };
+            let state = LeaseStateStore::load(temp.path());
+            let verifier = verifier(2);
+            let checker = FakeChecker(RulesCheck::Passed);
+            let apply = PolicyApplier {
+                state_dir: temp.path().into(),
+                identity: PolicyIdentity {
+                    tenant_id: "tenant-a".into(),
+                    machine_id: Some("machine-a".into()),
+                },
+                state: &state,
+                http: &http,
+                verifier: &verifier,
+                checker: &checker,
+                lease_hint: None,
+            };
+            let outcome = apply.refresh(now).unwrap();
+            if accepted {
+                assert!(matches!(outcome, RefreshOutcome::Applied { .. }));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    RefreshOutcome::Refused {
+                        code: RefusalCode::LeaseExpired,
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]
