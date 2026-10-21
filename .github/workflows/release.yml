@@ -407,7 +407,7 @@ jobs:
           retention-days: 30
 
   package-pkg:
-    name: Build macOS PKG installers
+    name: Build TrackAI Endpoint macOS PKGs
     needs: [build, build-macos-intel]
     if: >-
       !cancelled() &&
@@ -538,11 +538,11 @@ jobs:
           packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-arm64 \
             --numbat-dir "packaging/numbat/out/numbat_${NUMBAT_VERSION}_darwin_arm64" \
             --trust-dir release-trust --arch arm64 --version "$VERSION" \
-            --output release/git-ai-macos-arm64.pkg
+            --output release/trackai-endpoint-macos-arm64.pkg
           packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-x64 \
             --numbat-dir "packaging/numbat/out/numbat_${NUMBAT_VERSION}_darwin_amd64" \
             --trust-dir release-trust --arch x64 --version "$VERSION" \
-            --output release/git-ai-macos-x64.pkg
+            --output release/trackai-endpoint-macos-x64.pkg
 
       - name: Notarize PKG installers
         if: inputs.dry_run != true
@@ -570,12 +570,12 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          shasum -a 256 git-ai-macos-*.pkg | sort > PKG-SHA256SUMS
+          shasum -a 256 trackai-endpoint-macos-*.pkg | sort > PKG-SHA256SUMS
 
       - name: Upload PKG artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: macos-pkg
+          name: trackai-endpoint-macos-pkg
           path: |
             release/*.pkg
             release/PKG-SHA256SUMS
@@ -645,7 +645,7 @@ jobs:
           if (Test-Path $gitAi) { throw 'MSI uninstall did not remove git-ai.exe' }
 
   test-pkg:
-    name: Test macOS PKG installer
+    name: Test TrackAI Endpoint macOS PKG
     needs: package-pkg
     if: ${{ !cancelled() && needs.package-pkg.result == 'success' }}
     runs-on: macos-latest
@@ -653,14 +653,14 @@ jobs:
       - name: Download PKG artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: macos-pkg
+          name: trackai-endpoint-macos-pkg
           path: release
 
       - name: Verify PKG and install when a console user is available
         run: |
           set -euo pipefail
           for arch in arm64 x64; do
-            pkg="release/git-ai-macos-$arch.pkg"
+            pkg="release/trackai-endpoint-macos-$arch.pkg"
             expanded="expanded-$arch"
             pkgutil --expand "$pkg" "$expanded"
             test -x "$expanded/Scripts/numbat"
@@ -688,7 +688,7 @@ jobs:
           console_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory | /usr/bin/awk 'NR == 1 { print $2 }')"
           git_ai="$console_home/.git-ai/bin/git-ai"
 
-          sudo installer -pkg release/git-ai-macos-arm64.pkg -target /
+          sudo installer -pkg release/trackai-endpoint-macos-arm64.pkg -target /
           lipo "$git_ai" -verify_arch arm64
           "$git_ai" --version
           numbat='/Library/Application Support/TrackAI/Endpoint/bin/numbat'
@@ -903,8 +903,8 @@ jobs:
             - **Windows MSI (ARM64)**: `git-ai-windows-arm64.msi`
             - **macOS (Intel)**: `git-ai-macos-x64`
             - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
-            - **macOS PKG (Intel)**: `git-ai-macos-x64.pkg`
-            - **macOS PKG (Apple Silicon)**: `git-ai-macos-arm64.pkg`
+            - **TrackAI Endpoint PKG (macOS Intel)**: `trackai-endpoint-macos-x64.pkg`
+            - **TrackAI Endpoint PKG (macOS Apple Silicon)**: `trackai-endpoint-macos-arm64.pkg`
 
             ### MDM login-start scripts
             Register `git-ai bg start` to run at login (see `mdm/README.md`):
@@ -1007,7 +1007,7 @@ jobs:
             }'
 
   publish-pkg:
-    name: Publish macOS PKG installers
+    name: Publish TrackAI Endpoint macOS PKGs
     needs: [create-release, package-pkg, test-pkg, build]
     if: >-
       !cancelled() &&
@@ -1025,14 +1025,14 @@ jobs:
       - name: Download notarized PKG artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: macos-pkg
+          name: trackai-endpoint-macos-pkg
           path: release
 
       - name: Generate attestations for notarized PKGs
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
-            release/git-ai-macos-*.pkg
+            release/trackai-endpoint-macos-*.pkg
             release/PKG-SHA256SUMS
 
       - name: Attach notarized PKGs to the release
@@ -1051,7 +1051,7 @@ jobs:
           fi
 
           gh release upload "$RELEASE_TAG" \
-            release/git-ai-macos-*.pkg \
+            release/trackai-endpoint-macos-*.pkg \
             release/PKG-SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
