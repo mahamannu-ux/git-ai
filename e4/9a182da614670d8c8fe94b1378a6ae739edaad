@@ -1,0 +1,21 @@
+src/security/day_one_scan.rs
+  s_4bd686272a5179::t_d777ee1439fb9e 23,34-45,76,89-96,283,289-307,318,354-357,361,373-377,379-401,497,504-505,609-616,620-666
+src/security/policy_apply.rs
+  s_4bd686272a5179::t_16b6540def2d12 611-613,2140-2190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "e49a182da614670d8c8fe94b1378a6ae739edaad",
+  "prompts": {},
+  "sessions": {
+    "s_4bd686272a5179": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15e7e-ac27-7381-b5cf-96e8a27a3d00",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
