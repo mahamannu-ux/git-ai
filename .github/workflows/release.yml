@@ -431,6 +431,69 @@ jobs:
           name: git-ai-macos-x64
           path: artifacts
 
+      - name: Read audited Numbat pin
+        id: numbat-pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          source packaging/numbat/pin.env
+          echo "go_version=${NUMBAT_GO_VERSION#go}" >> "$GITHUB_OUTPUT"
+          echo "version=$NUMBAT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: ${{ steps.numbat-pin.outputs.go_version }}
+          cache: false
+
+      - name: Build audited Numbat binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/numbat/build.sh darwin arm64 packaging/numbat/out
+          packaging/numbat/build.sh darwin amd64 packaging/numbat/out
+
+      - name: Prepare release trust documents
+        shell: bash
+        env:
+          TRACKAI_SECURITY_TRUST_DOCUMENTS_B64: ${{ secrets.TRACKAI_SECURITY_TRUST_DOCUMENTS_B64 }}
+        run: |
+          set -euo pipefail
+          python3 packaging/macos/unpack-release-trust.py
+
+      - name: Import Apple application certificate for Numbat
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64}" || -z "${APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD}" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "::warning::Numbat remains unsigned in this dry-run PKG."
+              exit 0
+            fi
+            echo "::error::Missing Apple Developer ID Application signing secrets."
+            exit 1
+          fi
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          APPLE_APPLICATION_KEYCHAIN="$GITHUB_WORKSPACE/application-signing.keychain"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$APPLE_APPLICATION_KEYCHAIN"
+          echo "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64" | base64 --decode > application-signing.p12
+          security import application-signing.p12 -k "$APPLE_APPLICATION_KEYCHAIN" -P "$APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f application-signing.p12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$APPLE_APPLICATION_KEYCHAIN"
+          APPLE_DEVELOPER_ID_APPLICATION_IDENTITY="$(security find-identity -v -p codesigning "$APPLE_APPLICATION_KEYCHAIN" | awk -F'"' '/Developer ID Application:/ { print $2; exit }')"
+          if [[ -z "$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" ]]; then
+            echo "::error::Imported P12 does not contain a Developer ID Application signing identity."
+            exit 1
+          fi
+          echo "APPLE_APPLICATION_KEYCHAIN=$APPLE_APPLICATION_KEYCHAIN" >> "$GITHUB_ENV"
+          echo "APPLE_DEVELOPER_ID_APPLICATION_IDENTITY=$APPLE_DEVELOPER_ID_APPLICATION_IDENTITY" >> "$GITHUB_ENV"
+
       - name: Import Apple installer certificate
         shell: bash
         env:
@@ -471,14 +534,15 @@ jobs:
           VERSION="${VERSION#v}"
           mkdir -p release
           chmod +x artifacts/git-ai-macos-arm64 artifacts/git-ai-macos-x64
-          lipo -create artifacts/git-ai-macos-arm64 artifacts/git-ai-macos-x64 -output artifacts/git-ai-macos-universal
-          lipo artifacts/git-ai-macos-universal -verify_arch x86_64 arm64
-          if [[ "${{ inputs.dry_run }}" != "true" ]]; then
-            codesign --verify --strict --verbose=2 --all-architectures artifacts/git-ai-macos-universal
-          fi
-          packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-arm64 --arch arm64 --version "$VERSION" --output release/git-ai-macos-arm64.pkg
-          packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-x64 --arch x64 --version "$VERSION" --output release/git-ai-macos-x64.pkg
-          packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-universal --arch universal --version "$VERSION" --output release/git-ai-macos-universal.pkg
+          NUMBAT_VERSION="${{ steps.numbat-pin.outputs.version }}"
+          packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-arm64 \
+            --numbat-dir "packaging/numbat/out/numbat_${NUMBAT_VERSION}_darwin_arm64" \
+            --trust-dir release-trust --arch arm64 --version "$VERSION" \
+            --output release/git-ai-macos-arm64.pkg
+          packaging/macos/build-pkg.sh --binary artifacts/git-ai-macos-x64 \
+            --numbat-dir "packaging/numbat/out/numbat_${NUMBAT_VERSION}_darwin_amd64" \
+            --trust-dir release-trust --arch x64 --version "$VERSION" \
+            --output release/git-ai-macos-x64.pkg
 
       - name: Notarize PKG installers
         if: inputs.dry_run != true
@@ -592,22 +656,44 @@ jobs:
           name: macos-pkg
           path: release
 
-      - name: Install PKG
+      - name: Verify PKG and install when a console user is available
         run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            pkg="release/git-ai-macos-$arch.pkg"
+            expanded="expanded-$arch"
+            pkgutil --expand "$pkg" "$expanded"
+            test -x "$expanded/Scripts/numbat"
+            test -f "$expanded/Scripts/trust/root.json"
+            test -f "$expanded/Scripts/placeholder.yaml"
+            test -f "$expanded/Scripts/agents.tsv"
+            mach_arch=arm64
+            if [ "$arch" = x64 ]; then mach_arch=x86_64; fi
+            lipo "$expanded/Scripts/numbat" -verify_arch "$mach_arch"
+            if [[ "${{ inputs.dry_run }}" != "true" ]]; then
+              codesign --verify --strict --verbose=2 "$expanded/Scripts/numbat"
+            fi
+            expected_sha="$(awk 'NF == 2 && $2 ~ /\/numbat$/ {print $1}' "$expanded/Scripts/SHA256SUMS")"
+            actual_sha="$(shasum -a 256 "$expanded/Scripts/numbat" | awk '{print $1}')"
+            test -n "$expected_sha" && test "$expected_sha" = "$actual_sha"
+          done
+
           console_user="$(/usr/bin/stat -f%Su /dev/console)"
           case "$console_user" in
             ''|root|loginwindow|_mbsetupuser)
-              echo "::error::No valid console user is logged in"
-              exit 1
+              echo "::warning::PKG payload verified; hosted runner has no console user for installation. IT-T20h-01 covers the live install."
+              exit 0
               ;;
           esac
           console_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory | /usr/bin/awk 'NR == 1 { print $2 }')"
           git_ai="$console_home/.git-ai/bin/git-ai"
 
-          PKG=release/git-ai-macos-universal.pkg
-          sudo installer -pkg "$PKG" -target /
-          lipo "$git_ai" -verify_arch x86_64 arm64
+          sudo installer -pkg release/git-ai-macos-arm64.pkg -target /
+          lipo "$git_ai" -verify_arch arm64
           "$git_ai" --version
+          numbat='/Library/Application Support/TrackAI/Endpoint/bin/numbat'
+          test -x "$numbat"
+          "$numbat" rules check --no-builtin-rules --rules-dir "$console_home/.git-ai/internal/security/rules/current/claude-code"
 
           binary_owner="$(/usr/bin/stat -f%Su "$git_ai")"
           state_owner="$(/usr/bin/stat -f%Su "$console_home/.git-ai")"
@@ -819,7 +905,6 @@ jobs:
             - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
             - **macOS PKG (Intel)**: `git-ai-macos-x64.pkg`
             - **macOS PKG (Apple Silicon)**: `git-ai-macos-arm64.pkg`
-            - **macOS PKG (Universal)**: `git-ai-macos-universal.pkg`
 
             ### MDM login-start scripts
             Register `git-ai bg start` to run at login (see `mdm/README.md`):

@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trackai.dev/contracts/security-v2/security-activation-lease-v2.schema.json",
+  "title": "TrackAI security activation lease payload v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "machine_id",
+    "lease_id",
+    "issued_at",
+    "expires_at",
+    "mode",
+    "agents",
+    "bundle_digest",
+    "data_settings",
+    "day_one_scan"
+  ],
+  "properties": {
+    "schema_version": { "const": "trackai.security-activation-lease/2" },
+    "tenant_id": { "$ref": "#/definitions/opaqueId" },
+    "machine_id": { "$ref": "#/definitions/opaqueId" },
+    "lease_id": { "$ref": "#/definitions/opaqueId" },
+    "issued_at": { "$ref": "#/definitions/utcTimestamp" },
+    "expires_at": { "$ref": "#/definitions/utcTimestamp" },
+    "mode": { "enum": ["off", "monitor", "monitor_and_pilot_block"] },
+    "agents": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/definitions/sourceAgent" }
+    },
+    "bundle_digest": { "$ref": "#/definitions/sha256" },
+    "data_settings": {
+      "$ref": "https://trackai.dev/contracts/security-v2/security-data-settings-v1.schema.json"
+    },
+    "day_one_scan": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["mode"],
+        "properties": { "mode": { "enum": ["monitor", "monitor_and_pilot_block"] } }
+      },
+      "then": {
+        "properties": {
+          "agents": { "type": "array", "minItems": 1, "maxItems": 64 }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\s]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40,
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$"
+    },
+    "sourceAgent": {
+      "enum": [
+        "claude-code", "cowork", "codex", "gemini-cli", "cursor", "windsurf",
+        "copilot", "vscode", "opencode", "openclaw", "antigravity", "factory",
+        "grok", "devin-cli", "hermes", "kimi-code", "pi", "qwen-code",
+        "cline", "amp", "auggie", "kiro", "goose", "kilo", "openhands",
+        "crush", "junie", "unknown"
+      ]
+    }
+  }
+}

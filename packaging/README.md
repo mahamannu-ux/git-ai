@@ -2,15 +2,16 @@
 
 This directory contains MSI and PKG installer scaffolding for Git AI.
 
-Package outputs must install `git-ai` only. They must not install a `git`
+Package outputs install `git-ai` and, on macOS, the TrackAI-managed Numbat
+binary. They must not install a `git`
 wrapper, `git.exe` shim, `git-og`, or any other executable that changes Git
 command routing. Per-user trace2 and editor/agent setup remains the
 responsibility of `git-ai install-hooks`.
 
 The release workflow builds signed/notarized production packages when the
 required Apple and Azure signing secrets are configured. Dry-run releases can
-build unsigned packages for validation. macOS releases include Intel, Apple
-Silicon, and universal PKGs.
+build unsigned packages for validation. macOS releases include separate Intel
+and Apple Silicon PKGs; the universal PKG was removed in Task20h-a.
 
 The Windows MSI is per-user: it installs under
 `%USERPROFILE%\\.git-ai\\bin` and changes only that user's `PATH`. It has no

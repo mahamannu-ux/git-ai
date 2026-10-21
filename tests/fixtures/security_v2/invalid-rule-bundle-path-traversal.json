@@ -1,0 +1,19 @@
+{
+  "schema_version": "trackai.security-rule-bundle/1",
+  "tenant_id": "tenant-placeholder",
+  "bundle_version": 1,
+  "epoch": 1,
+  "issued_at": "2026-10-17T10:00:00Z",
+  "numbat_pin": "20a5a52",
+  "compiler_version": "trackai-compiler-1.0.0",
+  "agents": {
+    "claude-code": {
+      "files": [{
+        "path": "../escape.yaml",
+        "sha256": "d362272600460fd98c5c84a9ba9f87d821833c175b022da4159c0a08e8616607",
+        "content_b64": "CmlkOiBzZWNyZXRzLmFnZW50X3JlYWRfZW52CnZlcnNpb246ICIyLjAiCmVuYWJsZWQ6IHRydWUKdGl0bGU6IE5hcnJvdyBlbnZpcm9ubWVudCBydWxlCnNldmVyaXR5OiBtZWRpdW0KZXhwcjogJ2V2ZW50LmV2ZW50X3R5cGUgPT0gImNvbW1hbmQuZXhlYyIgJiYgZXZlbnQuY29tbWFuZC5jb250YWlucygiT1ZFUlJJREVfT05MWSIpJwo="
+      }],
+      "enabled_rule_ids": ["secrets.agent_read_env"]
+    }
+  }
+}

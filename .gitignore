@@ -41,3 +41,6 @@ fuzz/corpus/
 .worktrees/
 .claude/worktrees/
 
+
+# Task20b: local Numbat reproducibility outputs
+packaging/numbat/out/

@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trackai.dev/contracts/security-v2/security-data-settings-v1.schema.json",
+  "title": "TrackAI security data settings v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command_previews",
+    "file_paths",
+    "urls",
+    "host_identity",
+    "user_identity"
+  ],
+  "properties": {
+    "schema_version": { "const": "trackai.security-data-settings/1" },
+    "command_previews": { "type": "boolean", "default": false },
+    "file_paths": { "type": "boolean", "default": false },
+    "urls": { "type": "boolean", "default": false },
+    "host_identity": { "type": "boolean", "default": false },
+    "user_identity": { "type": "boolean", "default": false }
+  }
+}

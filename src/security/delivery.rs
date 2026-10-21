@@ -1,73 +1,72 @@
-//! Disconnected delivery adapter for queued Task6 security findings.
-//!
-//! The caller supplies credential resolution and upload functions. This keeps
-//! the adapter testable and prevents a live route from being enabled before
-//! TrackAI has approved durable storage.
+//! Security-v2 queue delivery using the existing machine credential.
 
 use crate::api::client::ApiContext;
 use crate::error::GitAiError;
-use crate::metrics::delivery::EvidenceDeliveryBinding;
-use crate::metrics::delivery::MetricDeliveryRuntime;
-use crate::security::delivery_queue::{
-    QueuedSecurityFinding, SecurityFindingFailureClass, SecurityFindingQueue,
-    SecurityFindingTerminalClass,
-};
-use serde::{Deserialize, Serialize};
+use crate::metrics::delivery::{MetricDeliveryHealthBinding, MetricDeliveryRuntime};
+use crate::security::activation::{SecurityLeaseContext, configured_lease_context};
+use crate::security::delivery_queue::{QueuedSecurityRecord, SecurityRecordQueue};
+use crate::security::records::minimize_queued;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, VecDeque};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecurityFindingUploadError {
-    pub index: usize,
-    pub error: String,
+const MAX_RECORDS: usize = 500;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadHttpResponse {
+    pub status: u16,
+    pub retry_after_seconds: Option<u64>,
+    pub body: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecurityFindingUploadResponse {
-    pub errors: Vec<SecurityFindingUploadError>,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultEnvelope {
+    schema_version: String,
+    results: Vec<RecordResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordResult {
+    record_id: String,
+    result: String,
+    code: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SecurityFindingFlushResult {
+pub struct SecurityFlushResult {
     pub delivered: usize,
-    pub terminal: usize,
+    pub dropped: usize,
     pub retrying: usize,
+    pub reprojected: usize,
 }
 
 type RouteKey = (String, String, String);
+type ParsedQueuedRecord = (QueuedSecurityRecord, Value);
+type SecurityBatch = Vec<ParsedQueuedRecord>;
 
-pub fn upload_security_findings(
-    context: &ApiContext,
-    body: &Value,
-) -> Result<SecurityFindingUploadResponse, GitAiError> {
-    let response = context.post_json("/worker/security/findings", body)?;
-    if response.status_code != 200 {
-        return Err(GitAiError::Generic(format!(
-            "security finding upload returned HTTP {}",
-            response.status_code
-        )));
-    }
-    let response_body = response.as_str().map_err(|_| {
-        GitAiError::Generic("security finding upload response was not valid UTF-8".to_string())
-    })?;
-    serde_json::from_str(response_body).map_err(|_| {
-        GitAiError::Generic("security finding upload response was invalid".to_string())
-    })
-}
-
-pub fn flush_security_findings_with<ResolveCredential, Upload>(
-    queue: &mut SecurityFindingQueue,
+pub fn flush_security_records_with<Resolve, Upload>(
+    queue: &mut SecurityRecordQueue,
+    leases: &dyn SecurityLeaseContext,
     now: u64,
-    limit: usize,
-    mut resolve_credential: ResolveCredential,
+    mut resolve: Resolve,
     mut upload: Upload,
-) -> Result<SecurityFindingFlushResult, GitAiError>
+) -> Result<SecurityFlushResult, GitAiError>
 where
-    ResolveCredential: FnMut(&EvidenceDeliveryBinding) -> Option<String>,
-    Upload: FnMut(&ApiContext, &Value) -> Result<SecurityFindingUploadResponse, GitAiError>,
+    Resolve: FnMut(&MetricDeliveryHealthBinding) -> Option<String>,
+    Upload:
+        FnMut(&MetricDeliveryHealthBinding, &str, &Value) -> Result<UploadHttpResponse, GitAiError>,
 {
-    let records = queue.dequeue_pending(limit, now)?;
-    let mut routes = BTreeMap::<RouteKey, Vec<QueuedSecurityFinding>>::new();
+    // Verification unavailable or no current lease is the off state. Preserve
+    // already-minimized rows for a later verified lease, but do not put them
+    // on the wire while local authorization is absent.
+    if leases.current().is_none() {
+        return Ok(SecurityFlushResult::default());
+    }
+    let records = queue.dequeue_pending(MAX_RECORDS, now)?;
+    let mut routes = BTreeMap::<RouteKey, Vec<QueuedSecurityRecord>>::new();
     for record in records {
         let binding = &record.delivery_binding;
         routes
@@ -79,135 +78,658 @@ where
             .or_default()
             .push(record);
     }
-
-    let mut result = SecurityFindingFlushResult::default();
+    let mut summary = SecurityFlushResult::default();
     for records in routes.into_values() {
-        let binding = &records[0].delivery_binding;
-        let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
-        let Some(credential) = resolve_credential(binding) else {
-            queue.mark_terminal(
-                &ids,
-                SecurityFindingTerminalClass::CredentialUnavailable,
-                now,
+        let binding = records[0].delivery_binding.clone();
+        let Some(credential) = resolve(&binding) else {
+            queue.delete_counted(
+                &records.iter().map(|record| record.id).collect::<Vec<_>>(),
+                "credential_unavailable",
             )?;
-            result.terminal += ids.len();
+            summary.dropped += records.len();
             continue;
         };
-
-        let mut findings = Vec::with_capacity(records.len());
-        let mut valid_ids = Vec::with_capacity(records.len());
-        for record in &records {
-            let finding = serde_json::from_str::<Value>(&record.finding_json)
-                .ok()
-                .and_then(|body| body.get("findings")?.as_array()?.first().cloned());
-            if let Some(finding) = finding {
-                findings.push(finding);
-                valid_ids.push(record.id);
-            } else {
-                queue.mark_terminal(
-                    &[record.id],
-                    SecurityFindingTerminalClass::InvalidLocalRecord,
-                    now,
-                )?;
-                result.terminal += 1;
-            }
+        let (batches, invalid_ids) = split_batches(records)?;
+        if !invalid_ids.is_empty() {
+            queue.delete_counted(&invalid_ids, "invalid_local_record")?;
+            summary.dropped += invalid_ids.len();
         }
-        if findings.is_empty() {
-            continue;
-        }
-
-        let context = ApiContext {
-            base_url: binding.api_base_url.clone(),
-            auth_token: None,
-            api_key: Some(credential),
-            author_identity: None,
-            timeout_secs: Some(30),
-        };
-        let body = json!({
-            "schemaVersion": "trackai.security-finding-upload/0.1",
-            "findings": findings,
-        });
-        let response = match upload(&context, &body) {
-            Ok(response) => response,
-            Err(_) => {
-                queue.mark_failed(
-                    &valid_ids,
-                    SecurityFindingFailureClass::TemporaryTransport,
-                    now,
-                )?;
-                result.retrying += valid_ids.len();
+        let mut pending_batches = VecDeque::from(batches);
+        while let Some(mut batch) = pending_batches.pop_front() {
+            let values = batch
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            let body = json!({"schema_version":"trackai.security-upload/2","records":values});
+            let has_numbat = batch.iter().any(|(record, _)| is_numbat_kind(&record.kind));
+            let response = match upload(&binding, &credential, &body) {
+                Ok(response) => response,
+                Err(_) => {
+                    let ids = batch
+                        .iter()
+                        .map(|(record, _)| record.id)
+                        .collect::<Vec<_>>();
+                    queue.mark_retry(&ids, "transport", now, None)?;
+                    summary.retrying += ids.len();
+                    continue;
+                }
+            };
+            let problem_code = problem_code(&response.body);
+            let split_failure = (response.status == 400
+                && matches!(
+                    problem_code.as_deref(),
+                    Some("SECURITY_V2_INVALID_BODY" | "SECURITY_V2_UNKNOWN_FIELD")
+                ))
+                || response.status == 413;
+            if split_failure {
+                if batch.len() == 1 {
+                    let code = problem_code
+                        .as_deref()
+                        .unwrap_or("SECURITY_V2_PAYLOAD_TOO_LARGE");
+                    queue.delete_counted(&[batch[0].0.id], code)?;
+                    if has_numbat {
+                        queue.record_upload_refusal(now, code)?;
+                    }
+                    summary.dropped += 1;
+                } else {
+                    let right = batch.split_off(batch.len() / 2);
+                    pending_batches.push_front(right);
+                    pending_batches.push_front(batch);
+                }
                 continue;
             }
-        };
-
-        let mut failed = HashSet::new();
-        let valid_response = response
-            .errors
-            .iter()
-            .all(|error| error.index < valid_ids.len() && failed.insert(error.index));
-        if !valid_response {
-            queue.mark_failed(
-                &valid_ids,
-                SecurityFindingFailureClass::ServerUnavailable,
-                now,
-            )?;
-            result.retrying += valid_ids.len();
-            continue;
+            if response.status == 429 {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.mark_retry(
+                    &ids,
+                    "SECURITY_V2_RATE_LIMITED",
+                    now,
+                    response.retry_after_seconds,
+                )?;
+                summary.retrying += ids.len();
+                continue;
+            }
+            if response.status >= 500
+                || problem_code.as_deref() == Some("SECURITY_V2_LEASE_REQUIRED")
+            {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.mark_retry(&ids, "SECURITY_V2_LEASE_REQUIRED", now, None)?;
+                summary.retrying += ids.len();
+                continue;
+            }
+            if response.status != 200
+                && matches!(
+                    problem_code.as_deref(),
+                    Some("SECURITY_V2_LEASE_MISMATCH" | "SECURITY_V2_RECORD_CONFLICT")
+                )
+            {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.delete_counted(&ids, problem_code.as_deref().unwrap_or("terminal"))?;
+                if has_numbat {
+                    queue.record_upload_refusal(
+                        now,
+                        problem_code.as_deref().unwrap_or("terminal"),
+                    )?;
+                }
+                summary.dropped += ids.len();
+                continue;
+            }
+            if response.status != 200 {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.mark_retry(&ids, "invalid_response", now, None)?;
+                summary.retrying += ids.len();
+                continue;
+            }
+            let Ok(envelope) = serde_json::from_str::<ResultEnvelope>(&response.body) else {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.mark_retry(&ids, "invalid_response", now, None)?;
+                summary.retrying += ids.len();
+                continue;
+            };
+            if envelope.schema_version != "trackai.security-upload-result/2"
+                || envelope.results.len() != batch.len()
+                || envelope
+                    .results
+                    .iter()
+                    .zip(&batch)
+                    .any(|(result, (record, _))| {
+                        result.record_id != record.record_id
+                            || !matches!(
+                                (result.result.as_str(), result.code.as_deref()),
+                                ("accepted" | "duplicate", None) | ("rejected", Some(_))
+                            )
+                    })
+            {
+                let ids = batch
+                    .iter()
+                    .map(|(record, _)| record.id)
+                    .collect::<Vec<_>>();
+                queue.mark_retry(&ids, "invalid_response", now, None)?;
+                summary.retrying += ids.len();
+                continue;
+            }
+            if has_numbat {
+                queue.record_upload_ack(now)?;
+            }
+            for (result, (record, value)) in envelope.results.iter().zip(batch.iter()) {
+                match (result.result.as_str(), result.code.as_deref()) {
+                    ("accepted" | "duplicate", None) => {
+                        queue.delete(&[record.id])?;
+                        summary.delivered += 1;
+                    }
+                    ("rejected", Some("SECURITY_V2_FIELD_NOT_PERMITTED")) => {
+                        let Some(current) = leases.current() else {
+                            queue.mark_retry(
+                                &[record.id],
+                                "SECURITY_V2_LEASE_REQUIRED",
+                                now,
+                                None,
+                            )?;
+                            summary.retrying += 1;
+                            continue;
+                        };
+                        if let Some(minimized) = minimize_queued(value, &current.data_settings) {
+                            queue.replace_projection(record.id, &minimized)?;
+                            summary.reprojected += 1;
+                        } else {
+                            queue
+                                .delete_counted(&[record.id], "SECURITY_V2_FIELD_NOT_PERMITTED")?;
+                            if is_numbat_kind(&record.kind) {
+                                queue.record_upload_refusal(
+                                    now,
+                                    "SECURITY_V2_FIELD_NOT_PERMITTED",
+                                )?;
+                            }
+                            summary.dropped += 1;
+                        }
+                    }
+                    (
+                        "rejected",
+                        Some(
+                            "SECURITY_V2_LEASE_MISMATCH"
+                            | "SECURITY_V2_RECORD_CONFLICT"
+                            | "SECURITY_V2_INVALID_BODY"
+                            | "SECURITY_V2_UNKNOWN_FIELD",
+                        ),
+                    ) => {
+                        queue.delete_counted(&[record.id], result.code.as_deref().unwrap())?;
+                        if is_numbat_kind(&record.kind) {
+                            queue.record_upload_refusal(now, result.code.as_deref().unwrap())?;
+                        }
+                        summary.dropped += 1;
+                    }
+                    _ => {
+                        queue.mark_retry(&[record.id], "invalid_response", now, None)?;
+                        summary.retrying += 1;
+                    }
+                }
+            }
         }
-
-        let delivered_ids = valid_ids
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !failed.contains(index))
-            .map(|(_, id)| *id)
-            .collect::<Vec<_>>();
-        let terminal_ids = valid_ids
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| failed.contains(index))
-            .map(|(_, id)| *id)
-            .collect::<Vec<_>>();
-        queue.mark_delivered(&delivered_ids, now)?;
-        queue.mark_terminal(
-            &terminal_ids,
-            SecurityFindingTerminalClass::ServerRejected,
-            now,
-        )?;
-        result.delivered += delivered_ids.len();
-        result.terminal += terminal_ids.len();
     }
-    Ok(result)
+    Ok(summary)
 }
 
-pub fn flush_security_findings(
-    queue: &mut SecurityFindingQueue,
-    runtime: &MetricDeliveryRuntime,
-    now: u64,
-    limit: usize,
-) -> Result<SecurityFindingFlushResult, GitAiError> {
-    flush_security_findings_with(
-        queue,
-        now,
-        limit,
-        |binding| runtime.credential_for_evidence_binding(binding).ok(),
-        upload_security_findings,
+fn is_numbat_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "finding" | "enforcement" | "indicator" | "permission_event" | "scan_summary"
     )
 }
 
-pub fn flush_configured_security_findings(
-    now: u64,
-    limit: usize,
-) -> Result<SecurityFindingFlushResult, GitAiError> {
+fn split_batches(
+    records: Vec<QueuedSecurityRecord>,
+) -> Result<(Vec<SecurityBatch>, Vec<i64>), GitAiError> {
+    let mut batches = Vec::new();
+    let mut current = SecurityBatch::new();
+    let mut invalid_ids = Vec::new();
+    for record in records {
+        let Ok(value) = serde_json::from_str::<Value>(&record.projection_json) else {
+            invalid_ids.push(record.id);
+            continue;
+        };
+        let mut candidate = current
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        candidate.push(value.clone());
+        let bytes = serde_json::to_vec(
+            &json!({"schema_version":"trackai.security-upload/2","records":candidate}),
+        )?
+        .len();
+        if (!current.is_empty() && bytes > MAX_BODY_BYTES) || current.len() == MAX_RECORDS {
+            batches.push(std::mem::take(&mut current));
+        }
+        let single_bytes = serde_json::to_vec(
+            &json!({"schema_version":"trackai.security-upload/2","records":[&value]}),
+        )?
+        .len();
+        if single_bytes > MAX_BODY_BYTES {
+            invalid_ids.push(record.id);
+            continue;
+        }
+        current.push((record, value));
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok((batches, invalid_ids))
+}
+
+fn problem_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("code")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+pub fn upload_security_records(
+    binding: &MetricDeliveryHealthBinding,
+    credential: &str,
+    body: &Value,
+) -> Result<UploadHttpResponse, GitAiError> {
+    let url = format!(
+        "{}/worker/security/v2/records",
+        binding.api_base_url.trim_end_matches('/')
+    );
+    let body = serde_json::to_string(body)?;
+    let (_agent, request) = ApiContext::http_post(&url, Some(30));
+    let response = request
+        .header("Content-Type", "application/json")
+        .header("X-API-Key", credential)
+        .send(&body)
+        .map_err(|error| GitAiError::Generic(format!("security upload failed: {error}")))?;
+    let status = response.status().as_u16();
+    let retry_after_seconds = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let mut body = response.into_body();
+    let body = body
+        .read_to_string()
+        .map_err(|error| GitAiError::Generic(format!("security response failed: {error}")))?;
+    Ok(UploadHttpResponse {
+        status,
+        retry_after_seconds,
+        body,
+    })
+}
+
+pub fn flush_configured_security_records(now: u64) -> Result<SecurityFlushResult, GitAiError> {
     let Some(runtime) = MetricDeliveryRuntime::load_optional_default()
         .map_err(|error| GitAiError::Generic(error.to_string()))?
     else {
-        return Ok(SecurityFindingFlushResult::default());
+        return Ok(SecurityFlushResult::default());
     };
-    let daemon_config = crate::daemon::DaemonConfig::from_env_or_default_paths()?;
-    let queue_path = daemon_config.internal_dir.join("security-findings.db");
-    if !queue_path.try_exists()? {
-        return Ok(SecurityFindingFlushResult::default());
+    let config = crate::daemon::DaemonConfig::from_env_or_default_paths()?;
+    let path = config.internal_dir.join("security-findings.db");
+    if !path.try_exists()? {
+        return Ok(SecurityFlushResult::default());
     }
-    let mut queue = SecurityFindingQueue::open_at_path(&queue_path)?;
-    flush_security_findings(&mut queue, &runtime, now, limit)
+    let mut queue = SecurityRecordQueue::open_at_path(&path)?;
+    flush_security_records_with(
+        &mut queue,
+        configured_lease_context(),
+        now,
+        |binding| runtime.credential_for_health_binding(binding).ok(),
+        upload_security_records,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::activation::{LeaseSnapshot, UnavailableLeaseContext};
+    use crate::security::records::{ProjectedRecord, SecurityDataSettings};
+    use crate::security::tail::{FileIdentity, TailRead};
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use std::collections::BTreeMap;
+
+    struct Lease(SecurityDataSettings);
+    impl SecurityLeaseContext for Lease {
+        fn current(&self) -> Option<LeaseSnapshot> {
+            Some(LeaseSnapshot {
+                lease_id: "lease".into(),
+                bundle_digest: "a".repeat(64),
+                issued_at: Utc.timestamp_opt(0, 0).unwrap(),
+                expires_at: Utc.timestamp_opt(4_000_000_000, 0).unwrap(),
+                data_settings: self.0.clone(),
+            })
+        }
+        fn lease_at(&self, at: chrono::DateTime<Utc>) -> Option<LeaseSnapshot> {
+            self.current()
+                .filter(|lease| lease.issued_at <= at && at < lease.expires_at)
+        }
+        fn issued(&self, _lease_id: &str) -> Option<LeaseSnapshot> {
+            self.current()
+        }
+    }
+
+    fn binding() -> MetricDeliveryHealthBinding {
+        MetricDeliveryHealthBinding {
+            tenant_id: "tenant".into(),
+            api_base_url: "https://trackai.example".into(),
+            credential_key_id: "ABCDEFGHIJKLMNOP".into(),
+        }
+    }
+
+    fn queue_with(values: Vec<Value>) -> (tempfile::TempDir, SecurityRecordQueue) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut queue = SecurityRecordQueue::open_at_path(&temp.path().join("queue.db")).unwrap();
+        let records = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut json)| {
+                let record_id = format!("sha256:{index:064x}");
+                json.as_object_mut()
+                    .unwrap()
+                    .insert("record_id".into(), json!(record_id));
+                ProjectedRecord {
+                    kind: json["kind"].as_str().unwrap().into(),
+                    record_id,
+                    lease_id: "lease".into(),
+                    json,
+                }
+            })
+            .collect::<Vec<_>>();
+        let binding = binding();
+        let refs = records
+            .iter()
+            .map(|record| (record, &binding))
+            .collect::<Vec<_>>();
+        queue
+            .commit_poll(
+                &TailRead {
+                    identity: FileIdentity {
+                        device: 1,
+                        inode: 1,
+                    },
+                    reset: false,
+                    start_offset: 0,
+                    next_offset: 1,
+                    partial_len: 0,
+                    file_len: 1,
+                    reached_eof: true,
+                    entries: vec![],
+                },
+                NaiveDate::from_ymd_opt(2026, 10, 17).unwrap(),
+                &refs,
+                &BTreeMap::new(),
+                10,
+                crate::security::delivery_queue::TailHealthObservation::default(),
+            )
+            .unwrap();
+        (temp, queue)
+    }
+
+    #[test]
+    fn accepted_duplicate_and_every_terminal_code_delete_rows() {
+        let (_temp, mut queue) = queue_with(vec![
+            json!({"kind":"finding"}),
+            json!({"kind":"scan_summary"}),
+            json!({"kind":"permission_event"}),
+            json!({"kind":"enforcement"}),
+            json!({"kind":"security_status"}),
+            json!({"kind":"agent_inventory"}),
+        ]);
+        let result=flush_security_records_with(
+            &mut queue,&Lease(SecurityDataSettings::ALL_OFF),10,|_|Some("credential".into()),
+            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"schema_version":"trackai.security-upload-result/2","results":[
+                {"record_id":body["records"][0]["record_id"],"result":"accepted"},
+                {"record_id":body["records"][1]["record_id"],"result":"duplicate"},
+                {"record_id":body["records"][2]["record_id"],"result":"rejected","code":"SECURITY_V2_LEASE_MISMATCH"},
+                {"record_id":body["records"][3]["record_id"],"result":"rejected","code":"SECURITY_V2_RECORD_CONFLICT"},
+                {"record_id":body["records"][4]["record_id"],"result":"rejected","code":"SECURITY_V2_INVALID_BODY"},
+                {"record_id":body["records"][5]["record_id"],"result":"rejected","code":"SECURITY_V2_UNKNOWN_FIELD"}
+            ]}).to_string() })
+        ).unwrap();
+        assert_eq!(result.delivered, 2);
+        assert_eq!(result.dropped, 4);
+        assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        let evidence = queue.health_evidence().unwrap();
+        assert_eq!(evidence.last_acked_at, Some(10));
+        assert_eq!(
+            evidence.last_refusal_code.as_deref(),
+            Some("SECURITY_V2_RECORD_CONFLICT")
+        );
+    }
+
+    #[test]
+    fn field_not_permitted_only_deletes_from_minimized_projection() {
+        let record_id = format!("sha256:{:064x}", 0);
+        let (_temp, mut queue) = queue_with(vec![json!({
+            "kind":"finding","record_id":record_id,
+            "observed_command":"redacted","observed_url":"https://example.invalid",
+            "endpoint":{"hostname":"host","username":"user"}
+        })]);
+        let result=flush_security_records_with(
+            &mut queue,&Lease(SecurityDataSettings::ALL_OFF),10,|_|Some("credential".into()),
+            |_,_,body| Ok(UploadHttpResponse { status:200,retry_after_seconds:None,body:json!({"schema_version":"trackai.security-upload-result/2","results":[{
+                "record_id":body["records"][0]["record_id"],"result":"rejected","code":"SECURITY_V2_FIELD_NOT_PERMITTED"
+            }]}).to_string() })
+        ).unwrap();
+        assert_eq!(result.reprojected, 1);
+        let rows = queue.dequeue_pending(500, 10).unwrap();
+        let value: Value = serde_json::from_str(&rows[0].projection_json).unwrap();
+        assert_eq!(value["record_id"], record_id);
+        for key in ["observed_command", "observed_url", "endpoint"] {
+            assert!(value.get(key).is_none());
+        }
+    }
+
+    #[test]
+    fn lease_required_server_error_and_rate_limit_retry() {
+        for (status, retry_after) in [(403, None), (503, None), (429, Some(17))] {
+            let (_temp, mut queue) = queue_with(vec![json!({"kind":"scan_summary"})]);
+            let result = flush_security_records_with(
+                &mut queue,
+                &Lease(SecurityDataSettings::ALL_OFF),
+                10,
+                |_| Some("credential".into()),
+                |_, _, _| {
+                    Ok(UploadHttpResponse {
+                        status,
+                        retry_after_seconds: retry_after,
+                        body: if status == 403 {
+                            json!({"code":"SECURITY_V2_LEASE_REQUIRED"}).to_string()
+                        } else {
+                            "{}".into()
+                        },
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(result.retrying, 1);
+            assert_eq!(queue.dequeue_pending(500, 1000).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn field_not_permitted_drops_indicator_when_urls_are_off() {
+        let (_temp, mut queue) = queue_with(vec![json!({
+            "kind":"indicator","type":"domain","value":"example.invalid"
+        })]);
+        let result = flush_security_records_with(
+            &mut queue,
+            &Lease(SecurityDataSettings::ALL_OFF),
+            10,
+            |_| Some("credential".into()),
+            |_, _, body| {
+                Ok(UploadHttpResponse {
+                    status: 200,
+                    retry_after_seconds: None,
+                    body: json!({"schema_version":"trackai.security-upload-result/2","results":[{
+                        "record_id":body["records"][0]["record_id"],
+                        "result":"rejected","code":"SECURITY_V2_FIELD_NOT_PERMITTED"
+                    }]})
+                    .to_string(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result.dropped, 1);
+        assert!(queue.dequeue_pending(500, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unavailable_lease_context_sends_nothing_and_preserves_queue() {
+        let (_temp, mut queue) = queue_with(vec![json!({"kind":"scan_summary"})]);
+        let mut upload_called = false;
+        let result = flush_security_records_with(
+            &mut queue,
+            &UnavailableLeaseContext,
+            10,
+            |_| Some("credential".into()),
+            |_, _, _| {
+                upload_called = true;
+                unreachable!()
+            },
+        )
+        .unwrap();
+        assert_eq!(result, SecurityFlushResult::default());
+        assert!(!upload_called);
+        assert_eq!(queue.dequeue_pending(500, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_success_envelope_never_deletes_a_durable_row() {
+        for response_body in [
+            json!({"results":[]}),
+            json!({
+                "schema_version":"trackai.security-upload-result/2",
+                "results":[],
+                "unknown":true
+            }),
+        ] {
+            let (_temp, mut queue) = queue_with(vec![json!({"kind":"scan_summary"})]);
+            let result = flush_security_records_with(
+                &mut queue,
+                &Lease(SecurityDataSettings::ALL_OFF),
+                10,
+                |_| Some("credential".into()),
+                |_, _, _| {
+                    Ok(UploadHttpResponse {
+                        status: 200,
+                        retry_after_seconds: None,
+                        body: response_body.to_string(),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(result.retrying, 1);
+            assert_eq!(queue.dequeue_pending(500, 1_000).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn whole_request_failure_isolates_one_bad_record_and_delivers_the_rest() {
+        let values = (0..500)
+            .map(|_| json!({"kind":"scan_summary"}))
+            .collect::<Vec<_>>();
+        let bad_record_id = format!("sha256:{:064x}", 247);
+        let (_temp, mut queue) = queue_with(values);
+
+        let result = flush_security_records_with(
+            &mut queue,
+            &Lease(SecurityDataSettings::ALL_OFF),
+            10,
+            |_| Some("credential".into()),
+            |_, _, body| {
+                let records = body["records"].as_array().unwrap();
+                if records
+                    .iter()
+                    .any(|record| record["record_id"] == bad_record_id)
+                {
+                    return Ok(UploadHttpResponse {
+                        status: 400,
+                        retry_after_seconds: None,
+                        body: json!({"code":"SECURITY_V2_INVALID_BODY"}).to_string(),
+                    });
+                }
+                Ok(UploadHttpResponse {
+                    status: 200,
+                    retry_after_seconds: None,
+                    body: json!({
+                        "schema_version":"trackai.security-upload-result/2",
+                        "results": records.iter().map(|record| json!({
+                            "record_id":record["record_id"],
+                            "result":"accepted"
+                        })).collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.delivered, 499);
+        assert_eq!(result.dropped, 1);
+        assert_eq!(result.retrying, 0);
+        assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        assert_eq!(queue.counter("terminal:SECURITY_V2_INVALID_BODY"), 1);
+    }
+
+    #[test]
+    fn payload_too_large_splits_and_drops_only_a_bad_singleton() {
+        let bad_record_id = format!("sha256:{:064x}", 1);
+        let (_temp, mut queue) = queue_with(vec![
+            json!({"kind":"scan_summary"}),
+            json!({"kind":"scan_summary"}),
+        ]);
+
+        let result = flush_security_records_with(
+            &mut queue,
+            &Lease(SecurityDataSettings::ALL_OFF),
+            10,
+            |_| Some("credential".into()),
+            |_, _, body| {
+                let records = body["records"].as_array().unwrap();
+                if records
+                    .iter()
+                    .any(|record| record["record_id"] == bad_record_id)
+                {
+                    return Ok(UploadHttpResponse {
+                        status: 413,
+                        retry_after_seconds: None,
+                        body: json!({"code":"SECURITY_V2_PAYLOAD_TOO_LARGE"}).to_string(),
+                    });
+                }
+                Ok(UploadHttpResponse {
+                    status: 200,
+                    retry_after_seconds: None,
+                    body: json!({
+                        "schema_version":"trackai.security-upload-result/2",
+                        "results":[{
+                            "record_id":records[0]["record_id"],
+                            "result":"accepted"
+                        }]
+                    })
+                    .to_string(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.delivered, 1);
+        assert_eq!(result.dropped, 1);
+        assert_eq!(result.retrying, 0);
+        assert!(queue.dequeue_pending(500, 10_000).unwrap().is_empty());
+        assert_eq!(queue.counter("terminal:SECURITY_V2_PAYLOAD_TOO_LARGE"), 1);
+    }
 }

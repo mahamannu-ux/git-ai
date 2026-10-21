@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trackai.dev/contracts/security-v2/fleet-configuration-v3.schema.json",
+  "title": "TrackAI fleet configuration envelope v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "configurationId",
+    "epoch",
+    "issuedAt",
+    "validUntil",
+    "channel",
+    "ring",
+    "repositoryPolicies",
+    "securityLease",
+    "verification",
+    "clientCompatibility",
+    "desiredRelease"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "configurationId": { "$ref": "#/definitions/opaqueId" },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "issuedAt": { "$ref": "#/definitions/utcTimestamp" },
+    "validUntil": {
+      "oneOf": [
+        { "$ref": "#/definitions/utcTimestamp" },
+        { "type": "null" }
+      ]
+    },
+    "channel": {
+      "enum": ["latest", "next", "enterprise-latest", "enterprise-next"]
+    },
+    "ring": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 64 },
+        { "type": "null" }
+      ]
+    },
+    "repositoryPolicies": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/definitions/repositoryPolicy" }
+    },
+    "securityLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "bundleDigest", "expiresAt"],
+      "properties": {
+        "leaseId": { "$ref": "#/definitions/opaqueId" },
+        "bundleDigest": { "$ref": "#/definitions/sha256" },
+        "expiresAt": { "$ref": "#/definitions/utcTimestamp" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "state"],
+      "properties": {
+        "required": { "const": true },
+        "state": { "const": "unavailable" }
+      }
+    },
+    "clientCompatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimumVersion", "maximumVersion"],
+      "properties": {
+        "minimumVersion": { "$ref": "#/definitions/semver" },
+        "maximumVersion": { "$ref": "#/definitions/semver" }
+      }
+    },
+    "desiredRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "releaseTag", "manifestUrl", "manifestSha256"],
+      "properties": {
+        "version": { "$ref": "#/definitions/semver" },
+        "releaseTag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "manifestUrl": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^https://github\\.com/mahamannu-ux/git-ai/releases/download/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/SHA256SUMS$"
+        },
+        "manifestSha256": { "$ref": "#/definitions/sha256" }
+      }
+    }
+  },
+  "definitions": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\s]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40,
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$"
+    },
+    "semver": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "repositoryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repositoryId",
+        "enrollmentId",
+        "grantId",
+        "branchPatterns",
+        "effectiveFrom",
+        "effectiveUntil"
+      ],
+      "properties": {
+        "repositoryId": { "$ref": "#/definitions/opaqueId" },
+        "enrollmentId": { "$ref": "#/definitions/opaqueId" },
+        "grantId": { "$ref": "#/definitions/opaqueId" },
+        "branchPatterns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "effectiveFrom": { "$ref": "#/definitions/utcTimestamp" },
+        "effectiveUntil": {
+          "oneOf": [
+            { "$ref": "#/definitions/utcTimestamp" },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

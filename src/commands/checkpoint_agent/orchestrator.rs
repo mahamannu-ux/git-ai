@@ -453,19 +453,6 @@ fn execute_pre_bash_call(e: PreBashCall) -> Result<Vec<CheckpointRequest>, GitAi
     };
     let repo_work_dir = repository.workdir()?;
 
-    if e.context.agent_id.tool == "opencode"
-        && let Some(command) = e.command.as_deref()
-        && let Some(repository_url) = crate::repo_url::resolve_repo_url_from_repo(&repository)
-    {
-        crate::security::activation::submit_activated_command(
-            &repository_url,
-            &e.context.external_session_id,
-            &e.tool_use_id,
-            command,
-            chrono::Utc::now().timestamp(),
-        );
-    }
-
     if config::Config::get()
         .get_feature_flags()
         .bash_checkpoints_v2
