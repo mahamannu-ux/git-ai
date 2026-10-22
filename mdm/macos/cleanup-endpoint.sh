@@ -18,6 +18,7 @@ BIN=""
 TARGET_USER=""
 NUMBAT_ADMIN_DIR="/Library/Application Support/TrackAI/Endpoint"
 NUMBAT_BIN="$NUMBAT_ADMIN_DIR/bin/numbat"
+RECEIPT_ID="com.git-ai.git-ai"
 
 usage() {
   cat <<'USAGE'
@@ -82,6 +83,7 @@ if [ "$MODE" = "dry-run" ]; then
   echo "git-ai cleanup-endpoint: binary=$NUMBAT_BIN"
   echo "git-ai cleanup-endpoint: security=$TARGET_HOME/.git-ai/internal/security"
   echo "git-ai cleanup-endpoint: preserved=$TARGET_HOME/.numbat"
+  echo "git-ai cleanup-endpoint: receipt=$RECEIPT_ID action=forget-after-successful-root-apply"
   if [ "$(id -u)" -eq 0 ]; then
     /usr/bin/sudo -H -u "$TARGET_USER" "$BIN" fleet cleanup --dry-run
   else
@@ -115,8 +117,16 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "git-ai cleanup-endpoint: managed Numbat already removed"
   fi
   echo "git-ai cleanup-endpoint: preserved $TARGET_HOME/.numbat"
-  /usr/bin/sudo -H -u "$TARGET_USER" "$BIN" fleet cleanup --apply
-  exit $?
+  CLEANUP_STATUS=0
+  /usr/bin/sudo -H -u "$TARGET_USER" "$BIN" fleet cleanup --apply || CLEANUP_STATUS=$?
+  [ "$CLEANUP_STATUS" -eq 0 ] || exit "$CLEANUP_STATUS"
+  if /usr/sbin/pkgutil --pkg-info "$RECEIPT_ID" >/dev/null 2>&1; then
+    /usr/sbin/pkgutil --forget "$RECEIPT_ID" >/dev/null || fail "could not forget receipt $RECEIPT_ID"
+    echo "git-ai cleanup-endpoint: forgot receipt $RECEIPT_ID"
+  else
+    echo "git-ai cleanup-endpoint: receipt $RECEIPT_ID already absent"
+  fi
+  exit 0
 fi
 [ ! -e "$NUMBAT_BIN" ] || fail "managed Numbat is installed; run cleanup as root for complete offboarding"
 # Propagate uninstall failure instead of masking it: a remaining LaunchAgent
@@ -129,8 +139,10 @@ if [ -x "$SCRIPT_DIR/install-login-start.sh" ]; then
   "$SCRIPT_DIR/install-login-start.sh" --uninstall 2>/dev/null || UNINSTALL_STATUS=$?
 fi
 "$BIN" fleet cleanup --apply || CLEANUP_STATUS=$?
+echo "receipt $RECEIPT_ID retained; rerun as root to forget it"
 if [ "$UNINSTALL_STATUS" -ne 0 ] || [ "$CLEANUP_STATUS" -ne 0 ]; then
   echo "git-ai cleanup-endpoint: incomplete (uninstall=$UNINSTALL_STATUS cleanup=$CLEANUP_STATUS)" >&2
-  exit 1
+  [ "$CLEANUP_STATUS" -eq 0 ] || exit "$CLEANUP_STATUS"
+  exit "$UNINSTALL_STATUS"
 fi
 exit 0
