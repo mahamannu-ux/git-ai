@@ -63,6 +63,7 @@ pub mod domain;
 pub mod family_actor;
 pub mod git_backend;
 pub mod global_actor;
+pub mod health;
 pub mod reducer;
 pub mod ref_cursor;
 pub mod rewrite_metrics;
@@ -243,6 +244,13 @@ impl CheckpointIngressQuota {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (state.requests, state.bytes)
+    }
+
+    fn try_outstanding(&self) -> Option<(usize, usize)> {
+        self.state
+            .try_lock()
+            .ok()
+            .map(|state| (state.requests, state.bytes))
     }
 }
 
@@ -2873,6 +2881,19 @@ impl RootFenceProbe {
         }
     }
 
+    /// Performs every observation at once, for a status peek that judges the
+    /// root against several waits without touching the file system or the
+    /// process table again. Runs without any daemon lock held.
+    fn observe_all(&mut self) {
+        if self.finishing {
+            return;
+        }
+        self.observe_reflog();
+        if self.wrote_refs.is_none() {
+            self.alive = self.pid.map(process_alive);
+        }
+    }
+
     /// Whether the root has written its worktree HEAD reflog since it started.
     fn observe_reflog(&mut self) {
         self.wrote_refs = self.head_reflog.as_ref().and_then(|(offsets, worktree)| {
@@ -3040,6 +3061,7 @@ pub struct ActorDaemonCoordinator {
     pending_ai_edits_by_family: Mutex<HashMap<String, HashMap<String, u128>>>,
     family_sequencers_by_family: Mutex<HashMap<String, FamilySequencerState>>,
     pending_root_slots_by_root: Mutex<HashMap<String, PendingRootSlot>>,
+    started_at: Instant,
     /// See [`FAMILY_CAUSAL_GRACE`].
     causal_grace: Duration,
     /// Fences released because the root's process was alive past the grace
@@ -3098,6 +3120,8 @@ pub struct ActorDaemonCoordinator {
     #[cfg(not(windows))]
     next_trace_connection_id: AtomicU64,
     teardown_complete: AtomicBool,
+    /// Successful budgeted self-heals in the persisted restart window.
+    self_heal_count: AtomicU64,
     shutting_down: AtomicBool,
     shutdown_action: AtomicU8,
     shutdown_notify: Notify,
@@ -3161,6 +3185,7 @@ impl ActorDaemonCoordinator {
             pending_ai_edits_by_family: Mutex::new(HashMap::new()),
             family_sequencers_by_family: Mutex::new(HashMap::new()),
             pending_root_slots_by_root: Mutex::new(HashMap::new()),
+            started_at: Instant::now(),
             causal_grace: family_causal_grace(),
             causal_grace_expirations: AtomicU64::new(0),
             causal_fence_hard_cap_releases: AtomicU64::new(0),
@@ -3212,6 +3237,7 @@ impl ActorDaemonCoordinator {
             #[cfg(not(windows))]
             next_trace_connection_id: AtomicU64::new(0),
             teardown_complete: AtomicBool::new(false),
+            self_heal_count: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             shutdown_action: AtomicU8::new(DaemonExitAction::Stop.as_u8()),
             shutdown_notify: Notify::new(),
@@ -7799,6 +7825,11 @@ impl ActorDaemonCoordinator {
     async fn handle_control_request(self: &Arc<Self>, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::StatusDaemon => {
+                serde_json::to_value(crate::daemon::health::DaemonHealthSnapshot::capture(self))
+                    .map(|v| ControlResponse::ok(None, Some(v)))
+                    .map_err(GitAiError::from)
+            }
             ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
                 "checkpoint.run requires the framed checkpoint transport".to_string(),
             )),
@@ -9663,6 +9694,10 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     remove_socket_if_exists(&config.control_socket_path)?;
 
     let mut coordinator_inner = ActorDaemonCoordinator::new();
+    coordinator_inner.self_heal_count.store(
+        self_heal_count_from_history(&self_restart_history_path(&config)),
+        Ordering::Relaxed,
+    );
 
     // Spawn the telemetry worker inside the daemon's tokio runtime.
     let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
@@ -9894,6 +9929,22 @@ fn self_restart_history_path(config: &DaemonConfig) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("self_restart_history.json")
+}
+
+fn self_heal_count_from_history(history_path: &Path) -> u64 {
+    let Ok(contents) = fs::read_to_string(history_path) else {
+        return 0;
+    };
+    let Ok(history) = serde_json::from_str::<Vec<u64>>(&contents) else {
+        return 0;
+    };
+    let now = (now_unix_nanos() / 1_000_000_000) as u64;
+    history
+        .into_iter()
+        .filter(|at| {
+            *at <= now && now.saturating_sub(*at) <= daemon_self_restart_budget_window_secs()
+        })
+        .count() as u64
 }
 
 fn checkpoint_control_timeout_uses_ci_or_test_budget() -> bool {
@@ -12008,6 +12059,286 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_snapshot_counts_sequencer_entries_by_kind_and_reports_fence() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(Duration::from_secs(10));
+        let idle = DaemonHealthSnapshot::capture(&coord);
+        assert!(!idle.snapshot_partial);
+        assert_eq!(idle.sequencer_families, 0);
+        assert_eq!(idle.trace_roots_open_mutating, 0);
+        assert!(idle.families.is_empty());
+
+        let sid = alive_root_sid("health");
+        open_unattributed_commit_root(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+
+        let fenced = DaemonHealthSnapshot::capture(&coord);
+        assert!(!fenced.snapshot_partial);
+        assert_eq!(fenced.trace_roots_open_mutating, 1);
+        assert_eq!(fenced.trace_roots_finishing, 0);
+        assert_eq!(fenced.trace_roots_written, 0);
+        assert_eq!(fenced.sequencer_families, 1);
+        assert_eq!(fenced.sequencer_entries_total, 1);
+        assert_eq!(fenced.sequencer_entries_commands, 1);
+        assert_eq!(fenced.sequencer_entries_checkpoints, 0);
+        assert_eq!(fenced.sequencer_fenced_families, 1);
+        assert!(
+            !fenced.sequencer_stalled,
+            "a fence within its bound is not a stall"
+        );
+        assert_eq!(fenced.families.len(), 1);
+        let family = &fenced.families[0];
+        assert_eq!(family.key, "family-a");
+        assert_eq!(family.entries, 1);
+        assert_eq!(family.entries_commands, 1);
+        assert_eq!(family.front_kind, Some("command"));
+        assert!(family.fenced, "the front entry waits for the open root");
+        assert_eq!(family.inflight_effects, 0);
+        assert_eq!(family.side_effect_errors, 0);
+
+        read_root_atexit(&coord, &sid);
+        assert_eq!(
+            DaemonHealthSnapshot::capture(&coord).trace_roots_finishing,
+            1
+        );
+
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        let released = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(released.trace_roots_open_mutating, 0);
+        assert_eq!(released.sequencer_fenced_families, 0);
+        assert!(!released.families[0].fenced);
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_reports_roots_that_have_written() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(Duration::from_secs(10));
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo);
+        let sid = alive_root_sid("health-written");
+        open_attributed_commit_root(&coord, &sid, &repo);
+        append_ready_rebase(&coord, &family);
+
+        let unwritten = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(unwritten.trace_roots_written, 0);
+        assert!(
+            !unwritten.families[0].fenced,
+            "a root that has written nothing fences nothing"
+        );
+
+        commit_untraced(&repo);
+        let written = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(written.trace_roots_written, 1);
+        assert!(
+            written.families[0].fenced,
+            "a root that wrote refs holds the fence"
+        );
+
+        // The reader has read its atexit; the worker has not processed it yet.
+        let mut atexit = serde_json::json!({
+            "event": "atexit",
+            "sid": sid,
+            "code": 0,
+            "time_ns": now_unix_nanos() as u64,
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut atexit));
+        let finishing = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(finishing.trace_roots_finishing, 1);
+        assert_eq!(
+            finishing.trace_roots_written, 0,
+            "a finishing root is reported as finishing, not re-judged as written"
+        );
+        assert!(finishing.families[0].fenced);
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_lists_families_with_only_side_effect_errors() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new();
+        coord
+            .record_side_effect_error(
+                "family-errors",
+                7,
+                &GitAiError::Generic("notes push rejected".to_string()),
+            )
+            .unwrap();
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(snapshot.side_effect_error_families, 1);
+        assert_eq!(snapshot.side_effect_errors_total, 1);
+        let family = snapshot
+            .families
+            .iter()
+            .find(|f| f.key == "family-errors")
+            .expect("a family with retained errors is listed even without pending work");
+        assert_eq!(family.side_effect_errors, 1);
+        assert_eq!(family.entries, 0);
+        assert_eq!(snapshot.sequencer_families, 0);
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_stall_bound_follows_the_fencing_root() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        // A tiny grace makes both caps (30x and 600x) shorter than the floor
+        // irrelevant: use a grace large enough that 30x < floor < 600x.
+        let grace = Duration::from_millis(500);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo);
+        let sid = alive_root_sid("stall");
+        open_attributed_commit_root(&coord, &sid, &repo);
+        commit_untraced(&repo); // the root has written: it may hold for 600x grace
+        append_ready_rebase(&coord, &family);
+        {
+            // Backdate the entry past the hard cap (30x grace = 15 s) and floor (10 s).
+            let mut sequencers = coord.family_sequencers_by_family.lock().unwrap();
+            let state = sequencers.get_mut(&family).unwrap();
+            for slot in state.entries.values_mut() {
+                slot.enqueued_at = Instant::now() - Duration::from_secs(20);
+            }
+        }
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        assert!(snapshot.families[0].fenced);
+        assert!(
+            !snapshot.sequencer_stalled,
+            "work fenced by a root that wrote refs is bounded by the written-root cap, not the hard cap"
+        );
+
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        assert!(!snapshot.families[0].fenced);
+        assert!(
+            snapshot.sequencer_stalled,
+            "unfenced work older than the hard cap is a stall"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_observes_fences_without_releasing_them() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("probe");
+        open_unattributed_commit_root(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+        tokio::time::sleep(grace * 3).await;
+
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        assert!(
+            !snapshot.families[0].fenced,
+            "past the grace an alive, unwritten root no longer fences (the next drain releases it)"
+        );
+        assert_eq!(
+            coord.causal_grace_expirations.load(Ordering::Relaxed),
+            0,
+            "a status probe must not perform the release itself"
+        );
+        assert!(
+            !coord
+                .trace_ingress_state
+                .lock()
+                .unwrap()
+                .root_fence_release_logged
+                .contains(&sid),
+            "a status probe must not log the release either"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_observes_a_bounded_number_of_open_roots() {
+        use crate::daemon::health::{DaemonHealthSnapshot, HEALTH_ROOT_OBSERVE_LIMIT};
+
+        // Past a tiny grace, an observed live root without a reflog releases,
+        // so the fence below is held only by roots the peek could not observe.
+        let grace = Duration::from_millis(1);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        for i in 0..HEALTH_ROOT_OBSERVE_LIMIT {
+            open_unattributed_commit_root(&coord, &alive_root_sid(&format!("many-{i}")));
+        }
+        append_ready_rebase(&coord, "family-a");
+        tokio::time::sleep(grace * 5).await;
+        let full = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(full.trace_roots_open_mutating, HEALTH_ROOT_OBSERVE_LIMIT);
+        assert!(!full.snapshot_partial);
+        assert!(!full.families[0].fenced, "every root was observed alive");
+
+        open_unattributed_commit_root(&coord, &alive_root_sid("one-too-many"));
+        let capped = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(
+            capped.trace_roots_open_mutating,
+            HEALTH_ROOT_OBSERVE_LIMIT + 1
+        );
+        assert!(
+            capped.snapshot_partial,
+            "roots beyond the observation limit are counted but not observed"
+        );
+        assert!(
+            capped.families[0].fenced,
+            "an unobserved root is reported as holding, never as released early"
+        );
+        assert!(!capped.sequencer_stalled);
+
+        // The drain releases even a written root at the written-root cap, so
+        // an unobserved root is not reported as holding past it.
+        tokio::time::sleep(grace * FAMILY_WRITTEN_ROOT_FENCE_CAP_MULTIPLIER).await;
+        assert!(!DaemonHealthSnapshot::capture(&coord).families[0].fenced);
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_does_not_call_a_busy_family_stalled() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new();
+        append_ready_rebase(&coord, "family-a");
+        // The entry has waited far past every fence bound and the stall floor.
+        {
+            let mut sequencers = coord.family_sequencers_by_family.lock().unwrap();
+            let slot = sequencers
+                .get_mut("family-a")
+                .and_then(|state| state.entries.values_mut().next())
+                .unwrap();
+            slot.enqueued_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        }
+        assert!(
+            DaemonHealthSnapshot::capture(&coord).sequencer_stalled,
+            "an old unfenced entry nobody is draining is a stall"
+        );
+
+        let busy = coord.begin_family_effect_guarded("family-a");
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        assert_eq!(snapshot.families[0].inflight_effects, 1);
+        assert!(
+            !snapshot.sequencer_stalled,
+            "entries queued behind a running side-effect pass are busy, not stuck"
+        );
+        drop(busy);
+        assert!(DaemonHealthSnapshot::capture(&coord).sequencer_stalled);
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_is_partial_when_sequencer_lock_is_held() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new();
+        append_ready_rebase(&coord, "family-a");
+        let guard = coord.family_sequencers_by_family.lock().unwrap();
+        let snapshot = DaemonHealthSnapshot::capture(&coord);
+        drop(guard);
+        assert!(
+            snapshot.snapshot_partial,
+            "a contended lock must be reported, never waited on"
+        );
+        assert_eq!(snapshot.sequencer_families, 0);
+        assert!(!DaemonHealthSnapshot::capture(&coord).snapshot_partial);
+    }
+
+    #[tokio::test]
     async fn readonly_trace_connection_close_without_atexit_clears_tracking() {
         let coord = ActorDaemonCoordinator::new();
         let sid = "20260411T120000.000000-Psid-readonly-close";
@@ -12088,6 +12419,82 @@ mod tests {
         let stale = vec![stale_ts; DAEMON_SELF_RESTART_BUDGET_MAX];
         fs::write(&history_path, serde_json::to_string(&stale).unwrap()).unwrap();
         assert!(consume_self_restart_budget(&history_path));
+    }
+
+    #[test]
+    fn self_heal_boundary_preserves_tail_queue_scan_cap_and_counter() {
+        use crate::metrics::delivery::MetricDeliveryHealthBinding;
+        use crate::security::delivery_queue::{SecurityRecordQueue, TailHealthObservation};
+        use crate::security::records::ProjectedRecord;
+        use crate::security::tail::{FileIdentity, TailRead};
+
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("security-findings.db");
+        let history_path = temp.path().join("self_restart_history.json");
+        let attempts_path = temp.path().join("day-one-scan-attempts");
+        let attempts = serde_json::json!({
+            "tenant_id": "tenant", "machine_id": "machine",
+            "failed_attempts": 23, "failed_agents": ["Numbat"]
+        });
+        fs::write(&attempts_path, serde_json::to_vec(&attempts).unwrap()).unwrap();
+
+        let record = ProjectedRecord {
+            kind: "finding".into(),
+            record_id: format!("sha256:{}", "a".repeat(64)),
+            lease_id: "lease".into(),
+            json: serde_json::json!({"kind":"finding","record_id":format!("sha256:{}", "a".repeat(64))}),
+        };
+        let binding = MetricDeliveryHealthBinding {
+            tenant_id: "tenant".into(),
+            api_base_url: "https://trackai.example".into(),
+            credential_key_id: "ABCDEFGHIJKLMNOP".into(),
+        };
+        let tail = TailRead {
+            identity: FileIdentity {
+                device: 7,
+                inode: 9,
+            },
+            reset: false,
+            start_offset: 0,
+            next_offset: 84,
+            partial_len: 3,
+            file_len: 87,
+            reached_eof: true,
+            entries: Vec::new(),
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        {
+            let mut queue = SecurityRecordQueue::open_at_path(&queue_path).unwrap();
+            queue
+                .commit_poll(
+                    &tail,
+                    date,
+                    &[(&record, &binding)],
+                    &BTreeMap::new(),
+                    100,
+                    TailHealthObservation::default(),
+                )
+                .unwrap();
+        }
+
+        // The self-heal decision persists only its own budget entry. Simulate
+        // the process boundary by closing and reopening the durable queue.
+        assert!(consume_self_restart_budget(&history_path));
+        let mut queue = SecurityRecordQueue::open_at_path(&queue_path).unwrap();
+        let checkpoint = queue.checkpoint().unwrap();
+        assert_eq!(checkpoint.identity, Some(tail.identity));
+        assert_eq!(checkpoint.offset, 84);
+        assert_eq!(checkpoint.partial_len, 3);
+        let pending = queue.dequeue_pending(10, 100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].record_id, record.record_id);
+        assert_eq!(pending[0].id, 1);
+        assert_eq!(pending[0].attempts, 0);
+        assert_eq!(
+            fs::read(&attempts_path).unwrap(),
+            serde_json::to_vec(&attempts).unwrap()
+        );
+        assert_eq!(self_heal_count_from_history(&history_path), 1);
     }
 
     #[test]

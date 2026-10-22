@@ -40,6 +40,10 @@ pub enum ControlRequest {
     SecurityActivationQuery { repository_url: String },
     #[serde(rename = "security.finding.submit")]
     SubmitSecurityFinding { candidate: SecurityFindingCandidate },
+    /// Snapshot of the daemon's attribution pipeline: per-family pending work
+    /// and fence state, and open trace roots.
+    #[serde(rename = "status.daemon")]
+    StatusDaemon,
     #[serde(rename = "snapshot.watermarks")]
     SnapshotWatermarks { repo_working_dir: String },
     #[serde(rename = "bash_session.start")]
@@ -198,4 +202,16 @@ pub struct CasSyncPayload {
     pub data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_daemon_request_uses_stable_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(ControlRequest::StatusDaemon).unwrap(),
+            serde_json::json!({ "method": "status.daemon" })
+        );
+    }
 }

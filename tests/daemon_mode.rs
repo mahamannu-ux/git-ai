@@ -2791,6 +2791,24 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_sync_control_requ
 }
 
 #[test]
+fn daemon_bg_status_includes_daemon_health() {
+    let repo = TestRepo::new_dedicated_daemon();
+    let output = bg_command(&repo, "status", &[]);
+    assert!(output.status.success(), "bg status failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("bg status must print JSON ({error}): {stdout}"));
+    assert_eq!(value["ok"], json!(true), "{value}");
+    assert!(value["data"]["family_key"].is_string(), "{value}");
+    assert!(value["daemon"]["uptime_seconds"].is_u64(), "{value}");
+    assert!(
+        value["daemon"]["sequencer_entries_total"].is_u64(),
+        "{value}"
+    );
+    assert!(value["daemon"]["families"].is_array(), "{value}");
+}
+
+#[test]
 #[cfg(not(windows))]
 fn daemon_partial_trace_line_does_not_block_checkpoint_control_request() {
     let repo = TestRepo::new_dedicated_daemon();
