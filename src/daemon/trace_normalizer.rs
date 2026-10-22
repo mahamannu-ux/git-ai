@@ -60,6 +60,17 @@ pub struct TraceNormalizer<B: GitBackend> {
 
 const COMPLETED_ROOT_RETENTION_LIMIT: usize = 16_384;
 
+// Keep this allowlist in sync with ingest_payload's dispatch. Unused Git
+// Trace2 frames must not occupy the daemon's bounded serial ingest queue.
+pub(crate) const INGESTED_TRACE_EVENTS: &[&str] = &[
+    "start",
+    "def_repo",
+    "cmd_name",
+    "def_param",
+    "exit",
+    "atexit",
+];
+
 impl<B: GitBackend> TraceNormalizer<B> {
     pub fn new(backend: Arc<B>) -> Self {
         Self {

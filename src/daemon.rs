@@ -105,8 +105,6 @@ const CHECKPOINT_FAMILY_DRAIN_CONCURRENCY: usize = 2;
 #[cfg(not(windows))]
 const TRACE_SOCKET_RECV_BUFFER_BYTES: usize = 512 * 1024;
 const TRACE_INGEST_QUEUE_CAPACITY: usize = 16_384;
-#[cfg(not(windows))]
-const TRACE_CONNECTION_BOOTSTRAP_READ_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const WINDOWS_TRACE_PIPE_WORKERS: usize = 16;
 #[cfg(windows)]
@@ -4459,6 +4457,14 @@ impl ActorDaemonCoordinator {
             trace_payload_primary_command(payload).or_else(|| trace_argv_primary_command(&argv));
         let event_is_read_only =
             trace_invocation_is_definitely_read_only(early_primary.as_deref(), &argv);
+        // Family resolution can touch the filesystem. Keep it outside the
+        // process-wide ingress lock used by every Trace2 reader.
+        let resolved_family = worktree_hint.as_ref().and_then(|worktree| {
+            common_dir_for_worktree(worktree).map(|common_dir| {
+                let family = common_dir.canonicalize().unwrap_or(common_dir);
+                family.to_string_lossy().to_string()
+            })
+        });
 
         let mut ingress = match self.trace_ingress_state.lock() {
             Ok(guard) => guard,
@@ -4477,11 +4483,8 @@ impl ActorDaemonCoordinator {
         }
 
         if let Some(worktree) = worktree_hint.clone() {
-            if let Some(common_dir) = common_dir_for_worktree(&worktree) {
-                let family = common_dir.canonicalize().unwrap_or(common_dir);
-                ingress
-                    .root_families
-                    .insert(root.clone(), family.to_string_lossy().to_string());
+            if let Some(family) = resolved_family {
+                ingress.root_families.insert(root.clone(), family);
             }
             ingress.root_worktrees.insert(root.clone(), worktree);
         }
@@ -4515,18 +4518,33 @@ impl ActorDaemonCoordinator {
         }
 
         let terminal = is_terminal_root_trace_event(&event, &sid, &root);
-        if command_mutates_refs
+        let capture_worktree = if command_mutates_refs
             && !terminal
             && !ingress.root_reflog_start_offsets.contains_key(&root)
-            && let Some(worktree) = worktree_hint
+        {
+            worktree_hint
                 .clone()
                 .or_else(|| ingress.root_worktrees.get(&root).cloned())
-        {
+        } else {
+            None
+        };
+        if let Some(worktree) = capture_worktree {
+            drop(ingress);
             let offsets =
                 crate::daemon::ref_cursor::capture_reflog_start_offsets_for_worktree(&worktree);
-            ingress
-                .root_reflog_start_offsets
-                .insert(root.clone(), offsets);
+            ingress = match self.trace_ingress_state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return false,
+            };
+            // A terminal frame may have closed the root while the lock was
+            // released. Do not resurrect its offsets, and preserve first
+            // capture if multiple frames raced.
+            if ingress.root_last_activity_ns.contains_key(&root) {
+                ingress
+                    .root_reflog_start_offsets
+                    .entry(root.clone())
+                    .or_insert(offsets);
+            }
         }
 
         let read_only_root =
@@ -7728,6 +7746,7 @@ fn trace_listener_loop_actor(
             .create_sync()
             .map_err(|e| GitAiError::Generic(format!("failed binding trace socket: {}", e)))?;
         set_socket_owner_only(&trace_socket_path)?;
+        let mut consecutive_spawn_failures = 0usize;
         for stream in listener.incoming() {
             if coordinator.is_shutting_down() {
                 break;
@@ -7735,98 +7754,21 @@ fn trace_listener_loop_actor(
             let Ok(stream) = stream else {
                 continue;
             };
-            // Raise the receive buffer on each accepted connection. Unlike TCP,
-            // a Unix-domain listener's SO_RCVBUF is not inherited by accepted
-            // connections, so this per-connection call is what takes effect.
-            if let Err(error) = set_trace_socket_recv_buffer(&stream) {
-                tracing::debug!(%error, "trace connection recv buffer setup failed");
-            }
-            if let Err(error) = coordinator.trace_unidentified_connection_opened() {
-                tracing::debug!(%error, "trace connection open bookkeeping error");
-                continue;
-            }
-            if let Err(error) =
-                stream.set_recv_timeout(Some(TRACE_CONNECTION_BOOTSTRAP_READ_TIMEOUT))
-            {
-                tracing::debug!(%error, "trace connection bootstrap timeout setup failed");
-            }
-            let mut reader = BufReader::new(stream);
-            let mut observed_roots = std::collections::BTreeSet::new();
-            match bootstrap_trace_connection_actor_reader(
-                &mut reader,
-                coordinator.clone(),
-                &mut observed_roots,
-            ) {
-                Ok(TraceConnectionBootstrap::Eof) => {
-                    if let Err(error) =
-                        finalize_trace_connection_roots(coordinator.clone(), observed_roots)
-                    {
-                        tracing::debug!(
-                            %error,
-                            "trace connection close bookkeeping error"
-                        );
+            // Accept must not read, lock, or touch the filesystem: Git writes
+            // Trace2 synchronously and a silent peer can otherwise stall all
+            // later connections behind the listener backlog.
+            match spawn_trace_connection_reader(stream, coordinator.clone()) {
+                Ok(()) => consecutive_spawn_failures = 0,
+                Err(_error) => {
+                    tracing::error!("trace listener: failed to spawn reader");
+                    consecutive_spawn_failures += 1;
+                    if consecutive_spawn_failures >= TRACE_SPAWN_FAILURE_SHUTDOWN_THRESHOLD {
+                        if spawn_self_restart().is_err() {
+                            tracing::error!("trace listener: self-restart failed");
+                        }
+                        break;
                     }
-                    continue;
                 }
-                Ok(TraceConnectionBootstrap::Stop) => {
-                    if let Err(error) =
-                        finalize_trace_connection_roots(coordinator.clone(), observed_roots)
-                    {
-                        tracing::debug!(
-                            %error,
-                            "trace connection close bookkeeping error"
-                        );
-                    }
-                    continue;
-                }
-                Ok(TraceConnectionBootstrap::Continue) => {}
-                Err(error) => {
-                    tracing::debug!(%error, "trace connection bootstrap error");
-                    if let Err(error) =
-                        finalize_trace_connection_roots(coordinator.clone(), observed_roots)
-                    {
-                        tracing::debug!(
-                            %error,
-                            "trace connection close bookkeeping error"
-                        );
-                    }
-                    continue;
-                }
-            }
-            if let Err(error) = reader.get_ref().set_recv_timeout(None) {
-                tracing::debug!(%error, "trace connection bootstrap timeout clear failed");
-            }
-            #[cfg(feature = "test-support")]
-            if let Ok(raw_delay_ms) =
-                std::env::var("GIT_AI_TEST_TRACE_LISTENER_WORKER_SPAWN_DELAY_MS")
-                && let Ok(delay_ms) = raw_delay_ms.parse::<u64>()
-                && delay_ms > 0
-            {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            let coord = coordinator.clone();
-            let observed_roots_on_spawn_failure = observed_roots.clone();
-            if std::thread::Builder::new()
-                .spawn(move || {
-                    if let Err(e) =
-                        handle_trace_connection_actor_reader(reader, coord, observed_roots)
-                    {
-                        tracing::debug!(%e, "trace connection error");
-                    }
-                })
-                .is_err()
-            {
-                tracing::error!("trace listener: failed to spawn handler thread");
-                if let Err(error) = finalize_trace_connection_roots(
-                    coordinator.clone(),
-                    observed_roots_on_spawn_failure,
-                ) {
-                    tracing::debug!(
-                        %error,
-                        "trace connection close bookkeeping error"
-                    );
-                }
-                break;
             }
         }
         Ok(())
@@ -7937,72 +7879,49 @@ fn handle_windows_trace_pipe_connection(
 }
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
-fn handle_trace_connection_actor(
+const TRACE_SPAWN_FAILURE_SHUTDOWN_THRESHOLD: usize = 16;
+
+#[cfg(not(windows))]
+fn spawn_trace_connection_reader(
     stream: LocalSocketStream,
     coordinator: Arc<ActorDaemonCoordinator>,
-) -> Result<(), GitAiError> {
-    coordinator.trace_unidentified_connection_opened()?;
-    let reader = BufReader::new(stream);
-    handle_trace_connection_actor_reader(reader, coordinator, std::collections::BTreeSet::new())
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("git-ai-trace-conn".to_string())
+        .spawn(move || run_trace_connection_reader(stream, coordinator))
+        .map(|_| ())
 }
 
 #[cfg(not(windows))]
-enum TraceConnectionBootstrap {
-    Continue,
-    Stop,
-    Eof,
+fn run_trace_connection_reader(
+    stream: LocalSocketStream,
+    coordinator: Arc<ActorDaemonCoordinator>,
+) {
+    // Preserve the existing test delay but move it off the accept loop.
+    #[cfg(feature = "test-support")]
+    if let Ok(raw_delay_ms) = std::env::var("GIT_AI_TEST_TRACE_LISTENER_WORKER_SPAWN_DELAY_MS")
+        && let Ok(delay_ms) = raw_delay_ms.parse::<u64>()
+        && delay_ms > 0
+    {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+    if let Err(error) = set_trace_socket_recv_buffer(&stream) {
+        tracing::debug!(%error, "trace connection recv buffer setup failed");
+    }
+    if let Err(error) = coordinator.trace_unidentified_connection_opened() {
+        tracing::debug!(%error, "trace connection open bookkeeping error");
+        return;
+    }
+    let reader = BufReader::new(stream);
+    if let Err(error) =
+        handle_trace_connection_actor_reader(reader, coordinator, std::collections::BTreeSet::new())
+    {
+        tracing::debug!(%error, "trace connection error");
+    }
 }
 
 struct TraceLineOutcome {
     continue_reading: bool,
-    #[cfg(not(windows))]
-    bootstrap_complete: bool,
-}
-
-#[cfg(not(windows))]
-const TRACE_CONNECTION_BOOTSTRAP_MAX_LINES: usize = 8;
-
-#[cfg(not(windows))]
-fn bootstrap_trace_connection_actor_reader<R: Read>(
-    reader: &mut BufReader<R>,
-    coordinator: Arc<ActorDaemonCoordinator>,
-    observed_roots: &mut std::collections::BTreeSet<String>,
-) -> Result<TraceConnectionBootstrap, GitAiError> {
-    for _ in 0..TRACE_CONNECTION_BOOTSTRAP_MAX_LINES {
-        let line = match read_json_line(reader) {
-            Ok(Some(line)) => line,
-            Ok(None) => return Ok(TraceConnectionBootstrap::Eof),
-            Err(error) if trace_bootstrap_read_timed_out(&error) => {
-                return Ok(TraceConnectionBootstrap::Continue);
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(outcome) =
-            process_trace_connection_line(&line, coordinator.clone(), observed_roots)?
-        else {
-            continue;
-        };
-        if !outcome.continue_reading {
-            return Ok(TraceConnectionBootstrap::Stop);
-        }
-        if outcome.bootstrap_complete {
-            return Ok(TraceConnectionBootstrap::Continue);
-        }
-    }
-    Ok(TraceConnectionBootstrap::Continue)
-}
-
-#[cfg(not(windows))]
-fn trace_bootstrap_read_timed_out(error: &GitAiError) -> bool {
-    matches!(
-        error,
-        GitAiError::IoError(io_error)
-            if matches!(
-                io_error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            )
-    )
 }
 
 fn handle_trace_connection_actor_reader<R: Read>(
@@ -8010,15 +7929,31 @@ fn handle_trace_connection_actor_reader<R: Read>(
     coordinator: Arc<ActorDaemonCoordinator>,
     mut observed_roots: std::collections::BTreeSet<String>,
 ) -> Result<(), GitAiError> {
-    while let Some(line) = read_json_line(&mut reader)? {
-        if process_trace_connection_line(&line, coordinator.clone(), &mut observed_roots)?
-            .is_some_and(|outcome| !outcome.continue_reading)
-        {
-            break;
+    let read_result = (|| {
+        while let Some(line) = read_json_line(&mut reader)? {
+            if process_trace_connection_line(&line, coordinator.clone(), &mut observed_roots)?
+                .is_some_and(|outcome| !outcome.continue_reading)
+            {
+                break;
+            }
         }
-    }
+        Ok(())
+    })();
+    // An errored read must still release root bookkeeping; otherwise a
+    // family can remain blocked behind a root that no longer has a peer.
+    let finalize_result = finalize_trace_connection_roots(coordinator, observed_roots);
+    read_result.and(finalize_result)
+}
 
-    finalize_trace_connection_roots(coordinator, observed_roots)
+fn reader_should_ingest_trace_event(event: &str) -> bool {
+    crate::daemon::trace_normalizer::INGESTED_TRACE_EVENTS.contains(&event)
+}
+
+// Git's Trace2 writer puts event first. Any other shape falls through to the
+// parsed check, so embedded user content can never be mistaken for the key.
+fn raw_trace_event_type(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("{\"event\":\"")?;
+    Some(rest.split_once('"')?.0)
 }
 
 fn process_trace_connection_line(
@@ -8030,29 +7965,26 @@ fn process_trace_connection_line(
     if trimmed.is_empty() {
         return Ok(None);
     }
+    if let Some(event) = raw_trace_event_type(trimmed)
+        && !reader_should_ingest_trace_event(event)
+    {
+        return Ok(None);
+    }
     let mut parsed: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    #[cfg(not(windows))]
-    let event = parsed
-        .get("event")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    #[cfg(not(windows))]
-    let mut bootstrap_complete = false;
+    if !reader_should_ingest_trace_event(
+        parsed
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        return Ok(None);
+    }
     if let Some(sid) = parsed.get("sid").and_then(Value::as_str) {
         let was_unidentified = observed_roots.is_empty();
         let root_sid = trace_root_sid(sid).to_string();
-        // `start` carries argv but not the worktree. Keep bootstrapping on the
-        // listener thread until the root `def_repo` event has been processed;
-        // that is the first point where trace augmentation can capture reflog
-        // start offsets with a concrete worktree.
-        #[cfg(not(windows))]
-        if event == "def_repo" && sid == root_sid {
-            bootstrap_complete = true;
-        }
         if observed_roots.insert(root_sid.clone()) {
             let _ = coordinator.trace_root_connection_opened(&root_sid);
         }
@@ -8067,11 +7999,7 @@ fn process_trace_connection_line(
     // issue dozens of read-only git commands per second.
     let continue_reading = !(coordinator.prepare_trace_payload_for_ingest(&mut parsed)
         && coordinator.enqueue_trace_payload(parsed).is_err());
-    Ok(Some(TraceLineOutcome {
-        continue_reading,
-        #[cfg(not(windows))]
-        bootstrap_complete,
-    }))
+    Ok(Some(TraceLineOutcome { continue_reading }))
 }
 
 fn finalize_trace_connection_roots(
@@ -10447,6 +10375,62 @@ mod tests {
     // -----------------------------------------------------------------------
     // OnceLock / shutdown / atomic-ordering tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn task17_reader_keeps_only_trace_events_used_by_normalizer() {
+        for event in [
+            "start",
+            "def_repo",
+            "cmd_name",
+            "def_param",
+            "exit",
+            "atexit",
+        ] {
+            assert!(reader_should_ingest_trace_event(event), "{event}");
+        }
+        for event in [
+            "version",
+            "cmd_path",
+            "child_start",
+            "region_enter",
+            "data",
+            "exec",
+        ] {
+            assert!(!reader_should_ingest_trace_event(event), "{event}");
+        }
+        assert_eq!(
+            raw_trace_event_type(r#"{"event":"start","sid":"root"}"#),
+            Some("start")
+        );
+        assert_eq!(
+            raw_trace_event_type(r#"{"sid":"root","event":"data"}"#),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn task17_unused_trace_frame_never_opens_root_or_allocates_queue_slot() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        let mut roots = std::collections::BTreeSet::new();
+        let outcome = process_trace_connection_line(
+            r#"{"event":"data","sid":"noise-root","category":"index"}"#,
+            coord.clone(),
+            &mut roots,
+        )
+        .unwrap();
+        assert!(outcome.is_none());
+        assert!(roots.is_empty());
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 0);
+
+        let reordered = process_trace_connection_line(
+            r#"{"sid":"noise-root","event":"data"}"#,
+            coord.clone(),
+            &mut roots,
+        )
+        .unwrap();
+        assert!(reordered.is_none());
+        assert!(roots.is_empty());
+    }
 
     /// `enqueue_trace_payload` must return an error when the ingest worker has
     /// not been started yet.  This is the "no-sender" fast-fail path and is

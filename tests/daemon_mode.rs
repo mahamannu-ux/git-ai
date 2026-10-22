@@ -2820,6 +2820,85 @@ fn daemon_trace_ingest_backpressure_shuts_down_without_blocking_listener() {
     panic!("daemon did not fail closed within 2s when trace ingest queue capacity was exhausted");
 }
 
+// Ported from upstream Git AI 648f8e92f: the queue has room for the
+// meaningful frames, while the synthetic Trace2 noise would overflow it.
+#[test]
+#[serial]
+#[cfg(not(windows))]
+fn task17_noise_frames_do_not_exhaust_bounded_ingest_queue() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("GIT_AI_TEST_TRACE_INGEST_QUEUE_CAPACITY", "8"),
+            ("GIT_AI_TEST_TRACE_INGEST_WORKER_START_DELAY_MS", "1000"),
+            ("GIT_AI_DAEMON_SOCKET_HEALTH_CHECK_SECS", "3600"),
+        ],
+    );
+    let sid = "task17-noise-heavy-root";
+    let worktree = repo_workdir_string(&repo);
+    let git_dir = repo.path().join(".git").to_string_lossy().to_string();
+    let mut frames = vec![
+        json!({"event":"version","sid":sid}),
+        json!({"event":"start","sid":sid,"argv":["git","commit","-m","synthetic"],"time_ns":80_000u64}),
+        json!({"event":"def_repo","sid":sid,"worktree":worktree,"repo":git_dir,"time_ns":80_001u64}),
+        json!({"event":"cmd_name","sid":sid,"name":"commit"}),
+    ];
+    for i in 0..20u64 {
+        frames.push(json!({"event":"data","sid":sid,"category":"index","time_ns":80_010+i}));
+    }
+    frames.push(json!({"event":"exit","sid":sid,"code":0,"time_ns":80_100u64}));
+    frames.push(trace_atexit_frame(sid, 0, 80_101));
+    send_trace_frames(&daemon_trace_socket_path(&repo), &frames);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        send_control_request(&daemon_control_socket_path(&repo), &ControlRequest::Ping).is_ok(),
+        "unused frames overflowed the ingest queue: {}",
+        repo.daemon_stderr_contents()
+    );
+    daemon.shutdown();
+}
+
+// Adapted from upstream Git AI c40c82dca: accepting a later Trace2 stream
+// cannot be serialized behind silent peers' bootstrap read timeouts.
+#[test]
+#[serial]
+#[cfg(not(windows))]
+fn task17_trace_accept_loop_stays_responsive_with_silent_peers() {
+    let repo = TestRepo::new_dedicated_daemon();
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let mut silent_streams = Vec::new();
+    for _ in 0..20 {
+        silent_streams.push(
+            open_local_socket_stream_with_timeout(&trace_socket, DAEMON_TEST_PROBE_TIMEOUT)
+                .expect("open silent trace connection"),
+        );
+    }
+    let session = repos::test_repo::new_daemon_test_sync_session_id();
+    let session_arg = format!("git-ai.testSyncSession={session}");
+    send_trace_frames(
+        &trace_socket,
+        &[
+            json!({"event":"start","sid":"task17-silent-followup","argv":["git","-c",session_arg,"commit","-m","synthetic"],"time_ns":20_000u64}),
+            json!({"event":"def_repo","sid":"task17-silent-followup","worktree":repo_workdir_string(&repo),"repo":repo.path().join(".git").to_string_lossy(),"time_ns":20_001u64}),
+            json!({"event":"exit","sid":"task17-silent-followup","code":0,"time_ns":20_100u64}),
+            trace_atexit_frame("task17-silent-followup", 0, 20_101),
+        ],
+    );
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        if repo
+            .daemon_completion_entries()
+            .iter()
+            .any(|entry| entry.test_sync_session.as_deref() == Some(session.as_str()))
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("later trace stream stalled behind silent connections");
+}
+
 #[test]
 fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
     let repo = TestRepo::new_dedicated_daemon();
@@ -5317,6 +5396,24 @@ fn bg_command_with_env(
 }
 
 use std::process::Output;
+
+#[test]
+#[serial]
+fn task17_bg_status_retains_top_level_shutdown_field_for_offboarding() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let mut daemon = DaemonGuard::start(&repo);
+    daemon.shutdown();
+    let output = bg_command(&repo, "status", &["--repo", "/"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let status: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status.get("daemon_running"), Some(&Value::Bool(false)));
+    assert!(stdout.contains("\"daemon_running\": false"));
+}
 
 #[test]
 #[serial]
