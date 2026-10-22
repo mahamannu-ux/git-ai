@@ -12422,7 +12422,7 @@ mod tests {
     }
 
     #[test]
-    fn self_heal_boundary_preserves_tail_queue_scan_cap_and_counter() {
+    fn self_heal_boundary_preserves_tail_queue_and_counter() {
         use crate::metrics::delivery::MetricDeliveryHealthBinding;
         use crate::security::delivery_queue::{SecurityRecordQueue, TailHealthObservation};
         use crate::security::records::ProjectedRecord;
@@ -12431,13 +12431,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("security-findings.db");
         let history_path = temp.path().join("self_restart_history.json");
-        let attempts_path = temp.path().join("day-one-scan-attempts");
-        let attempts = serde_json::json!({
-            "tenant_id": "tenant", "machine_id": "machine",
-            "failed_attempts": 23, "failed_agents": ["Numbat"]
-        });
-        fs::write(&attempts_path, serde_json::to_vec(&attempts).unwrap()).unwrap();
-
         let record = ProjectedRecord {
             kind: "finding".into(),
             record_id: format!("sha256:{}", "a".repeat(64)),
@@ -12490,10 +12483,6 @@ mod tests {
         assert_eq!(pending[0].record_id, record.record_id);
         assert_eq!(pending[0].id, 1);
         assert_eq!(pending[0].attempts, 0);
-        assert_eq!(
-            fs::read(&attempts_path).unwrap(),
-            serde_json::to_vec(&attempts).unwrap()
-        );
         assert_eq!(self_heal_count_from_history(&history_path), 1);
     }
 

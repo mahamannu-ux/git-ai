@@ -534,7 +534,25 @@ fn task17_macos_offboarding_dry_run_and_daemon_status_refusal_retain_security() 
             !apply.status.success(),
             "status {status} must block removal"
         );
+        let stderr = String::from_utf8_lossy(&apply.stderr);
+        assert!(
+            stderr.contains("daemon still running"),
+            "status {status} must fail at the shutdown gate, not an earlier check: {stderr}"
+        );
         assert!(security.join("retained").exists());
         assert!(numbat.exists());
     }
+
+    // The same fixture must pass the shutdown gate when status is false.
+    // With no agents.tsv, the next guard refuses managed hook removal.
+    let stopped = invoke("--apply", "{\"daemon_running\": false}");
+    assert!(!stopped.status.success());
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        stderr.contains("managed agent map missing"),
+        "status=false must reach the managed-agent guard: {stderr}"
+    );
+    assert!(!stderr.contains("daemon still running"), "{stderr}");
+    assert!(security.join("retained").exists());
+    assert!(numbat.exists());
 }
