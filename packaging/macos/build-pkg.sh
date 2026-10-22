@@ -48,12 +48,17 @@ esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="$ROOT/target/package/pkg-$ARCH"
+# Adapted from git-ai-project/git-ai@acbac7ef86 and @5b25b11a6: pkgbuild
+# needs a real, empty payload to persist receipt version metadata. Keep the
+# root empty and explicitly traversable; all Endpoint content stays in Scripts.
+PAYLOAD_ROOT="$WORK_DIR/payload"
 SCRIPTS="$WORK_DIR/scripts"
 COMPONENT_PKG="$WORK_DIR/git-ai-component.pkg"
 OUTPUT_ABS="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$OUTPUT")"
 
 rm -rf "$WORK_DIR"
-mkdir -p "$SCRIPTS" "$(dirname "$OUTPUT_ABS")"
+mkdir -p "$PAYLOAD_ROOT" "$SCRIPTS" "$(dirname "$OUTPUT_ABS")"
+chmod 0755 "$PAYLOAD_ROOT"
 install -m 0755 "$BINARY" "$SCRIPTS/git-ai"
 install -m 0755 "$NUMBAT_DIR/numbat" "$SCRIPTS/numbat"
 for notice in LICENSE THIRD_PARTY_LICENSES.txt PROVENANCE.txt; do
@@ -90,7 +95,7 @@ install -m 0755 "$ROOT/packaging/macos/scripts/postinstall" "$SCRIPTS/postinstal
 xattr -cr "$SCRIPTS" 2>/dev/null || true
 
 pkgbuild \
-  --nopayload \
+  --root "$PAYLOAD_ROOT" \
   --scripts "$SCRIPTS" \
   --identifier "com.git-ai.git-ai" \
   --version "$VERSION" \

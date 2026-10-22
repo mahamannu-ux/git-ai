@@ -143,6 +143,52 @@ fn macos_postinstall_carries_no_credential() {
 }
 
 #[test]
+fn macos_pkg_receipt_is_versioned_without_root_payload() {
+    let build_pkg = build_pkg();
+    for required in [
+        "PAYLOAD_ROOT=\"$WORK_DIR/payload\"",
+        "mkdir -p \"$PAYLOAD_ROOT\"",
+        "chmod 0755 \"$PAYLOAD_ROOT\"",
+        "--root \"$PAYLOAD_ROOT\"",
+    ] {
+        assert!(
+            build_pkg.contains(required),
+            "macOS PKG build must retain empty-payload marker {required}"
+        );
+    }
+    assert!(
+        !build_pkg.contains("--nopayload"),
+        "macOS PKG needs a real empty payload so pkgutil records its version"
+    );
+
+    let release = repo_file(".github/workflows/release.yml");
+    for required in [
+        "package_arch: arm64",
+        "package_arch: x64",
+        "trackai-endpoint-macos-${{ matrix.package_arch }}.pkg",
+        "lsbom -s \"$expanded/Bom\"",
+        "pkgutil --files \"$receipt_id\"",
+        "unexpected_receipt_files",
+        "$0 != \".\"",
+        "stat -f '%Su:%Sg %Lp' /",
+        "pkgutil --pkg-info \"$receipt_id\"",
+        "receipt version",
+        "binary version",
+        "PKG install gate requires an eligible console user",
+    ] {
+        assert!(
+            release.contains(required),
+            "macOS release gate must retain receipt/root safeguard {required}"
+        );
+    }
+    assert!(
+        !release
+            .contains("PKG payload verified; hosted runner has no console user for installation"),
+        "macOS release gate must not report success before installing the package"
+    );
+}
+
+#[test]
 fn managed_docs_point_secure_enrollment_to_task9c() {
     let readme = packaging_readme();
     for forbidden in ["API_KEY", "API_BASE", "trk_v1", "api-key", "your-api-key"] {
