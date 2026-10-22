@@ -1,0 +1,23 @@
+src/commands/daemon.rs
+  s_0ae9587312e4b5::t_4374b628a3ceae 504,509-511,522-523,526,531-553
+src/daemon/control_api.rs
+  s_0ae9587312e4b5::t_3b65319e28316a 43-46,206-217
+tests/daemon_mode.rs
+  s_0ae9587312e4b5::t_b68857a705bc96 2793-2810
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "3a4c8f1bbb5cae813305552a126bf38ab5fb7beb",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9587312e4b5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1630f-b66b-7753-96dd-fad397a0c7ae",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
