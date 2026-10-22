@@ -12,6 +12,7 @@ use crate::git::status::MAX_PATHSPEC_ARGS;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Serialize)]
 struct CheckpointInfo {
@@ -132,10 +133,11 @@ fn run_status(json: bool, diff_only: bool) -> Result<(), GitAiError> {
 
     let mut pathspecs: HashSet<String> = checkpoints
         .iter()
-        .flat_map(|cp| cp.entries.iter().map(|e| e.file.clone()))
+        .flat_map(|cp| cp.entries.iter().map(|e| normalize_status_path(&e.file)))
         .filter(|file| !should_ignore_file_with_matcher(file, &ignore_matcher))
         .collect();
     for file_path in working_va.files() {
+        let file_path = normalize_status_path(&file_path);
         if !should_ignore_file_with_matcher(&file_path, &ignore_matcher) {
             pathspecs.insert(file_path);
         }
@@ -252,7 +254,7 @@ fn get_working_dir_diff_stats(
         if paths.is_empty() {
             return Ok((0, 0));
         }
-        if paths.len() > MAX_PATHSPEC_ARGS {
+        if needs_working_dir_post_filter(paths) {
             // Disable rename detection so git reports renames as separate
             // delete + add entries with clean filenames. Without this,
             // numstat outputs "old => new" arrow notation in the filename
@@ -273,6 +275,28 @@ fn get_working_dir_diff_stats(
     let output = exec_git_with_profile(&args, InternalGitProfile::NumstatParse)?;
     let stdout = String::from_utf8(output.stdout)?;
 
+    Ok(parse_working_dir_numstat_stats(
+        &stdout,
+        pathspecs,
+        needs_post_filter,
+        ignore_matcher,
+    ))
+}
+
+fn needs_working_dir_post_filter(paths: &HashSet<String>) -> bool {
+    paths.len() > MAX_PATHSPEC_ARGS || paths.iter().any(|path| !path.is_ascii())
+}
+
+fn normalize_status_path(path: &str) -> String {
+    path.nfc().collect()
+}
+
+fn parse_working_dir_numstat_stats(
+    stdout: &str,
+    pathspecs: Option<&HashSet<String>>,
+    needs_post_filter: bool,
+    ignore_matcher: &IgnoreMatcher,
+) -> (u32, u32) {
     let mut added_lines = 0u32;
     let mut deleted_lines = 0u32;
 
@@ -285,16 +309,16 @@ fn get_working_dir_diff_stats(
         // Parse numstat format: "added\tdeleted\tfilename"
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 3 {
+            let file_path = normalize_status_path(&crate::utils::unescape_git_path(parts[2]));
             // Post-filter by pathspec when we couldn't pass them as CLI args
             if needs_post_filter
                 && let Some(paths) = pathspecs
-                && !paths.contains(parts[2])
+                && !paths.contains(&file_path)
             {
                 continue;
             }
 
-            let file_path = parts[2];
-            if should_ignore_file_with_matcher(file_path, ignore_matcher) {
+            if should_ignore_file_with_matcher(&file_path, ignore_matcher) {
                 continue;
             }
 
@@ -312,7 +336,32 @@ fn get_working_dir_diff_stats(
         }
     }
 
-    Ok((added_lines, deleted_lines))
+    (added_lines, deleted_lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decomposed_non_ascii_numstat_matches_normalized_checkpoint_path() {
+        let paths = HashSet::from([normalize_status_path("cafe\u{301}.txt")]);
+        let matcher = build_ignore_matcher(&[]);
+        assert!(needs_working_dir_post_filter(&paths));
+        assert_eq!(
+            parse_working_dir_numstat_stats(
+                "3\t1\t\"caf\\303\\251.txt\"\n",
+                Some(&paths),
+                true,
+                &matcher
+            ),
+            (3, 1)
+        );
+        assert_eq!(
+            parse_working_dir_numstat_stats("4\t0\tother.txt\n", Some(&paths), true, &matcher),
+            (0, 0)
+        );
+    }
 }
 
 /// Count AI-attributed lines from InitialAttributions (uncommitted changes)
