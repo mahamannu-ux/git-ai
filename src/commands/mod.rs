@@ -22,6 +22,7 @@ pub mod logout;
 pub mod metrics_backfill;
 pub mod notes_migrate;
 pub mod personal_dashboard;
+pub(crate) mod revision;
 pub mod show;
 pub mod show_prompt;
 pub mod status;
