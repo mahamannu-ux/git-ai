@@ -645,10 +645,20 @@ jobs:
           if (Test-Path $gitAi) { throw 'MSI uninstall did not remove git-ai.exe' }
 
   test-pkg:
-    name: Test TrackAI Endpoint macOS PKG
+    name: Test TrackAI Endpoint macOS PKG (${{ matrix.package_arch }})
     needs: package-pkg
     if: ${{ !cancelled() && needs.package-pkg.result == 'success' }}
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            package_arch: arm64
+            binary_arch: arm64
+          - runner: macos-15-intel
+            package_arch: x64
+            binary_arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Download PKG artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -663,6 +673,11 @@ jobs:
             pkg="release/trackai-endpoint-macos-$arch.pkg"
             expanded="expanded-$arch"
             pkgutil --expand "$pkg" "$expanded"
+            payload_entries="$(lsbom -s "$expanded/Bom")"
+            if [ "$payload_entries" != "." ]; then
+              echo "::error::PKG payload for $arch must contain only '.', found: $payload_entries"
+              exit 1
+            fi
             test -x "$expanded/Scripts/numbat"
             test -f "$expanded/Scripts/trust/root.json"
             test -f "$expanded/Scripts/placeholder.yaml"
@@ -681,16 +696,36 @@ jobs:
           console_user="$(/usr/bin/stat -f%Su /dev/console)"
           case "$console_user" in
             ''|root|loginwindow|_mbsetupuser)
-              echo "::warning::PKG payload verified; hosted runner has no console user for installation. IT-T20h-01 covers the live install."
-              exit 0
+              echo "::error::PKG install gate requires an eligible console user; found '$console_user'"
+              exit 1
               ;;
           esac
           console_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory | /usr/bin/awk 'NR == 1 { print $2 }')"
           git_ai="$console_home/.git-ai/bin/git-ai"
 
-          sudo installer -pkg release/trackai-endpoint-macos-arm64.pkg -target /
-          lipo "$git_ai" -verify_arch arm64
-          "$git_ai" --version
+          pkg="release/trackai-endpoint-macos-${{ matrix.package_arch }}.pkg"
+          root_before="$(/usr/bin/stat -f '%Su:%Sg %Lp' /)"
+          sudo installer -pkg "$pkg" -target /
+          root_after="$(/usr/bin/stat -f '%Su:%Sg %Lp' /)"
+          if [ "$root_after" != "$root_before" ]; then
+            echo "::error::PKG changed / ownership or mode from '$root_before' to '$root_after'"
+            exit 1
+          fi
+
+          lipo "$git_ai" -verify_arch "${{ matrix.binary_arch }}"
+          binary_version="$("$git_ai" --version)"
+          receipt_id="com.git-ai.git-ai"
+          receipt_version="$(pkgutil --pkg-info "$receipt_id" | awk -F': ' '$1 == "version" { print $2 }')"
+          if [ "$receipt_version" != "$binary_version" ]; then
+            echo "::error::PKG receipt version '$receipt_version' does not match binary version '$binary_version'"
+            exit 1
+          fi
+          receipt_files="$(pkgutil --files "$receipt_id")"
+          unexpected_receipt_files="$(printf '%s\n' "$receipt_files" | awk 'NF && $0 != "." { print }')"
+          if [ -n "$unexpected_receipt_files" ]; then
+            echo "::error::PKG receipt unexpectedly lists installed files: $unexpected_receipt_files"
+            exit 1
+          fi
           numbat='/Library/Application Support/TrackAI/Endpoint/bin/numbat'
           test -x "$numbat"
           "$numbat" rules check --no-builtin-rules --rules-dir "$console_home/.git-ai/internal/security/rules/current/claude-code"
