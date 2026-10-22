@@ -1,0 +1,23 @@
+src/daemon.rs
+  s_0ae9587312e4b5::t_c7f3cbf1a0a2d9 4460-4467,4486-4487,4521,4524-4525,4528-4532,4535-4547,7749,7757-7769,7882,7885-7892,7896-7897,7899-7919,7923-7924,7932-7938,7940-7946,7948-7956,7968-7972,7977-7984,8002,10379-10434
+src/daemon/trace_normalizer.rs
+  s_0ae9587312e4b5::t_93c8e0a0883fdd 63-73
+tests/daemon_mode.rs
+  s_0ae9587312e4b5::t_15995816d7b3df 2823-2901,5400-5417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "b9ad3894cccc017f8b0cad09c7a59cca961844e2",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9587312e4b5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1630f-b66b-7753-96dd-fad397a0c7ae",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
