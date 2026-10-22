@@ -486,6 +486,41 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
     handle
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityTickStep {
+    PolicyRefresh,
+    ShipperPoll,
+    StatusQueue,
+    InventoryQueue,
+    SecurityFlush,
+}
+
+const SECURITY_TICK_STEPS: [SecurityTickStep; 5] = [
+    SecurityTickStep::PolicyRefresh,
+    SecurityTickStep::ShipperPoll,
+    SecurityTickStep::StatusQueue,
+    SecurityTickStep::InventoryQueue,
+    SecurityTickStep::SecurityFlush,
+];
+
+async fn run_security_shipper_tick_with<Step, Scan>(mut step: Step, scan: Scan)
+where
+    Step: FnMut(SecurityTickStep, chrono::DateTime<chrono::Utc>) + Send + 'static,
+    Scan: FnOnce(),
+{
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        for action in SECURITY_TICK_STEPS {
+            step(action, now);
+        }
+    })
+    .await
+    {
+        tracing::warn!(%error, "security shipper task failed");
+    }
+    scan();
+}
+
 fn spawn_security_shipper_worker() {
     if SECURITY_SHIPPER_STARTED.swap(true, Ordering::Relaxed) {
         return;
@@ -495,50 +530,67 @@ fn spawn_security_shipper_worker() {
     tokio::spawn(async move {
         loop {
             let joins = joins.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || {
-                let now = chrono::Utc::now();
-                let applied = match refresh_configured_security_policy(now) {
-                    Ok(crate::security::policy_apply::RefreshOutcome::Applied { .. }) => true,
-                    Ok(_) => false,
-                    Err(error) => {
-                        tracing::warn!(%error, "security policy refresh failed");
-                        false
+            let mut applied = false;
+            let mut binding = None;
+            run_security_shipper_tick_with(
+                move |action, now| match action {
+                    SecurityTickStep::PolicyRefresh => {
+                        applied = match refresh_configured_security_policy(now) {
+                            Ok(crate::security::policy_apply::RefreshOutcome::Applied {
+                                ..
+                            }) => true,
+                            Ok(_) => false,
+                            Err(error) => {
+                                tracing::warn!(%error, "security policy refresh failed");
+                                false
+                            }
+                        };
                     }
-                };
-                let binding =
-                    crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
-                        .ok()
-                        .flatten()
-                        .and_then(|runtime| runtime.fleet_binding().ok());
-                if let Ok(mut joins) = joins.lock()
-                    && let Err(error) = poll_configured_security_records(
-                        crate::security::activation::configured_lease_context(),
-                        binding.as_ref(),
-                        &std::collections::HashMap::new(),
-                        &mut joins,
-                        now.timestamp() as u64,
-                    )
-                {
-                    tracing::warn!(%error, "security record polling failed");
-                }
-                if let Err(error) = queue_configured_security_status(now, applied, binding.as_ref())
-                {
-                    tracing::warn!(%error, "security status queue failed");
-                }
-                if let Err(error) =
-                    crate::security::inventory::queue_configured_inventory(now, binding.as_ref())
-                {
-                    tracing::warn!(%error, "security inventory queue failed");
-                }
-                if let Err(error) = flush_configured_security_records(now.timestamp() as u64) {
-                    tracing::warn!(%error, "security record delivery failed");
-                }
-            })
-            .await
-            {
-                tracing::warn!(%error, "security shipper task failed");
-            }
-            crate::security::day_one_scan::spawn_if_due();
+                    SecurityTickStep::ShipperPoll => {
+                        binding =
+                            crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default(
+                            )
+                            .ok()
+                            .flatten()
+                            .and_then(|runtime| runtime.fleet_binding().ok());
+                        if let Ok(mut joins) = joins.lock()
+                            && let Err(error) = poll_configured_security_records(
+                                crate::security::activation::configured_lease_context(),
+                                binding.as_ref(),
+                                &std::collections::HashMap::new(),
+                                &mut joins,
+                                now.timestamp() as u64,
+                            )
+                        {
+                            tracing::warn!(%error, "security record polling failed");
+                        }
+                    }
+                    SecurityTickStep::StatusQueue => {
+                        if let Err(error) =
+                            queue_configured_security_status(now, applied, binding.as_ref())
+                        {
+                            tracing::warn!(%error, "security status queue failed");
+                        }
+                    }
+                    SecurityTickStep::InventoryQueue => {
+                        if let Err(error) = crate::security::inventory::queue_configured_inventory(
+                            now,
+                            binding.as_ref(),
+                        ) {
+                            tracing::warn!(%error, "security inventory queue failed");
+                        }
+                    }
+                    SecurityTickStep::SecurityFlush => {
+                        if let Err(error) =
+                            flush_configured_security_records(now.timestamp() as u64)
+                        {
+                            tracing::warn!(%error, "security record delivery failed");
+                        }
+                    }
+                },
+                crate::security::day_one_scan::spawn_if_due,
+            )
+            .await;
             tokio::time::sleep(SECURITY_SHIPPER_POLL_INTERVAL).await;
         }
     });
@@ -2089,6 +2141,30 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn task17_security_tick_wires_all_six_actions_in_order_without_timer_or_server() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let blocking_calls = calls.clone();
+        let scan_calls = calls.clone();
+        run_security_shipper_tick_with(
+            move |step, _now| blocking_calls.lock().unwrap().push(format!("{step:?}")),
+            move || scan_calls.lock().unwrap().push("DayOneScan".to_string()),
+        )
+        .await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "PolicyRefresh",
+                "ShipperPoll",
+                "StatusQueue",
+                "InventoryQueue",
+                "SecurityFlush",
+                "DayOneScan",
+            ]
+        );
+        assert_eq!(SECURITY_SHIPPER_POLL_INTERVAL, Duration::from_secs(2));
+    }
 
     #[test]
     fn client_delivery_health_report_contains_counts_and_timestamps_only() {

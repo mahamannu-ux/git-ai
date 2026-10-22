@@ -467,3 +467,74 @@ fn macos_cleanup_wrapper_runs_cleanup_and_reports_each_half() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn task17_macos_offboarding_dry_run_and_daemon_status_refusal_retain_security() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let home = root.join("user-home");
+    let security = home.join(".git-ai/internal/security");
+    fs::create_dir_all(&security).unwrap();
+    fs::write(security.join("retained"), "sentinel").unwrap();
+    let admin = root.join("endpoint");
+    fs::create_dir_all(admin.join("bin")).unwrap();
+    let script = root.join("cleanup-endpoint.sh");
+    let fake_id = root.join("id");
+    let fake_dscl = root.join("dscl");
+    let fake_sudo = root.join("sudo");
+    let binary = root.join("git-ai");
+    let numbat = admin.join("bin/numbat");
+    for (path, contents) in [
+        (&fake_id, "#!/bin/sh\n[ \"$1\" = -u ] && echo 0\nexit 0\n".to_string()),
+        (&fake_dscl, format!("#!/bin/sh\necho 'NFSHomeDirectory: {}'\n", home.display())),
+        (&fake_sudo, "#!/bin/sh\nshift 3\nexec \"$@\"\n".to_string()),
+        (&binary, "#!/bin/sh\ncase \"$*\" in\n  'bg status --repo /') printf '%s\\n' \"$FAKE_STATUS\";;\n  'fleet cleanup --dry-run') echo 'fleet dry run';;\nesac\n".to_string()),
+        (&numbat, "#!/bin/sh\nexit 0\n".to_string()),
+    ] {
+        fs::write(path, contents).unwrap();
+        let mut mode = fs::metadata(path).unwrap().permissions();
+        mode.set_mode(0o755);
+        fs::set_permissions(path, mode).unwrap();
+    }
+    let source = macos_cleanup_script()
+        .replace("id -u", &format!("\"{}\" -u", fake_id.display()))
+        .replace("/usr/bin/id", &format!("\"{}\"", fake_id.display()))
+        .replace("/usr/bin/dscl", &format!("\"{}\"", fake_dscl.display()))
+        .replace("/usr/bin/sudo", &format!("\"{}\"", fake_sudo.display()))
+        .replace(
+            "/Library/Application Support/TrackAI/Endpoint",
+            &admin.to_string_lossy(),
+        );
+    fs::write(&script, source).unwrap();
+
+    let invoke = |mode: &str, status: &str| {
+        std::process::Command::new("sh")
+            .arg(&script)
+            .args([mode, "--user", "testuser", "--bin"])
+            .arg(&binary)
+            .env("FAKE_STATUS", status)
+            .output()
+            .unwrap()
+    };
+    let dry_run = invoke("--dry-run", "");
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dry_run.stdout).contains("fleet dry run"));
+    assert!(security.join("retained").exists());
+
+    for status in ["{}", "{\"daemon_running\": true}"] {
+        let apply = invoke("--apply", status);
+        assert!(
+            !apply.status.success(),
+            "status {status} must block removal"
+        );
+        assert!(security.join("retained").exists());
+        assert!(numbat.exists());
+    }
+}
