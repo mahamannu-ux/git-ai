@@ -10,6 +10,38 @@ use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[test]
+fn test_notes_backend_config_normal_output_uses_stdout() {
+    let repo = TestRepo::new();
+    for args in [
+        &["config", "set", "notes_backend.kind", "http"][..],
+        &[
+            "config",
+            "set",
+            "notes_backend.backend_url",
+            "https://example.com",
+        ][..],
+        &["config", "unset", "notes_backend.backend_url"][..],
+        &["config", "unset", "notes_backend.kind"][..],
+    ] {
+        let output = repo
+            .git_ai_command_without_pre_sync_for_test(args, &[])
+            .output()
+            .expect("run config command");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty(), "{args:?} should print to stdout");
+        assert!(
+            output.stderr.is_empty(),
+            "{args:?} printed normal output to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Parse the JSON emitted by `git-ai config <key>` into a serde value.
 fn get_json(repo: &TestRepo, key: &str) -> Value {
     let out = repo
