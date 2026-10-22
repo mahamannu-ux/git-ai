@@ -48,7 +48,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 
@@ -109,6 +109,24 @@ const CHECKPOINT_FAMILY_DRAIN_CONCURRENCY: usize = 2;
 /// semaphore: they run on the blocking pool and must not be starved by
 /// long command passes.
 const COMMAND_SIDE_EFFECT_CONCURRENCY: usize = 2;
+/// How long an accepted checkpoint may wait on the trace-ingest watermark
+/// before the delay is logged, and the cadence of repeat logs while it keeps
+/// waiting. Healthy admission takes milliseconds; a wait this long means
+/// trace ingestion is stalled and must be visible in the logs (#2252).
+/// How long a completed sequencer entry (or a sync/await request) waits for an
+/// older, still-open mutating trace root of its family before that root's
+/// process is examined: long enough for a git process that just changed refs
+/// to get its `exit`/`atexit` frames to the reader. Overridable via
+/// `GIT_AI_DAEMON_CAUSAL_GRACE_MS`.
+const FAMILY_CAUSAL_GRACE: Duration = Duration::from_secs(1);
+/// Multiple of the grace after which a fence is released although the root is
+/// finishing (its final frames never got processed) or its process is gone or
+/// unknown (frames lost, or a socket fd leaked to a hook's background child).
+const FAMILY_CAUSAL_FENCE_HARD_CAP_MULTIPLIER: u32 = 30;
+/// Multiple of the grace for which a root that has already changed refs (its
+/// worktree HEAD reflog grew since it started) may hold the fence while it is
+/// still running, e.g. through a post-write hook.
+const FAMILY_WRITTEN_ROOT_FENCE_CAP_MULTIPLIER: u32 = 600;
 // Trace2 frames are written synchronously by Git to the daemon's Unix socket.
 // With small kernel socket buffers (macOS defaults to ~8 KiB), a bursty trace2
 // stream can fill the buffer and block the raw `git` process in `write()` until
@@ -483,6 +501,40 @@ fn is_trace_payload(payload: &Value) -> bool {
 
 fn trace_root_sid(sid: &str) -> &str {
     sid.split('/').next().unwrap_or(sid)
+}
+
+/// Git encodes its pid in the trace2 session id
+/// (`<timestamp>-H<host hash>-P<hex pid>`); child sids append `/<child sid>`.
+fn trace_sid_pid(sid: &str) -> Option<u32> {
+    let root = trace_root_sid(sid);
+    let pid_hex = &root[root.rfind("-P")? + 2..];
+    u32::from_str_radix(pid_hex, 16).ok()
+}
+
+/// HEAD-moving commands can be checked against the worktree HEAD reflog.
+fn moves_head_command(command: &str) -> bool {
+    matches!(
+        command,
+        "am" | "checkout"
+            | "cherry-pick"
+            | "commit"
+            | "merge"
+            | "pull"
+            | "rebase"
+            | "reset"
+            | "revert"
+            | "stash"
+            | "switch"
+    )
+}
+
+/// Sleeps until `deadline`, or forever when there is no timer to wait for
+/// (for `select!` arms that only sometimes have a deadline).
+pub(crate) async fn sleep_until_or_pending(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn is_terminal_root_trace_event(event: &str, sid: &str, root: &str) -> bool {
@@ -2627,7 +2679,7 @@ fn prune_stale_daemon_logs(log_dir: &Path) {
             Some(s) => s,
             None => continue,
         };
-        let _pid: u32 = match stem.parse() {
+        let pid: u32 = match stem.parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -2640,20 +2692,64 @@ fn prune_stale_daemon_logs(log_dir: &Path) {
         if !dominated {
             continue;
         }
-        #[cfg(unix)]
-        {
-            if process_alive(_pid) {
-                continue;
-            }
+        if process_alive(pid) {
+            continue;
         }
         let _ = fs::remove_file(&path);
     }
 }
 
+/// Whether `pid` is a running process. Exited-but-unreaped (zombie) processes
+/// count as gone: they have finished writing. Processes we may not signal
+/// (another user's) count as alive.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     // kill(pid, 0) checks existence without sending a signal.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    exists && !process_is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    // `/proc/<pid>/stat`: "<pid> (<comm>) <state> ..."; comm may contain
+    // spaces and parentheses, so read the state after the last ')'.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let after_comm = &stat[stat.rfind(')')? + 1..];
+            after_comm
+                .split_whitespace()
+                .next()
+                .map(|state| state == "Z")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut exit_code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        CloseHandle(handle);
+        queried && exit_code == STILL_ACTIVE as u32
+    }
 }
 
 fn read_json_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, GitAiError> {
@@ -2715,10 +2811,114 @@ struct FamilySequencerOrder {
     ordinal: u64,
 }
 
+/// A sequenced entry plus the daemon-side moment it became ready. The causal
+/// fence measures its wait from `enqueued_at`, never from git's own
+/// timestamps in the order key.
+#[derive(Debug)]
+struct FamilySequencerSlot {
+    enqueued_at: Instant,
+    entry: FamilySequencerEntry,
+}
+
 #[derive(Debug, Default)]
 struct FamilySequencerState {
     next_ordinal: u64,
-    entries: BTreeMap<FamilySequencerOrder, FamilySequencerEntry>,
+    entries: BTreeMap<FamilySequencerOrder, FamilySequencerSlot>,
+}
+
+/// One open root's standing against the causal fence for some waiting work
+/// (see `classify_root_fence`).
+enum RootFence {
+    /// Still holds; its time bound next changes the answer after this long.
+    Held(Duration),
+    /// Held past its bound, or judged not causally prior by the fallback
+    /// heuristics: release it, and say so once.
+    Release(&'static str),
+    /// Fences nothing: it has not changed refs.
+    Open,
+}
+
+/// What the causal fence needs to know about one open root. Gathered under
+/// the ingress lock (cheap map reads and clones); the filesystem and process
+/// observations run after the lock is dropped, so a slow worktree or a
+/// liveness syscall never stalls trace ingestion.
+#[derive(Clone)]
+struct RootFenceProbe {
+    root_sid: String,
+    waited: Duration,
+    /// Its atexit is queued (or its socket closed): the worker will clear it.
+    finishing: bool,
+    /// Worktree HEAD reflog start offsets and worktree, for commands that move
+    /// HEAD; `None` when that reflog cannot reveal the root's writes.
+    head_reflog: Option<(HashMap<String, u64>, Option<PathBuf>)>,
+    /// The root's start on git's clock, which a reflog modified later reveals
+    /// as written even when its length was recorded late.
+    started_at_ns: Option<u128>,
+    pid: Option<u32>,
+    wrote_refs: Option<bool>,
+    alive: Option<bool>,
+}
+
+impl RootFenceProbe {
+    /// Performs the observations the classification needs: the reflog stat
+    /// when there is one to consult, else a liveness probe once the grace has
+    /// passed. Runs without any daemon lock held.
+    fn observe(&mut self, grace: Duration) {
+        if self.finishing {
+            return;
+        }
+        self.observe_reflog();
+        if self.wrote_refs.is_none() && self.waited >= grace {
+            self.alive = self.pid.map(process_alive);
+        }
+    }
+
+    /// Whether the root has written its worktree HEAD reflog since it started.
+    fn observe_reflog(&mut self) {
+        self.wrote_refs = self.head_reflog.as_ref().and_then(|(offsets, worktree)| {
+            crate::daemon::ref_cursor::worktree_head_reflog_grew_since(
+                offsets,
+                worktree.as_deref(),
+                self.started_at_ns,
+            )
+        });
+    }
+}
+
+/// A fence release to log once the ingress lock is dropped.
+struct FenceRelease {
+    reason: &'static str,
+    context: &'static str,
+    root_age_ms: Option<u64>,
+    waited_ms: u64,
+}
+
+impl FenceRelease {
+    fn log(&self) {
+        tracing::warn!(
+            component = "daemon",
+            phase = "checkpoint_processing",
+            reason = self.reason,
+            context = self.context,
+            root_age_ms = self.root_age_ms,
+            waited_ms = self.waited_ms,
+            "proceeding past an open mutating trace root"
+        );
+    }
+}
+
+/// What a drain would do with a family's sequencer front right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyFrontDisposition {
+    /// Nothing to pop, or checkpoint admission is in progress: the event that
+    /// appends or admits an entry schedules its own drain.
+    Idle,
+    Ready,
+    /// Fenced behind an older open root; look again after `retry_in` or when
+    /// a root clears or is released (`trace_root_fence_notify`).
+    Fenced {
+        retry_in: Duration,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2811,6 +3011,13 @@ struct TraceIngressState {
     root_open_connections: HashMap<String, usize>,
     unidentified_open_connections: usize,
     root_close_markers_enqueued: HashSet<String>,
+    /// Mutating roots whose `atexit` the reader has already consumed: the git
+    /// process is done and its final frame is queued for the ingest worker,
+    /// which clears the root (and lifts its fence) when it reaches it. Socket
+    /// EOF must not clear such a root first, and needs no close marker for it.
+    root_finishing: HashSet<String>,
+    /// Roots whose fence release has been logged and counted already.
+    root_fence_release_logged: HashSet<String>,
 }
 
 #[doc(hidden)]
@@ -2833,6 +3040,17 @@ pub struct ActorDaemonCoordinator {
     pending_ai_edits_by_family: Mutex<HashMap<String, HashMap<String, u128>>>,
     family_sequencers_by_family: Mutex<HashMap<String, FamilySequencerState>>,
     pending_root_slots_by_root: Mutex<HashMap<String, PendingRootSlot>>,
+    /// See [`FAMILY_CAUSAL_GRACE`].
+    causal_grace: Duration,
+    /// Fences released because the root's process was alive past the grace
+    /// and had written nothing.
+    causal_grace_expirations: AtomicU64,
+    /// Fences released at a time bound (hard cap, written-root cap).
+    causal_fence_hard_cap_releases: AtomicU64,
+    /// Fired when a root clears or is released: fenced drains and waits
+    /// re-evaluate. Distinct from the per-frame ingest progress notify so a
+    /// fenced family does not wake on every trace frame the daemon sees.
+    trace_root_fence_notify: Notify,
     commit_file_timestamp_snapshots_by_root:
         Mutex<HashMap<String, CommitFileTimestampSnapshotHandles>>,
     recent_replay_prerequisites_by_family:
@@ -2943,6 +3161,10 @@ impl ActorDaemonCoordinator {
             pending_ai_edits_by_family: Mutex::new(HashMap::new()),
             family_sequencers_by_family: Mutex::new(HashMap::new()),
             pending_root_slots_by_root: Mutex::new(HashMap::new()),
+            causal_grace: family_causal_grace(),
+            causal_grace_expirations: AtomicU64::new(0),
+            causal_fence_hard_cap_releases: AtomicU64::new(0),
+            trace_root_fence_notify: Notify::new(),
             commit_file_timestamp_snapshots_by_root: Mutex::new(HashMap::new()),
             recent_replay_prerequisites_by_family: Mutex::new(HashMap::new()),
             side_effect_errors_by_family: Mutex::new(HashMap::new()),
@@ -3333,6 +3555,13 @@ impl ActorDaemonCoordinator {
         }
     }
 
+    #[cfg(test)]
+    fn new_with_causal_grace(causal_grace: Duration) -> Self {
+        let mut coordinator = Self::new();
+        coordinator.causal_grace = causal_grace;
+        coordinator
+    }
+
     /// Attribution work an automatic restart would abandon mid-flight:
     /// accepted checkpoints, queued trace payloads, actionable sequencer
     /// entries, and executing side-effect passes. PendingRoot placeholders
@@ -3353,7 +3582,7 @@ impl ActorDaemonCoordinator {
                 state
                     .entries
                     .values()
-                    .any(|entry| !matches!(entry, FamilySequencerEntry::PendingRoot))
+                    .any(|slot| !matches!(slot.entry, FamilySequencerEntry::PendingRoot))
             })
         {
             return true;
@@ -3526,9 +3755,13 @@ impl ActorDaemonCoordinator {
                 ordinal: state.next_ordinal,
             };
             state.next_ordinal = state.next_ordinal.saturating_add(1);
-            state
-                .entries
-                .insert(order, FamilySequencerEntry::PendingRoot);
+            state.entries.insert(
+                order,
+                FamilySequencerSlot {
+                    enqueued_at: Instant::now(),
+                    entry: FamilySequencerEntry::PendingRoot,
+                },
+            );
             order
         };
 
@@ -3628,18 +3861,29 @@ impl ActorDaemonCoordinator {
             ordinal: state.next_ordinal,
         };
         state.next_ordinal = state.next_ordinal.saturating_add(1);
-        state.entries.insert(order, entry);
+        state.entries.insert(
+            order,
+            FamilySequencerSlot {
+                enqueued_at: Instant::now(),
+                entry,
+            },
+        );
         Ok(())
     }
 
-    async fn drain_ready_family_sequencer_entries(&self, family: &str) -> Result<(), GitAiError> {
+    /// Drains the family's ready entries; when an older open root still holds
+    /// the front, returns how long until that fence's time bound is next due.
+    async fn drain_ready_family_sequencer_entries(
+        &self,
+        family: &str,
+    ) -> Result<Option<Duration>, GitAiError> {
         let exec_lock = self.side_effect_exec_lock(family)?;
         let _guard = exec_lock.lock().await;
         self.drain_ready_family_sequencer_entries_locked(family)
             .await
     }
 
-    async fn drain_all_ready_family_sequencers(&self) -> Result<(), GitAiError> {
+    async fn drain_all_ready_family_sequencers(self: &Arc<Self>) -> Result<(), GitAiError> {
         let families = {
             let map = self.family_sequencers_by_family.lock().map_err(|_| {
                 GitAiError::Generic("family sequencer map lock poisoned".to_string())
@@ -3649,17 +3893,25 @@ impl ActorDaemonCoordinator {
                 .map(|(family, _)| family.clone())
                 .collect::<Vec<_>>()
         };
-        let first_error = stream::iter(families)
-            .map(|family| async move { self.drain_ready_family_sequencer_entries(&family).await })
-            .buffer_unordered(CHECKPOINT_FAMILY_DRAIN_CONCURRENCY)
-            .fold(None, |first_error, result| async move {
-                first_error.or_else(|| result.err())
+        let outcomes = stream::iter(families)
+            .map(|family| async move {
+                let outcome = self.drain_ready_family_sequencer_entries(&family).await;
+                (family, outcome)
             })
+            .buffer_unordered(CHECKPOINT_FAMILY_DRAIN_CONCURRENCY)
+            .collect::<Vec<_>>()
             .await;
-        if let Some(error) = first_error {
-            return Err(error);
+        let mut first_error = None;
+        for (family, outcome) in outcomes {
+            match outcome {
+                // A fence lifts on a timer as much as on a root clearing; the
+                // coalesced per-family drain task owns that wait.
+                Ok(Some(_)) => self.schedule_family_drain(family),
+                Ok(None) => {}
+                Err(error) => first_error = first_error.or(Some(error)),
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Schedules drains for sequencer entries unblocked by a cleared trace
@@ -3692,72 +3944,316 @@ impl ActorDaemonCoordinator {
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                if coordinator
+                // Enroll before draining so a root clearing or releasing
+                // between the pass and the wait below cannot be lost.
+                let fence_changed = coordinator.trace_root_fence_notify.notified();
+                tokio::pin!(fence_changed);
+                fence_changed.as_mut().enable();
+                let fenced = match coordinator
                     .drain_ready_family_sequencer_entries(&family)
                     .await
-                    .is_err()
                 {
-                    tracing::error!(
-                        component = "daemon",
-                        phase = "checkpoint_processing",
-                        reason = "family_drain_failed",
-                        "failed draining family sequencer"
-                    );
-                    if let Ok(mut scheduled) = coordinator.scheduled_family_drains.lock() {
-                        scheduled.remove(&family);
+                    Ok(Some(retry_in)) => Some(retry_in),
+                    Ok(None) => {
+                        // Deregister atomically with the front check: an entry
+                        // appended after the pass but before deregistration
+                        // must either be seen here (loop again) or by the
+                        // fresh task its own schedule call spawns after we
+                        // release the marker.
+                        let Ok(mut scheduled) = coordinator.scheduled_family_drains.lock() else {
+                            return;
+                        };
+                        match coordinator.family_front_entry_disposition(&family) {
+                            FamilyFrontDisposition::Idle => {
+                                scheduled.remove(&family);
+                                return;
+                            }
+                            FamilyFrontDisposition::Ready => continue,
+                            FamilyFrontDisposition::Fenced { retry_in } => Some(retry_in),
+                        }
                     }
-                    return;
-                }
-                // Deregister atomically with the emptiness check: an entry
-                // appended after the pass but before deregistration must
-                // either be seen here (loop again) or by the fresh task its
-                // own schedule call spawns after we release the marker.
-                let Ok(mut scheduled) = coordinator.scheduled_family_drains.lock() else {
-                    return;
+                    Err(_) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_processing",
+                            reason = "family_drain_failed",
+                            "failed draining family sequencer"
+                        );
+                        if let Ok(mut scheduled) = coordinator.scheduled_family_drains.lock() {
+                            scheduled.remove(&family);
+                        }
+                        return;
+                    }
                 };
-                if !coordinator.family_has_actionable_front_entry(&family) {
-                    scheduled.remove(&family);
-                    return;
+                // Keep the marker: this task owns the family's re-drain. The
+                // fence lifts when its root clears or is released (notified)
+                // or when its time bound expires (timer).
+                let deadline = fenced.map(|retry_in| tokio::time::Instant::now() + retry_in);
+                tokio::select! {
+                    _ = &mut fence_changed => {}
+                    _ = sleep_until_or_pending(deadline) => {}
+                    _ = coordinator.wait_for_shutdown() => {
+                        if let Ok(mut scheduled) = coordinator.scheduled_family_drains.lock() {
+                            scheduled.remove(&family);
+                        }
+                        return;
+                    }
                 }
             }
         });
     }
 
-    /// Whether the family's sequencer front would be popped by a drain right
-    /// now — mirrors the gates of `drain_ready_family_sequencer_entries_locked`
-    /// (unadmitted checkpoints, PendingRoot front, prior-open-root fencing).
-    /// Gated-but-present entries return false: the event that lifts their
-    /// gate (admission completion, root clear) schedules its own drain.
-    fn family_has_actionable_front_entry(&self, family: &str) -> bool {
+    /// What a drain would do with the family's sequencer front right now —
+    /// mirrors the gates of `drain_ready_family_sequencer_entries_locked`
+    /// (unadmitted checkpoints, prior-open-root fencing). Entries gated on
+    /// admission are `Idle`: admission completion schedules its own drain.
+    fn family_front_entry_disposition(&self, family: &str) -> FamilyFrontDisposition {
         if self.unadmitted_checkpoints.load(Ordering::Acquire) > 0 {
-            return false;
+            return FamilyFrontDisposition::Idle;
         }
         let Ok(map) = self.family_sequencers_by_family.lock() else {
-            return false;
+            return FamilyFrontDisposition::Idle;
         };
         let Some(state) = map.get(family) else {
-            return false;
+            return FamilyFrontDisposition::Idle;
         };
-        let Some((order, entry)) = state.entries.first_key_value() else {
-            return false;
+        let Some((order, slot)) = state.entries.first_key_value() else {
+            return FamilyFrontDisposition::Idle;
         };
-        if matches!(entry, FamilySequencerEntry::PendingRoot) {
-            return false;
+        if matches!(slot.entry, FamilySequencerEntry::PendingRoot) {
+            return FamilyFrontDisposition::Idle;
         }
-        let entry_root_sid = match entry {
-            FamilySequencerEntry::ReadyCommand(command) => Some(command.root_sid.as_str()),
-            FamilySequencerEntry::AppliedSideEffects { applied, .. } => {
-                Some(applied.command.root_sid.as_str())
+        let (entry_root_sid, entry_kind) = Self::sequencer_entry_identity(&slot.entry);
+        match self.family_entry_blocked_by_prior_open_trace_root(
+            family,
+            order.started_at_ns,
+            entry_root_sid,
+            slot.enqueued_at.elapsed(),
+            entry_kind,
+        ) {
+            Ok(None) => FamilyFrontDisposition::Ready,
+            Ok(Some(retry_in)) => FamilyFrontDisposition::Fenced { retry_in },
+            Err(_) => FamilyFrontDisposition::Idle,
+        }
+    }
+
+    /// The trace root an entry came from (so it never fences itself) and a
+    /// label for logs.
+    fn sequencer_entry_identity(entry: &FamilySequencerEntry) -> (Option<&str>, &'static str) {
+        match entry {
+            FamilySequencerEntry::PendingRoot => (None, "pending_root"),
+            FamilySequencerEntry::ReadyCommand(command) => {
+                (Some(command.root_sid.as_str()), "command")
             }
-            _ => None,
+            FamilySequencerEntry::AppliedSideEffects { applied, .. } => (
+                Some(applied.command.root_sid.as_str()),
+                "applied_side_effects",
+            ),
+            FamilySequencerEntry::Checkpoint { .. } => (None, "checkpoint"),
+            FamilySequencerEntry::Canceled => (None, "canceled"),
+        }
+    }
+
+    /// Whether an open trace root could still change refs that matter to
+    /// `family` (`None`: any family): open, not definitely read-only,
+    /// mutating or not yet classified, and attributed to `family` or to no
+    /// family yet (unattributed roots fail closed and count for everyone).
+    fn open_root_may_mutate_family(
+        ingress: &TraceIngressState,
+        root_sid: &str,
+        family: Option<&str>,
+    ) -> bool {
+        ingress
+            .root_open_connections
+            .get(root_sid)
+            .is_some_and(|count| *count > 0)
+            && !ingress.root_definitely_read_only.contains(root_sid)
+            && ingress.root_mutating.get(root_sid).copied().unwrap_or(true)
+            && family.is_none_or(|family| {
+                ingress
+                    .root_families
+                    .get(root_sid)
+                    .is_none_or(|root_family| root_family == family)
+            })
+    }
+
+    /// Gathers what the fence needs about open root `root_sid` for work that
+    /// has waited `waited`; see [`RootFenceProbe::observe`] for the rest.
+    fn root_fence_probe(
+        ingress: &TraceIngressState,
+        root_sid: &str,
+        waited: Duration,
+    ) -> RootFenceProbe {
+        let moves_head = ingress
+            .root_argv
+            .get(root_sid)
+            .and_then(|argv| trace_argv_primary_command(argv))
+            .is_some_and(|primary| moves_head_command(&primary));
+        RootFenceProbe {
+            root_sid: root_sid.to_string(),
+            waited,
+            finishing: ingress.root_finishing.contains(root_sid)
+                || ingress.root_close_markers_enqueued.contains(root_sid),
+            head_reflog: moves_head
+                .then(|| ingress.root_reflog_start_offsets.get(root_sid).cloned())
+                .flatten()
+                .map(|offsets| (offsets, ingress.root_worktrees.get(root_sid).cloned())),
+            started_at_ns: ingress.root_started_at_ns.get(root_sid).copied(),
+            pid: trace_sid_pid(root_sid),
+            wrote_refs: None,
+            alive: None,
+        }
+    }
+
+    /// Whether an observed open root holds the causal fence. Decides from
+    /// data first and heuristics last, and applies no bookkeeping itself, so
+    /// status probes can ask too (releases are recorded by `evaluate_fence`).
+    ///
+    /// The fence exists for one hazard: a git process that has changed refs
+    /// while its final frame has not reached the sequencer. So:
+    /// - a *finishing* root (atexit read, or socket closed) holds until the
+    ///   worker processes its queued frame, which always clears it; should
+    ///   that somehow not happen, the hard cap releases it with a warning;
+    /// - a HEAD-moving root whose worktree HEAD reflog has grown or been
+    ///   modified since it started has changed refs and holds until it
+    ///   finishes (a post-write hook, say), bounded by the written-root cap;
+    /// - a HEAD-moving root whose worktree HEAD reflog is untouched has
+    ///   changed nothing: it fences nothing, and nobody waits for an editor or
+    ///   a pre-commit hook;
+    /// - any other root (no reflog to consult, or a command whose ref writes
+    ///   that reflog cannot reveal) falls back to time and liveness: it holds
+    ///   for the causal grace, then is released if its process is alive and
+    ///   held until the hard cap if it is gone.
+    fn classify_root_fence(&self, probe: &RootFenceProbe) -> RootFence {
+        let grace = self.causal_grace;
+        let hard_cap = grace * FAMILY_CAUSAL_FENCE_HARD_CAP_MULTIPLIER;
+        let hold_until = |bound: Duration, release: &'static str| {
+            if probe.waited < bound {
+                RootFence::Held(bound - probe.waited)
+            } else {
+                RootFence::Release(release)
+            }
         };
-        !self
-            .family_entry_blocked_by_prior_open_trace_root(
-                family,
-                order.started_at_ns,
-                entry_root_sid,
-            )
-            .unwrap_or(true)
+        if probe.finishing {
+            return hold_until(hard_cap, "finishing_root_cap");
+        }
+        match probe.wrote_refs {
+            Some(true) => {
+                return hold_until(
+                    grace * FAMILY_WRITTEN_ROOT_FENCE_CAP_MULTIPLIER,
+                    "written_root_cap",
+                );
+            }
+            Some(false) => return RootFence::Open,
+            None => {}
+        }
+        if probe.waited < grace {
+            return hold_until(grace, "causal_grace_expired");
+        }
+        match probe.alive {
+            Some(true) => RootFence::Release("causal_grace_expired"),
+            _ => hold_until(hard_cap, "causal_fence_hard_cap"),
+        }
+    }
+
+    /// Evaluates every open root accepted by `candidate` against the causal
+    /// fence for work that has waited `waited_for(root)`: gathers probes under
+    /// the ingress lock, observes them with the lock dropped, then applies
+    /// (and logs, once per root) any heuristic release. Returns the
+    /// earliest-expiring hold, if any root still holds.
+    fn evaluate_fence(
+        &self,
+        candidate: impl Fn(&TraceIngressState, &str) -> bool,
+        waited_for: impl Fn(&TraceIngressState, &str) -> Duration,
+        context: &'static str,
+    ) -> Result<Option<Duration>, GitAiError> {
+        let lock_ingress = || {
+            self.trace_ingress_state
+                .lock()
+                .map_err(|_| GitAiError::Generic("trace ingress state lock poisoned".to_string()))
+        };
+        let mut probes = {
+            let ingress = lock_ingress()?;
+            ingress
+                .root_open_connections
+                .keys()
+                .filter(|root_sid| candidate(&ingress, root_sid))
+                .map(|root_sid| {
+                    Self::root_fence_probe(&ingress, root_sid, waited_for(&ingress, root_sid))
+                })
+                .collect::<Vec<_>>()
+        };
+        if probes.is_empty() {
+            return Ok(None);
+        }
+        for probe in &mut probes {
+            probe.observe(self.causal_grace);
+        }
+
+        let mut ingress = lock_ingress()?;
+        let mut held: Option<Duration> = None;
+        let mut releases = Vec::new();
+        for probe in probes {
+            // Cleared while we were observing: it fences nothing any more.
+            if !Self::open_root_may_mutate_family(&ingress, &probe.root_sid, None) {
+                continue;
+            }
+            match self.classify_root_fence(&probe) {
+                RootFence::Held(retry_in) => {
+                    if held.is_none_or(|earliest| retry_in < earliest) {
+                        held = Some(retry_in);
+                    }
+                }
+                RootFence::Release(reason) => {
+                    if ingress
+                        .root_fence_release_logged
+                        .insert(probe.root_sid.clone())
+                    {
+                        releases.push(self.fence_release(
+                            &ingress,
+                            probe.root_sid,
+                            reason,
+                            probe.waited,
+                            context,
+                        ));
+                    }
+                }
+                RootFence::Open => {}
+            }
+        }
+        drop(ingress);
+        if !releases.is_empty() {
+            for release in &releases {
+                release.log();
+            }
+            self.trace_root_fence_notify.notify_waiters();
+        }
+        Ok(held)
+    }
+
+    fn fence_release(
+        &self,
+        ingress: &TraceIngressState,
+        root_sid: String,
+        reason: &'static str,
+        waited: Duration,
+        context: &'static str,
+    ) -> FenceRelease {
+        let counter = if reason == "causal_grace_expired" {
+            &self.causal_grace_expirations
+        } else {
+            &self.causal_fence_hard_cap_releases
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        FenceRelease {
+            reason,
+            context,
+            root_age_ms: ingress
+                .root_started_at_ns
+                .get(&root_sid)
+                .map(|started| (now_unix_nanos().saturating_sub(*started) / 1_000_000) as u64),
+            waited_ms: waited.as_millis() as u64,
+        }
     }
 
     /// Replaces a root's PendingRoot sequencer entry with `replacement` and
@@ -3790,9 +4286,10 @@ impl ActorDaemonCoordinator {
                     root_sid, family, slot.order
                 )));
             };
-            match entry {
+            match &mut entry.entry {
                 FamilySequencerEntry::PendingRoot => {
-                    *entry = replacement;
+                    entry.entry = replacement;
+                    entry.enqueued_at = Instant::now();
                 }
                 _ => {
                     return Err(GitAiError::Generic(format!(
@@ -3805,45 +4302,52 @@ impl ActorDaemonCoordinator {
         Ok(Some(family))
     }
 
+    /// Open mutating roots that hold the causal fence right now: `await`
+    /// treats them as pending work. Roots without a reflog to consult are
+    /// judged on how long the daemon has heard nothing from them.
+    fn has_open_mutating_roots_holding_fence(&self) -> bool {
+        let now = now_unix_nanos();
+        self.evaluate_fence(
+            |ingress, root_sid| Self::open_root_may_mutate_family(ingress, root_sid, None),
+            |ingress, root_sid| {
+                ingress
+                    .root_last_activity_ns
+                    .get(root_sid)
+                    .map(|last| Duration::from_nanos(now.saturating_sub(u128::from(*last)) as u64))
+                    .unwrap_or(Duration::ZERO)
+            },
+            "await",
+        )
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Whether a sequencer entry positioned at `started_at_ns`, ready for
+    /// `waited`, must still wait for an older mutating trace root that is open
+    /// (see `classify_root_fence` for how long a root can hold). Roots that
+    /// started after the entry cannot precede it. Unattributed roots (no
+    /// family yet) fail closed and fence every family.
     fn family_entry_blocked_by_prior_open_trace_root(
         &self,
         family: &str,
         started_at_ns: u128,
         entry_root_sid: Option<&str>,
-    ) -> Result<bool, GitAiError> {
-        let ingress = self
-            .trace_ingress_state
-            .lock()
-            .map_err(|_| GitAiError::Generic("trace ingress state lock poisoned".to_string()))?;
-
-        for (root_sid, open_count) in &ingress.root_open_connections {
-            if *open_count == 0 || entry_root_sid == Some(root_sid.as_str()) {
-                continue;
-            }
-            if ingress.root_definitely_read_only.contains(root_sid) {
-                continue;
-            }
-            if !ingress.root_mutating.get(root_sid).copied().unwrap_or(true) {
-                continue;
-            }
-            if ingress
-                .root_started_at_ns
-                .get(root_sid)
-                .copied()
-                .is_some_and(|root_started| root_started > started_at_ns)
-            {
-                continue;
-            }
-            if ingress
-                .root_families
-                .get(root_sid)
-                .is_none_or(|root_family| root_family == family)
-            {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+        waited: Duration,
+        entry_kind: &'static str,
+    ) -> Result<Option<Duration>, GitAiError> {
+        self.evaluate_fence(
+            |ingress, root_sid| {
+                entry_root_sid != Some(root_sid)
+                    && Self::open_root_may_mutate_family(ingress, root_sid, Some(family))
+                    && ingress
+                        .root_started_at_ns
+                        .get(root_sid)
+                        .is_none_or(|root_started| *root_started <= started_at_ns)
+            },
+            |_, _| waited,
+            entry_kind,
+        )
     }
 
     fn record_side_effect_error(
@@ -3997,6 +4501,8 @@ impl ActorDaemonCoordinator {
         ingress.root_definitely_read_only.remove(root_sid);
         ingress.root_open_connections.remove(root_sid);
         ingress.root_close_markers_enqueued.remove(root_sid);
+        ingress.root_finishing.remove(root_sid);
+        ingress.root_fence_release_logged.remove(root_sid);
     }
 
     fn record_trace_connection_close(&self, roots: &[String]) -> Result<Vec<String>, GitAiError> {
@@ -4010,6 +4516,9 @@ impl ActorDaemonCoordinator {
                 && *count > 1
             {
                 *count -= 1;
+                continue;
+            }
+            if ingress.root_finishing.contains(root_sid) {
                 continue;
             }
             if !Self::trace_root_needs_close_marker(&ingress, root_sid) {
@@ -4121,18 +4630,19 @@ impl ActorDaemonCoordinator {
         })?;
         queued.remove(root_sid);
         self.trace_ingest_progress_notify.notify_waiters();
+        self.trace_root_fence_notify.notify_waiters();
         Ok(())
     }
 
+    #[cfg(test)]
     fn has_open_trace_roots_that_may_mutate_refs(&self) -> bool {
         let Ok(ingress) = self.trace_ingress_state.lock() else {
             return false;
         };
-        ingress.root_open_connections.iter().any(|(root, count)| {
-            *count > 0
-                && !ingress.root_definitely_read_only.contains(root)
-                && ingress.root_mutating.get(root).copied().unwrap_or(true)
-        })
+        ingress
+            .root_open_connections
+            .keys()
+            .any(|root| Self::open_root_may_mutate_family(&ingress, root, None))
     }
 
     fn next_trace_ingest_seq(&self) -> u64 {
@@ -4526,10 +5036,13 @@ impl ActorDaemonCoordinator {
             state.next_ordinal = state.next_ordinal.saturating_add(1);
             state.entries.insert(
                 order,
-                FamilySequencerEntry::Checkpoint {
-                    request: Box::new(prepared.request),
-                    receipt_seq: prepared.receipt_seq,
-                    reservation: prepared.reservation,
+                FamilySequencerSlot {
+                    enqueued_at: Instant::now(),
+                    entry: FamilySequencerEntry::Checkpoint {
+                        request: Box::new(prepared.request),
+                        receipt_seq: prepared.receipt_seq,
+                        reservation: prepared.reservation,
+                    },
                 },
             );
             self.unadmitted_checkpoints
@@ -4653,19 +5166,38 @@ impl ActorDaemonCoordinator {
     }
 
     /// Waits until all trace payloads enqueued up to now have been processed
-    /// by the ingest worker, and any identified trace root that may mutate refs
-    /// has closed. This is a causal drain fence: it guarantees that trace2 data
+    /// by the ingest worker, and no identified trace root that may mutate refs
+    /// still holds the causal fence (see `classify_root_fence`): it has
+    /// closed, or it has been open past the grace with its process provably
+    /// still running and nothing written. This guarantees that trace2 data
     /// already visible to the daemon for prior mutating git operations has
-    /// reached the family sequencer before returning.
+    /// reached the family sequencer.
     ///
     /// Accepted sockets with no complete trace2 root are not causal evidence for
     /// any repository family. They are tracked for connection cleanup, but must
     /// not globally block checkpoint/sync control requests.
-    ///
-    /// Used by checkpoint entry to ensure ordering: a checkpoint must not be
-    /// processed until all causally-prior git operations have been ingested
-    /// through their root `atexit`/connection-close boundary.
     async fn wait_for_trace_ingest_processed_through(&self) {
+        self.wait_for_trace_ingest_processed_through_scope(None, "global")
+            .await
+    }
+
+    /// As [`Self::wait_for_trace_ingest_processed_through`], but scoped to one
+    /// family: open mutating roots already attributed to a different family do
+    /// not hold this fence, so a long-running git command in one repository
+    /// does not delay `sync.family` for every other repository. Unattributed
+    /// roots still fail closed and count until their `def_repo` arrives.
+    async fn wait_for_trace_ingest_processed_through_family(&self, family: &str) {
+        self.wait_for_trace_ingest_processed_through_scope(Some(family), "sync")
+            .await
+    }
+
+    async fn wait_for_trace_ingest_processed_through_scope(
+        &self,
+        family: Option<&str>,
+        context: &'static str,
+    ) {
+        let started = Instant::now();
+        let started_ns = now_unix_nanos();
         loop {
             // Read the current high-water mark. Any payload enqueued before this
             // point has a seq <= this value. We need to wait until the ingest
@@ -4673,16 +5205,30 @@ impl ActorDaemonCoordinator {
             let target = self.next_trace_ingest_seq.load(Ordering::Acquire) as u64;
             self.wait_for_trace_ingest_seq(target).await;
 
-            if !self.has_open_trace_roots_that_may_mutate_refs() {
+            // Enroll before checking (see wait_for_trace_ingest_seq): a root
+            // clearing or releasing must not race the evaluation.
+            let fence_changed = self.trace_root_fence_notify.notified();
+            tokio::pin!(fence_changed);
+            fence_changed.as_mut().enable();
+            // Roots that started after this wait began cannot precede the
+            // work it certifies, and must not be judged on this wait's clock.
+            let hold = self.evaluate_fence(
+                |ingress, root_sid| {
+                    Self::open_root_may_mutate_family(ingress, root_sid, family)
+                        && ingress
+                            .root_started_at_ns
+                            .get(root_sid)
+                            .is_none_or(|root_started| *root_started <= started_ns)
+                },
+                |_, _| started.elapsed(),
+                context,
+            );
+            let Ok(Some(retry_in)) = hold else {
                 return;
-            }
-
-            let progress = self.trace_ingest_progress_notify.notified();
-            if !self.has_open_trace_roots_that_may_mutate_refs() {
-                return;
-            }
+            };
             tokio::select! {
-                _ = progress => {}
+                _ = &mut fence_changed => {}
+                _ = tokio::time::sleep(retry_in) => {}
                 _ = self.wait_for_shutdown() => return,
             }
         }
@@ -4798,6 +5344,7 @@ impl ActorDaemonCoordinator {
         let terminal = is_terminal_root_trace_event(&event, &sid, &root);
         let capture_worktree = if command_mutates_refs
             && !terminal
+            && !ingress.root_finishing.contains(&root)
             && !ingress.root_reflog_start_offsets.contains_key(&root)
         {
             worktree_hint
@@ -4833,13 +5380,14 @@ impl ActorDaemonCoordinator {
             ingress.root_reflog_start_offsets.get(&root).cloned(),
             ingress.root_worktrees.get(&root).cloned(),
         );
+        if terminal && !read_only_root {
+            ingress.root_finishing.insert(root.clone());
+        }
         if terminal {
+            // Keep family and mutating classification until the ingest worker
+            // clears the root, so its final queued frames retain their fence.
             ingress.root_worktrees.remove(&root);
-            ingress.root_families.remove(&root);
-            ingress.root_argv.remove(&root);
-            ingress.root_started_at_ns.remove(&root);
             ingress.root_reflog_start_offsets.remove(&root);
-            ingress.root_mutating.remove(&root);
             ingress.root_target_repo_only.remove(&root);
             ingress.root_last_activity_ns.remove(&root);
             ingress.root_definitely_read_only.remove(&root);
@@ -4899,56 +5447,46 @@ impl ActorDaemonCoordinator {
     async fn drain_ready_family_sequencer_entries_locked(
         &self,
         family: &str,
-    ) -> Result<(), GitAiError> {
+    ) -> Result<Option<Duration>, GitAiError> {
         // Register the in-flight pass BEFORE popping entries: completion
         // fences must never observe an empty sequencer with no registered
         // pass while popped entries are about to execute (#2252).
         let _family_effect = self.begin_family_effect_guarded(family);
         let mut ready: Vec<(u64, FamilySequencerEntry)> = Vec::new();
-        let mut progressed = false;
+        let mut fenced = None;
         {
             let mut map = self.family_sequencers_by_family.lock().map_err(|_| {
                 GitAiError::Generic("family sequencer map lock poisoned".to_string())
             })?;
             if self.unadmitted_checkpoints.load(Ordering::Acquire) > 0 {
-                return Ok(());
+                return Ok(None);
             }
             let Some(state) = map.get_mut(family) else {
-                return Ok(());
+                return Ok(None);
             };
             while let Some(first_entry) = state.entries.first_entry() {
-                if matches!(first_entry.get(), FamilySequencerEntry::PendingRoot) {
+                let slot = first_entry.get();
+                if matches!(slot.entry, FamilySequencerEntry::PendingRoot) {
                     break;
                 }
-                let entry_root_sid = match first_entry.get() {
-                    FamilySequencerEntry::ReadyCommand(command) => Some(command.root_sid.as_str()),
-                    FamilySequencerEntry::AppliedSideEffects { applied, .. } => {
-                        Some(applied.command.root_sid.as_str())
-                    }
-                    _ => None,
-                };
-                if self.family_entry_blocked_by_prior_open_trace_root(
+                let (entry_root_sid, entry_kind) = Self::sequencer_entry_identity(&slot.entry);
+                fenced = self.family_entry_blocked_by_prior_open_trace_root(
                     family,
                     first_entry.key().started_at_ns,
                     entry_root_sid,
-                )? {
+                    slot.enqueued_at.elapsed(),
+                    entry_kind,
+                )?;
+                if fenced.is_some() {
                     break;
                 }
-                let (order, entry) = first_entry.remove_entry();
-                match entry {
-                    FamilySequencerEntry::PendingRoot => {
-                        unreachable!("pending root should not be removed from sequencer front");
-                    }
-                    other => {
-                        ready.push((order.ordinal, other));
-                        progressed = true;
-                    }
-                }
+                let (order, slot) = first_entry.remove_entry();
+                ready.push((order.ordinal, slot.entry));
             }
         }
 
         if ready.is_empty() {
-            return Ok(());
+            return Ok(fenced);
         }
 
         for (order, ready_entry) in ready {
@@ -5373,8 +5911,7 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        let _ = progressed;
-        Ok(())
+        Ok(fenced)
     }
 
     fn worktree_state_key(worktree: &Path) -> String {
@@ -7002,13 +7539,17 @@ impl ActorDaemonCoordinator {
         }
     }
 
-    async fn sync_family(&self, repo_working_dir: String) -> Result<FamilyStatus, GitAiError> {
+    async fn sync_family(
+        self: &Arc<Self>,
+        repo_working_dir: String,
+    ) -> Result<FamilyStatus, GitAiError> {
         let checkpoint_target = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
         self.wait_for_checkpoint_admission_through(checkpoint_target)
             .await;
         self.wait_for_no_unadmitted_checkpoints().await;
-        self.backend.resolve_family(Path::new(&repo_working_dir))?;
-        self.wait_for_trace_ingest_processed_through().await;
+        let family = self.backend.resolve_family(Path::new(&repo_working_dir))?;
+        self.wait_for_trace_ingest_processed_through_family(&family.0)
+            .await;
 
         loop {
             self.wait_for_no_unadmitted_checkpoints().await;
@@ -7035,7 +7576,7 @@ impl ActorDaemonCoordinator {
         self.status_for_family(repo_working_dir).await
     }
 
-    async fn drain_accepted_checkpoints(&self) -> Result<(), GitAiError> {
+    async fn drain_accepted_checkpoints(self: &Arc<Self>) -> Result<(), GitAiError> {
         loop {
             let checkpoint_target = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
             self.wait_for_checkpoint_admission_through(checkpoint_target)
@@ -7060,7 +7601,7 @@ impl ActorDaemonCoordinator {
     /// Progress is logged every few seconds. Returns an `AwaitResult` describing
     /// whether the daemon was idle before the timeout and how much telemetry
     /// (if any) is still pending.
-    async fn await_completion(&self, timeout_secs: u64) -> AwaitResult {
+    async fn await_completion(self: &Arc<Self>, timeout_secs: u64) -> AwaitResult {
         use tokio::time::{Duration, Instant, timeout};
 
         let start = Instant::now();
@@ -7220,7 +7761,7 @@ impl ActorDaemonCoordinator {
         {
             return true;
         }
-        if self.has_open_trace_roots_that_may_mutate_refs() {
+        if self.has_open_mutating_roots_holding_fence() {
             return true;
         }
         if let Ok(map) = self.inflight_effects_by_family.lock()
@@ -7255,7 +7796,7 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
-    async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
+    async fn handle_control_request(self: &Arc<Self>, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
             ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
@@ -8519,6 +9060,21 @@ fn daemon_max_uptime_ns() -> u128 {
 
 const DAEMON_SOCKET_HEALTH_CHECK_SECS: u64 = 30;
 
+/// A positive millisecond duration override from the environment, else
+/// `default`.
+fn env_duration_ms(var: &str, default: Duration) -> Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+fn family_causal_grace() -> Duration {
+    env_duration_ms("GIT_AI_DAEMON_CAUSAL_GRACE_MS", FAMILY_CAUSAL_GRACE)
+}
+
 fn daemon_socket_health_check_interval() -> u64 {
     std::env::var("GIT_AI_DAEMON_SOCKET_HEALTH_CHECK_SECS")
         .ok()
@@ -8822,11 +9378,10 @@ fn should_defer_restart_for_checkpoints(
 const TRACE_DRAIN_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
 fn daemon_trace_drain_probe_deadline() -> Duration {
-    std::env::var("GIT_AI_DAEMON_TRACE_DRAIN_PROBE_DEADLINE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(TRACE_DRAIN_PROBE_DEADLINE)
+    env_duration_ms(
+        "GIT_AI_DAEMON_TRACE_DRAIN_PROBE_DEADLINE_MS",
+        TRACE_DRAIN_PROBE_DEADLINE,
+    )
 }
 
 /// End-to-end trace drain health probe: connect to the trace socket, write
@@ -10924,6 +11479,534 @@ mod tests {
         coord.request_shutdown();
     }
 
+    #[test]
+    fn trace_sid_pid_parses_real_trace2_sid() {
+        assert_eq!(
+            trace_sid_pid("20260903T230057.647295Z-H68dbce90-P001cc228"),
+            Some(0x001c_c228)
+        );
+        assert_eq!(
+            trace_sid_pid(
+                "20260903T230057.647295Z-H68dbce90-P001cc228/20260903T230058.100000Z-H68dbce90-P001cc2f0"
+            ),
+            Some(0x001c_c228),
+            "child sids resolve to the root process"
+        );
+        assert_eq!(
+            trace_sid_pid("20260411T120000.000000-Punfinished-root"),
+            None
+        );
+        assert_eq!(trace_sid_pid("no-pid-here"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_distinguishes_live_reaped_and_foreign_processes() {
+        assert!(process_alive(std::process::id()), "this process is alive");
+        assert!(
+            process_alive(1),
+            "a process we may not signal (EPERM) is still alive"
+        );
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        child.wait().expect("reap the short-lived process");
+        assert!(!process_alive(child.id()), "a reaped process is gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_alive_distinguishes_live_and_reaped_processes() {
+        assert!(process_alive(std::process::id()), "this process is alive");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn a short-lived process");
+        child.wait().expect("reap the short-lived process");
+        assert!(!process_alive(child.id()), "a reaped process is gone");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_alive_treats_zombies_as_gone() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let started = std::time::Instant::now();
+        while !process_is_zombie(child.id()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "child never exited"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !process_alive(child.id()),
+            "an exited but unreaped process has finished writing: it is gone"
+        );
+        child.wait().unwrap();
+    }
+
+    /// A root sid whose pid is this test process: alive for as long as the
+    /// test runs, standing in for a git command blocked in an editor or hook.
+    fn alive_root_sid(tag: &str) -> String {
+        format!("20260411T120000.000000-H{tag}-P{:x}", std::process::id())
+    }
+
+    /// Opens a mutating `git commit` root on the reader side only (no ingest
+    /// worker needed). Without a worktree it is unattributed and fences
+    /// every family.
+    fn open_unattributed_commit_root(coord: &ActorDaemonCoordinator, sid: &str) {
+        coord.trace_root_connection_opened(sid).unwrap();
+        let mut start = serde_json::json!({
+            "event": "start",
+            "sid": sid,
+            "argv": ["git", "commit", "-m", "blocked"],
+            "time_ns": 1u64,
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut start));
+    }
+
+    /// The reader consumes the root's `atexit` frame: the process is done and
+    /// its final frame is queued for the worker.
+    fn read_root_atexit(coord: &ActorDaemonCoordinator, sid: &str) {
+        let mut atexit = serde_json::json!({
+            "event": "atexit",
+            "sid": sid,
+            "code": 0,
+            "time_ns": 2u64,
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut atexit));
+    }
+
+    /// Opens a mutating root running `argv` attributed to `repo`, so the
+    /// reader records its family and its reflog start offsets.
+    fn open_attributed_root(coord: &ActorDaemonCoordinator, sid: &str, repo: &Path, argv: &[&str]) {
+        open_attributed_root_started_at(coord, sid, repo, argv, now_unix_nanos());
+    }
+
+    /// Like `open_attributed_root`, with the root's `start` frame stamped at
+    /// `started_at_ns` on git's clock.
+    fn open_attributed_root_started_at(
+        coord: &ActorDaemonCoordinator,
+        sid: &str,
+        repo: &Path,
+        argv: &[&str],
+        started_at_ns: u128,
+    ) {
+        coord.trace_root_connection_opened(sid).unwrap();
+        let mut start = serde_json::json!({
+            "event": "start",
+            "sid": sid,
+            "argv": argv,
+            "worktree": repo,
+            "time_ns": started_at_ns as u64,
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut start));
+    }
+
+    fn open_attributed_commit_root(coord: &ActorDaemonCoordinator, sid: &str, repo: &Path) {
+        open_attributed_root(coord, sid, repo, &["git", "commit", "-m", "running"]);
+    }
+
+    /// A ref write in `repo` that bypasses trace2, standing in for the write
+    /// a still-running root performs.
+    fn init_test_family(
+        coord: &ActorDaemonCoordinator,
+        temp: &tempfile::TempDir,
+    ) -> (PathBuf, String) {
+        run_git_for_test(temp.path(), &["init", "repo"]);
+        let repo = temp.path().join("repo");
+        let family = coord.backend.resolve_family(&repo).unwrap().0;
+        (repo, family)
+    }
+
+    fn commit_untraced(repo: &Path) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "write",
+            ])
+            .env("GIT_TRACE2_EVENT", "0")
+            .output()
+            .expect("git commit should run");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Appends a completed rebase keyed at the current clock, so it follows
+    /// every root opened earlier in the test.
+    fn append_ready_rebase(coord: &ActorDaemonCoordinator, family: &str) {
+        coord
+            .append_family_sequencer_entry(
+                family,
+                now_unix_nanos(),
+                FamilySequencerEntry::ReadyCommand(Box::new(test_rebase_command(&[], Vec::new()))),
+            )
+            .unwrap();
+    }
+
+    fn is_fenced(disposition: FamilyFrontDisposition) -> bool {
+        matches!(disposition, FamilyFrontDisposition::Fenced { .. })
+    }
+
+    #[tokio::test]
+    async fn family_fence_releases_after_grace_when_root_process_is_alive() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("alive");
+        open_unattributed_commit_root(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+        assert!(
+            is_fenced(coord.family_front_entry_disposition("family-a")),
+            "a completed entry waits for an older open root within the causal grace"
+        );
+
+        tokio::time::sleep(grace * 3).await;
+        assert_eq!(
+            coord.family_front_entry_disposition("family-a"),
+            FamilyFrontDisposition::Ready,
+            "with no reflog to consult, a root whose process is alive past the grace is judged still running, not in flight"
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 1);
+
+        // Later work waits its own grace, but the heuristic release is
+        // reported once per root.
+        append_ready_rebase(&coord, "family-b");
+        assert!(is_fenced(coord.family_front_entry_disposition("family-b")));
+        tokio::time::sleep(grace * 3).await;
+        assert_eq!(
+            coord.family_front_entry_disposition("family-b"),
+            FamilyFrontDisposition::Ready
+        );
+        assert_eq!(
+            coord.causal_grace_expirations.load(Ordering::Relaxed),
+            1,
+            "a release is counted once per root"
+        );
+
+        // A root that closes before the grace expires releases without a count.
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("closed");
+        open_unattributed_commit_root(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+        assert!(is_fenced(coord.family_front_entry_disposition("family-a")));
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        assert_eq!(
+            coord.family_front_entry_disposition("family-a"),
+            FamilyFrontDisposition::Ready
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn family_fence_holds_past_grace_when_root_process_is_dead() {
+        let grace = Duration::from_millis(20);
+        let hard_cap = grace * FAMILY_CAUSAL_FENCE_HARD_CAP_MULTIPLIER;
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        child.wait().expect("reap the short-lived process");
+        let sid = format!("20260411T120000.000000-Hdead-P{:x}", child.id());
+        open_unattributed_commit_root(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+
+        tokio::time::sleep(grace * 4).await;
+        assert!(
+            is_fenced(coord.family_front_entry_disposition("family-a")),
+            "a root whose process is gone may still have frames in flight: keep holding past the grace"
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 0);
+
+        tokio::time::sleep(hard_cap).await;
+        assert_eq!(
+            coord.family_front_entry_disposition("family-a"),
+            FamilyFrontDisposition::Ready,
+            "the hard cap bounds the wait for a root that never finishes"
+        );
+        assert_eq!(
+            coord.causal_fence_hard_cap_releases.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_root_holds_fence_until_cleared() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("exiting");
+        open_unattributed_commit_root(&coord, &sid);
+        read_root_atexit(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+        tokio::time::sleep(grace * 3).await;
+        assert!(
+            is_fenced(coord.family_front_entry_disposition("family-a")),
+            "a finishing root holds the fence until the worker processes its frames, regardless of grace or liveness"
+        );
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        assert_eq!(
+            coord.family_front_entry_disposition("family-a"),
+            FamilyFrontDisposition::Ready
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 0);
+
+        // A finishing root's final frame is queued and the worker clears it,
+        // even if that frame fails to ingest; only the hard cap, a safety net
+        // against a root the worker somehow never clears, releases it by time.
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("stuck");
+        open_unattributed_commit_root(&coord, &sid);
+        read_root_atexit(&coord, &sid);
+        append_ready_rebase(&coord, "family-a");
+        tokio::time::sleep(grace * (FAMILY_CAUSAL_FENCE_HARD_CAP_MULTIPLIER / 2)).await;
+        assert!(is_fenced(coord.family_front_entry_disposition("family-a")));
+        tokio::time::sleep(grace * (FAMILY_CAUSAL_FENCE_HARD_CAP_MULTIPLIER / 2) + grace).await;
+        assert_eq!(
+            coord.family_front_entry_disposition("family-a"),
+            FamilyFrontDisposition::Ready
+        );
+        assert_eq!(
+            coord.causal_fence_hard_cap_releases.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn root_with_a_reflog_fences_only_once_it_has_written() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo); // so the worktree HEAD reflog exists
+        let sid = alive_root_sid("attributed");
+        open_attributed_commit_root(&coord, &sid, &repo);
+
+        append_ready_rebase(&coord, &family);
+        assert_eq!(
+            coord.family_front_entry_disposition(&family),
+            FamilyFrontDisposition::Ready,
+            "an open root whose worktree HEAD reflog has not grown has changed nothing: no wait at all"
+        );
+
+        // The root writes refs (say, then runs a post-commit hook).
+        commit_untraced(&repo);
+        append_ready_rebase(&coord, &family);
+        assert!(
+            is_fenced(coord.family_front_entry_disposition(&family)),
+            "once its worktree HEAD reflog has grown, the root holds the fence"
+        );
+        tokio::time::sleep(grace * 3).await;
+        assert!(
+            is_fenced(coord.family_front_entry_disposition(&family)),
+            "...for as long as it runs, even though its process is alive"
+        );
+        read_root_atexit(&coord, &sid);
+        assert!(is_fenced(coord.family_front_entry_disposition(&family)));
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        assert_eq!(
+            coord.family_front_entry_disposition(&family),
+            FamilyFrontDisposition::Ready
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            coord.causal_fence_hard_cap_releases.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn long_pre_commit_hook_does_not_misfence_later_checkpoint() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo);
+        let sid = alive_root_sid("pre-commit-hook");
+        open_attributed_commit_root(&coord, &sid, &repo);
+
+        // An older commit waiting in a pre-commit hook has not written HEAD.
+        // A later same-family checkpoint can proceed well past the grace.
+        tokio::time::sleep(grace * 5).await;
+        let checkpoint_start = now_unix_nanos();
+        assert_eq!(
+            coord
+                .family_entry_blocked_by_prior_open_trace_root(
+                    &family,
+                    checkpoint_start,
+                    None,
+                    grace * 5,
+                    "checkpoint",
+                )
+                .unwrap(),
+            None
+        );
+
+        // Once that older commit writes HEAD but remains open (a post-write
+        // hook), a subsequent checkpoint must wait for its final Trace2 frame
+        // rather than attach to the wrong commit.
+        commit_untraced(&repo);
+        assert!(
+            coord
+                .family_entry_blocked_by_prior_open_trace_root(
+                    &family,
+                    now_unix_nanos(),
+                    None,
+                    Duration::ZERO,
+                    "checkpoint",
+                )
+                .unwrap()
+                .is_some()
+        );
+        coord.clear_trace_root_tracking(&sid).unwrap();
+        assert_eq!(
+            coord
+                .family_entry_blocked_by_prior_open_trace_root(
+                    &family,
+                    now_unix_nanos(),
+                    None,
+                    Duration::ZERO,
+                    "checkpoint",
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn root_that_wrote_before_its_reflog_length_was_recorded_counts_as_written() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo);
+        // The root started, wrote, and only then did the reader get to record
+        // its reflog length: the length shows no growth, but the reflog was
+        // modified after the root's start.
+        let started_at_ns = now_unix_nanos();
+        std::thread::sleep(Duration::from_millis(20));
+        commit_untraced(&repo);
+        let sid = alive_root_sid("late-capture");
+        open_attributed_root_started_at(
+            &coord,
+            &sid,
+            &repo,
+            &["git", "commit", "-m", "already written"],
+            started_at_ns,
+        );
+        append_ready_rebase(&coord, &family);
+        tokio::time::sleep(grace * 3).await;
+        assert!(
+            is_fenced(coord.family_front_entry_disposition(&family)),
+            "a late-recorded reflog length must not hide a write that already happened"
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn root_writing_refs_other_than_head_falls_back_to_grace_and_liveness() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, family) = init_test_family(&coord, &temp);
+        commit_untraced(&repo);
+        let sid = alive_root_sid("branch");
+        open_attributed_root(
+            &coord,
+            &sid,
+            &repo,
+            &["git", "branch", "-f", "other", "HEAD"],
+        );
+        append_ready_rebase(&coord, &family);
+
+        assert!(
+            is_fenced(coord.family_front_entry_disposition(&family)),
+            "the HEAD reflog cannot reveal a branch update: hold for the grace"
+        );
+        tokio::time::sleep(grace * 3).await;
+        assert_eq!(
+            coord.family_front_entry_disposition(&family),
+            FamilyFrontDisposition::Ready,
+            "past the grace an alive process is judged still running"
+        );
+        assert_eq!(coord.causal_grace_expirations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fence_waits_for_open_mutating_trace_root_until_causal_grace_expires() {
+        let grace = Duration::from_millis(50);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("sync");
+        open_unattributed_commit_root(&coord, &sid);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                coord.wait_for_trace_ingest_processed_through()
+            )
+            .await
+            .is_err(),
+            "the fence holds within the causal grace"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            coord.wait_for_trace_ingest_processed_through(),
+        )
+        .await
+        .expect("the fence releases once the grace expires and the root's process is alive");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            coord.wait_for_trace_ingest_processed_through_family("/any/family/.git"),
+        )
+        .await
+        .expect("the family-scoped fence sees the same sticky release");
+        assert!(
+            coord.has_open_trace_roots_that_may_mutate_refs(),
+            "releasing the fence does not forget the root: it is still open"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_pending_work_ignores_idle_open_roots_but_counts_finishing_ones() {
+        let grace = Duration::from_millis(20);
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("idle");
+        open_unattributed_commit_root(&coord, &sid);
+        assert!(
+            coord.has_pending_daemon_work(),
+            "a fresh open root without a reflog to consult is pending within the grace"
+        );
+        tokio::time::sleep(grace * 3).await;
+        assert!(
+            !coord.has_pending_daemon_work(),
+            "an open root judged still running (a human at an editor) is not daemon work"
+        );
+
+        let coord = ActorDaemonCoordinator::new_with_causal_grace(grace);
+        let sid = alive_root_sid("finishing");
+        open_unattributed_commit_root(&coord, &sid);
+        read_root_atexit(&coord, &sid);
+        assert!(
+            tokio::time::timeout(grace * 3, coord.wait_for_trace_ingest_processed_through())
+                .await
+                .is_err(),
+            "a finishing root's frames are queued: waits hold and await keeps it pending"
+        );
+        assert!(coord.has_pending_daemon_work());
+    }
+
     #[tokio::test]
     async fn readonly_trace_connection_close_without_atexit_clears_tracking() {
         let coord = ActorDaemonCoordinator::new();
@@ -11346,7 +12429,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_completion_waits_for_late_rewrite_metric_producer() {
-        let coord = ActorDaemonCoordinator::new();
+        let coord = Arc::new(ActorDaemonCoordinator::new());
         let completed = Arc::new(AtomicBool::new(false));
         crate::daemon::rewrite_metrics::spawn_test_rewrite_metric_producer(
             Duration::from_millis(50),
