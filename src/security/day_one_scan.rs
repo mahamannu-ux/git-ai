@@ -560,7 +560,9 @@ mod tests {
         )
         .unwrap();
         assert!(security.join("day-one-scan-done").exists());
-        let database = rusqlite::Connection::open(tmp.path().join("security-findings.db")).unwrap();
+        let database =
+            crate::sqlite::open_with_memory_limits(tmp.path().join("security-findings.db"))
+                .unwrap();
         let count: i64 = database
             .query_row("SELECT count(*) FROM security_record_queue", [], |row| {
                 row.get(0)
@@ -696,7 +698,9 @@ mod tests {
         .unwrap();
         assert!(security.join("day-one-scan-done").exists());
         assert_eq!(fs::read_dir(security.join("scan-tmp")).unwrap().count(), 0);
-        let database = rusqlite::Connection::open(tmp.path().join("security-findings.db")).unwrap();
+        let database =
+            crate::sqlite::open_with_memory_limits(tmp.path().join("security-findings.db"))
+                .unwrap();
         let count: i64 = database
             .query_row("SELECT count(*) FROM security_record_queue", [], |row| {
                 row.get(0)
