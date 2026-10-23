@@ -41,7 +41,7 @@ The privacy fixture places `PRIVATE_PROMPT_SENTINEL_do_not_upload` in VS Code se
 - Codex fork/subagent pre-upgrade cursor e2e passed 1/1; cursor reconciliation unit passed 1/1. Large JSON bounded read 1/1 and JSONL oversized/UTF-8 tail 2/2 passed. Task17 security six-action worker wiring unit passed 1/1.
 - Codex fork and plain rollout preset identities passed 1/1 each; Copilot hook-without-daemon unknown unit passed 1/1.
 - `cargo fmt --check` and `git diff --check` passed on the committed code.
-- `task build` passed. Independent read-only `codex review --base 3552d4640` reported no actionable regression.
+- `task build` passed. Independent read-only `codex review --base 3552d4640` reported no actionable regression. Supplemental `codex review --commit 39432ca6b` found no actionable defect in the final queue-count assertion; that review's own sandboxed test was interrupted, while the same fixture passed separately with local daemon sockets enabled.
 - `task lint` under host Rust/Clippy 1.97.1 stopped on 12 unchanged-line warnings inherited from fork main/Task17b (the project CI toolchain is pinned to 1.93.0); none was in a new Task17c line. `cargo clippy --all-targets -- -D warnings` passed after suppressing only those seven inherited warning categories: `useless_borrows_in_formatting`, `for_kv_map`, `question_mark`, `manual_filter`, `byte_char_slices`, `needless_borrow`, `unnecessary_to_owned`.
 
 ## Remaining gates
