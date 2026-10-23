@@ -103,6 +103,30 @@ fn normalize_for_snapshot(output: &str) -> String {
         .join("\n")
 }
 
+fn normalize_blank_boundary_for_snapshot(output: &str) -> String {
+    normalize_for_snapshot(output)
+        .lines()
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn blank_boundary_normalizer_ignores_padding_but_preserves_content() {
+    let eight_spaces = "        (author metadata) Line 1";
+    let nine_spaces = "         (author metadata) Line 1";
+    let different_content = "         (author metadata) Line 2";
+
+    assert_eq!(
+        normalize_blank_boundary_for_snapshot(eight_spaces),
+        normalize_blank_boundary_for_snapshot(nine_spaces)
+    );
+    assert_ne!(
+        normalize_blank_boundary_for_snapshot(nine_spaces),
+        normalize_blank_boundary_for_snapshot(different_content)
+    );
+}
+
 #[test]
 fn test_blame_basic_format() {
     let repo = TestRepo::new();
@@ -695,8 +719,10 @@ fn test_blame_blank_boundary() {
     let git_output = repo.git(&["blame", "-b", "test.txt"]).unwrap();
     let git_ai_output = repo.git_ai(&["blame", "-b", "test.txt"]).unwrap();
 
-    let git_norm = normalize_for_snapshot(&git_output);
-    let git_ai_norm = normalize_for_snapshot(&git_ai_output);
+    // Git 2.56 changed the padding used when -b blanks a boundary commit.
+    // Compare the meaningful metadata and content while ignoring that padding.
+    let git_norm = normalize_blank_boundary_for_snapshot(&git_output);
+    let git_ai_norm = normalize_blank_boundary_for_snapshot(&git_ai_output);
     println!("\n[DEBUG] Normalized git blame output:\n{}", git_norm);
     println!("\n[DEBUG] Normalized git-ai blame output:\n{}", git_ai_norm);
     assert_eq!(
