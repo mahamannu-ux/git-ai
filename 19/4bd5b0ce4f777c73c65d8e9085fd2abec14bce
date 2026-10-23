@@ -1,0 +1,19 @@
+src/commands/status.rs
+  s_22b02387332269::t_0e14f04dfcb32a 379-403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "194bd5b0ce4f777c73c65d8e9085fd2abec14bce",
+  "prompts": {},
+  "sessions": {
+    "s_22b02387332269": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a165c1-8cd6-7aa3-9dc5-8c4eea33dd56",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
