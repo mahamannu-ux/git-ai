@@ -19,6 +19,25 @@ fn isolated_bash_history_db_path() -> (tempfile::TempDir, String) {
 }
 
 #[test]
+fn copilot_bash_without_checkpoint_remains_unattributed() {
+    let (_dir, db_path) = isolated_bash_history_db_path();
+    let env = [("GIT_AI_TEST_BASH_CHECKPOINT_DB_PATH", db_path.as_str())];
+    let repo = TestRepo::new_with_daemon_env(&env);
+    let path = repo.path().join("untraced.txt");
+    fs::write(&path, "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+
+    // A nearby editor session file is not evidence of a Bash checkpoint.
+    fs::write(&path, "base\nuntraced bash edit\n").unwrap();
+    repo.stage_all_and_commit("untraced edit").unwrap();
+    let mut file = repo.filename("untraced.txt");
+    file.assert_committed_lines(lines![
+        "base".unattributed_human(),
+        "untraced bash edit".unattributed_human(),
+    ]);
+}
+
+#[test]
 fn test_bash_pre_legacy_checkpoint_recovers_dirty_edge_attribution() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("example.txt");
@@ -251,6 +270,106 @@ fn test_bash_checkpoints_v2_records_for_recovery_without_working_log_checkpoints
     );
     assert!(calls[0].start_trace_id.is_some());
     assert!(calls[0].end_trace_id.is_some());
+}
+
+#[test]
+fn test_copilot_bash_recovery_uses_selected_vscode_model() {
+    let (_bash_db_dir, bash_db_path) = isolated_bash_history_db_path();
+    let env = [("GIT_AI_TEST_BASH_CHECKPOINT_DB_PATH", bash_db_path.as_str())];
+    let mut repo = TestRepo::new_with_daemon_env(&env);
+    repo.patch_git_ai_config(|patch| {
+        patch.feature_flags = Some(json!({"bash_checkpoints_v2": true}));
+    });
+    let repo_root = repo.canonical_path();
+    let file_path = repo_root.join("copilot-bash.txt");
+
+    fs::write(&file_path, "original line\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("copilot-bash.txt");
+    file.assert_committed_lines(lines!["original line".unattributed_human()]);
+
+    let session_id = "copilot-bash-model-session";
+    let storage = tempfile::tempdir().unwrap();
+    let workspace_storage = storage.path().join("workspaceStorage/workspace-id");
+    let transcript_path = workspace_storage
+        .join("GitHub.copilot-chat/transcripts")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript_path,
+        format!(r#"{{"type":"session.start","data":{{"sessionId":"{session_id}"}}}}\n"#),
+    )
+    .unwrap();
+    let chat_session_path = workspace_storage
+        .join("chatSessions")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(chat_session_path.parent().unwrap()).unwrap();
+    fs::write(
+        chat_session_path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "kind": 0,
+                "v": {
+                    "inputState": {
+                        "selectedModel": {"identifier": "copilot/claude-sonnet-5"}
+                    },
+                    "requests": []
+                }
+            }),
+            json!({
+                "kind": 2,
+                "k": ["requests"],
+                "v": [{
+                    "modelId": "copilot/claude-sonnet-5",
+                    "result": {"metadata": {"sessionId": session_id}}
+                }]
+            })
+        ),
+    )
+    .unwrap();
+
+    let hook_input = |event_name: &str| {
+        json!({
+            "hookEventName": event_name,
+            "cwd": repo_root,
+            "toolName": "run_in_terminal",
+            "toolUseId": "copilot-bash-tool",
+            "toolInput": {"command": "printf 'written by Copilot bash\\n' >> copilot-bash.txt"},
+            "sessionId": session_id,
+            "transcript_path": transcript_path
+        })
+        .to_string()
+    };
+    repo.git_ai(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &hook_input("PreToolUse"),
+    ])
+    .expect("Copilot pre-bash hook should succeed");
+    fs::write(&file_path, "original line\nwritten by Copilot bash\n").unwrap();
+    repo.git_ai(&[
+        "checkpoint",
+        "github-copilot",
+        "--hook-input",
+        &hook_input("PostToolUse"),
+    ])
+    .expect("Copilot post-bash hook should succeed");
+
+    let commit = repo.stage_all_and_commit("After Copilot bash").unwrap();
+    file.assert_committed_lines(lines![
+        "original line".unattributed_human(),
+        "written by Copilot bash".ai(),
+    ]);
+    let session = commit
+        .authorship_log
+        .metadata
+        .sessions
+        .values()
+        .find(|session| session.agent_id.tool == "github-copilot")
+        .expect("Copilot Bash session should be present");
+    assert_eq!(session.agent_id.model, "copilot/claude-sonnet-5");
 }
 
 #[test]

@@ -220,25 +220,7 @@ pub(super) fn parse_vscode_native_hooks(
         agent_id: AgentId {
             tool: "github-copilot".to_string(),
             id: session_id.clone(),
-            model: transcript_path
-                .as_ref()
-                .and_then(|tp| {
-                    let path = Path::new(tp.as_str());
-                    let sweep_format = match transcript_format {
-                        StreamFormat::CopilotEventStreamJsonl => {
-                            crate::streams::sweep::StreamFormat::CopilotEventStreamJsonl
-                        }
-                        _ => crate::streams::sweep::StreamFormat::CopilotSessionJson,
-                    };
-                    model_extraction::extract_model_from_copilot_vscode_transcript(
-                        path,
-                        sweep_format,
-                        &session_id,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .unwrap_or_else(|| "unknown".to_string()),
+            model: "unknown".to_string(),
         },
         external_session_id: session_id,
         trace_id: trace_id.to_string(),
@@ -760,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_native_model_prefers_otel_selected_model_over_models_json_default() {
+    fn test_copilot_native_hook_is_unknown_without_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let user_dir = dir.path().join("User");
         let transcript_path = user_dir
@@ -826,7 +808,7 @@ mod tests {
 
         match &events[0] {
             ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(e.context.agent_id.model, "claude-sonnet-4");
+                assert_eq!(e.context.agent_id.model, "unknown");
             }
             _ => panic!("Expected PostFileEdit"),
         }
