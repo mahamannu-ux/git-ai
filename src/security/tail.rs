@@ -321,9 +321,14 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
 #[cfg(windows)]
 fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
     use std::os::windows::fs::MetadataExt;
+
+    // Security is not monitored on Windows (TASK20 section 1.2). Keep the
+    // unsupported build on stable Rust without claiming production-grade file
+    // identity; Task9g must replace this fallback with
+    // GetFileInformationByHandle before any Windows monitoring claim.
     FileIdentity {
-        device: u64::from(metadata.volume_serial_number().unwrap_or_default()),
-        inode: metadata.file_index().unwrap_or_default(),
+        device: 0,
+        inode: metadata.creation_time(),
     }
 }
 
@@ -342,6 +347,21 @@ mod tests {
 
     fn write(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_uses_stable_creation_time_fallback() {
+        use std::os::windows::fs::MetadataExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("records.ndjson");
+        write(&path, b"one\n");
+        let metadata = std::fs::metadata(path).unwrap();
+
+        let identity = file_identity(&metadata);
+        assert_eq!(identity.device, 0);
+        assert_eq!(identity.inode, metadata.creation_time());
     }
 
     #[test]
