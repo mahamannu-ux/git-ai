@@ -1,0 +1,29 @@
+src/authorship/attribution_recovery.rs
+  s_22b02387332269::t_6a8d54022f2b16 354-358,360,362,394-396,1472,1480
+src/commands/checkpoint_agent/presets/github_copilot/ide.rs
+  s_22b02387332269::t_cff24a015840ad 223,745,811
+src/daemon.rs
+  s_22b02387332269::t_1d3efa2c19fa66 1125-1130
+src/streams/model_extraction.rs
+  s_22b02387332269::t_5c03c29579b054 1,4-5,9-10,16-19,254-797,853-854,928-929,932-940,943-945,1412-1467,1492,1501-1594
+tests/integration/bash_attribution.rs
+  s_22b02387332269::t_e21b9e1d84e888 21-39,275-374
+tests/integration/github_copilot_integration.rs
+  s_22b02387332269::t_95af40c7b38bec 4,279-555,563-565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "c0804a05eb373508b69ffaabf130b9c9a8c2da46",
+  "prompts": {},
+  "sessions": {
+    "s_22b02387332269": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a165c1-8cd6-7aa3-9dc5-8c4eea33dd56",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
