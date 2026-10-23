@@ -1007,7 +1007,9 @@ mod tests {
             runtime.managed_security_modes(),
             vec![(
                 "https://github.com/example/company-a".to_string(),
-                crate::fleet::SecurityMode::Monitor,
+                // Legacy V1 activation is ignored: only a current lease may
+                // enable security, so the effective mode remains off.
+                crate::fleet::SecurityMode::Off,
             )]
         );
         assert!(runtime.fleet_binding().is_err());

@@ -6,19 +6,18 @@
 # re-trigger (idempotency), an unusual --bin path, and the logon-time lock race
 # covered by `bg start --retry-secs`.
 #
-# Usage: test-login-start.ps1 [-Scenario lifecycle]
+# Usage: test-login-start.ps1 [-Scenario lifecycle|auto-update]
 #
 # Environment: BINARY_SOURCE (local|release), GIT_AI_LOCAL_BINARY,
-# GIT_AI_RELEASE_TAG, MDM_TEST_LOG_DIR — same meaning as in
+# GIT_AI_INSTALL_SCRIPT, GIT_AI_RELEASE_TAG, LATEST_TAG, MDM_TEST_LOG_DIR — same meaning as in
 # test-login-start.sh.
 #
-# Task9b scope: Windows lifecycle only. There is no auto-update scenario and no
-# configuration-tuning surface (the launchers carry no configuration; Task9c
-# owns it). Ported from upstream snapshot 0670e7ef27590af0e8ff5409267f3f4b09b8fcb4
-# (same Apache-2.0 project) with the auto-update and configuration-transport
-# surface removed.
+# Task9f-mdm-b adds a published N-1 to N regression without adding a launcher
+# configuration surface. Ported from upstream snapshot
+# 0670e7ef27590af0e8ff5409267f3f4b09b8fcb4 and adapted from
+# git-ai-project/git-ai@0cd8ede139e5cb5287cd09563ce677525d703547.
 param(
-    [ValidateSet('lifecycle')]
+    [ValidateSet('lifecycle', 'auto-update')]
     [string]$Scenario = 'lifecycle'
 )
 
@@ -26,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 
 $BinarySource = if ($env:BINARY_SOURCE) { $env:BINARY_SOURCE } else { 'local' }
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$InstallScript = if ($env:GIT_AI_INSTALL_SCRIPT) { $env:GIT_AI_INSTALL_SCRIPT } else { Join-Path $RepoRoot 'install.ps1' }
 $LogOut = if ($env:MDM_TEST_LOG_DIR) { $env:MDM_TEST_LOG_DIR } else { Join-Path ($env:RUNNER_TEMP, $env:TEMP | Where-Object { $_ } | Select-Object -First 1) 'mdm-logs' }
 $Bin = Join-Path $HOME '.git-ai\bin\git-ai.exe'
 $DaemonDir = Join-Path $HOME '.git-ai\internal\daemon'
@@ -33,6 +33,8 @@ $TaskPath = '\GitAI\'
 $TaskName = 'Start bg at logon'
 $MdmScript = Join-Path $RepoRoot 'mdm\windows\install-login-start.ps1'
 $StatusRepo = Join-Path ([IO.Path]::GetTempPath()) ("mdm-status-" + [guid]::NewGuid().ToString('N'))
+$PreviousUpdateInterval = $null
+$UpdateIntervalChanged = $false
 
 function Write-Log([string]$Message) { Write-Host "[mdm-test] $Message" }
 function Fail([string]$Message) { throw "[mdm-test] FAIL: $Message" }
@@ -46,13 +48,16 @@ function Install-Binary {
                 Fail 'GIT_AI_LOCAL_BINARY must point at a built git-ai.exe'
             }
         }
-        'release' { }
+        'release' {
+            if (-not (Test-Path $InstallScript)) { Fail "release installer missing: $InstallScript" }
+        }
         default { Fail 'BINARY_SOURCE must be local or release' }
     }
     Push-Location $RepoRoot
     try {
-        # install.ps1 honors GIT_AI_LOCAL_BINARY for local builds.
-        pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+        # The selected release installer is immutable in release mode; the
+        # repository copy continues to honor GIT_AI_LOCAL_BINARY for local CI.
+        pwsh -NoProfile -ExecutionPolicy Bypass -File $InstallScript
         if ($LASTEXITCODE -ne 0) { Fail "install.ps1 exited $LASTEXITCODE" }
     } finally {
         Pop-Location
@@ -65,6 +70,12 @@ function Get-DaemonPid {
     $file = Join-Path $DaemonDir 'daemon.pid.json'
     if (-not (Test-Path $file)) { return $null }
     try { return (Get-Content -Raw $file | ConvertFrom-Json).pid } catch { return $null }
+}
+
+function Get-InstalledVersion {
+    $match = [regex]::Match((& $Bin --version | Out-String), '\d+\.\d+\.\d+')
+    if (-not $match.Success) { Fail 'installed binary did not report a semantic version' }
+    return $match.Value
 }
 
 function Test-PidAlive($ProcessId) {
@@ -140,6 +151,13 @@ function Invoke-Cleanup {
     Copy-Item (Join-Path $DaemonDir 'logs') (Join-Path $LogOut 'daemon-logs') -Recurse -Force -ErrorAction SilentlyContinue
     Get-Task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue | Out-File (Join-Path $LogOut 'task-info.txt')
     Copy-Item (Join-Path $HOME '.git-ai\login\start-bg.ps1') $LogOut -Force -ErrorAction SilentlyContinue
+    if ($script:UpdateIntervalChanged) {
+        [Environment]::SetEnvironmentVariable(
+            'GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL',
+            $script:PreviousUpdateInterval,
+            'User'
+        )
+    }
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $MdmScript --uninstall *> $null
     if (Test-Path $Bin) { & $Bin bg shutdown *> $null }
     Remove-Item $StatusRepo -Recurse -Force -ErrorAction SilentlyContinue
@@ -290,11 +308,53 @@ function Invoke-LauncherRetryScenario {
     Write-Log 'launcher retry semantics verified'
 }
 
+function Invoke-AutoUpdateScenario {
+    if ($BinarySource -ne 'release') { Fail 'auto-update needs BINARY_SOURCE=release' }
+    if (-not $env:GIT_AI_RELEASE_TAG) { Fail 'auto-update needs an immutable older release tag' }
+    if (-not $env:LATEST_TAG) { Fail 'auto-update needs an immutable latest release tag' }
+    $latest = $env:LATEST_TAG.TrimStart('v')
+
+    Install-Binary
+    $before = Get-InstalledVersion
+    if ($before -eq $latest) { Fail 'older and latest release tags resolved to the same version' }
+    & $Bin config set disable_auto_updates false
+    Stop-Daemon
+
+    # Test-only user environment accelerates the hosted regression. The
+    # scheduled-task launcher retains its frozen product contract.
+    $script:PreviousUpdateInterval = [Environment]::GetEnvironmentVariable(
+        'GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL',
+        'User'
+    )
+    [Environment]::SetEnvironmentVariable(
+        'GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL',
+        '10',
+        'User'
+    )
+    $script:UpdateIntervalChanged = $true
+
+    Register-AndWaitForDaemon
+    $pid1 = Get-DaemonPid
+    Wait-For 360 "binary updated to $latest" { (Get-InstalledVersion) -eq $latest }
+    Wait-For 120 'daemon restarted after update' {
+        $current = Get-DaemonPid
+        $current -and $current -ne $pid1
+    }
+    Wait-For 30 'updated daemon healthy' { Test-DaemonUp }
+    if (-not (Test-Registered)) { Fail 'login start registration missing after update' }
+    Test-MechanismSane
+
+    Invoke-MdmScript --uninstall
+    if (Test-Registered) { Fail 'task still registered after --uninstall' }
+    Write-Log "auto-update $before -> $latest completed under login start"
+}
+
 New-Item -ItemType Directory -Path $StatusRepo -Force | Out-Null
 git -C $StatusRepo init -q
 try {
     switch ($Scenario) {
         'lifecycle' { Invoke-LifecycleScenario }
+        'auto-update' { Invoke-AutoUpdateScenario }
     }
     Write-Log "PASS $Scenario on windows"
 } finally {

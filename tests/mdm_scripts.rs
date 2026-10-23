@@ -308,6 +308,120 @@ fn release_workflow_publishes_the_scripts_as_assets() {
 }
 
 #[test]
+fn published_release_selector_fixtures_are_deterministic_and_fail_closed() {
+    let selector = repo_file("scripts/mdm/select-release-pair.py");
+    for required in [
+        "no eligible release pair",
+        "trackai-endpoint-macos-arm64.pkg",
+        "trackai-endpoint-macos-x64.pkg",
+        "git-ai-windows-x64.msi",
+        "git-ai-login-start-macos.sh",
+        "git-ai-login-start-windows.ps1",
+        "install.sh",
+        "install.ps1",
+        "PKG-SHA256SUMS",
+        "SHA256SUMS",
+        "production_trust_pinned",
+    ] {
+        assert!(
+            selector.contains(required),
+            "published-release selector must retain eligibility marker {required}"
+        );
+    }
+
+    let output = std::process::Command::new("python3")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/mdm/select-release-pair.py"))
+        .arg("--self-test")
+        .output()
+        .expect("run published-release selector fixture tests");
+    assert!(
+        output.status.success(),
+        "selector fixture tests failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn published_release_workflow_is_immutable_bounded_and_honest() {
+    let workflow = repo_file(".github/workflows/mdm-login-start-nightly.yml");
+    for required in [
+        "permissions:\n  contents: read",
+        "no eligible release pair",
+        "pair_available == 'true'",
+        "scripts/mdm/select-release-pair.py --self-test",
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases",
+        "gh release download \"$tag\"",
+        "diff --no-dereference --brief",
+        "SHA256SUMS",
+        "gh attestation verify",
+        "attestations: read",
+        "needs: [select-releases, published-assets]",
+        "Download and verify selected fork installer",
+        "test -n \"$expected\" && test \"$expected\" = \"$actual\"",
+        "--source-digest \"$source_digest\"",
+        "--signer-workflow \"$GITHUB_REPOSITORY/.github/workflows/release.yml\"",
+        "path: ${{ runner.temp }}/mdm-logs",
+        "retention-days: 7",
+        "security: not monitored on Windows",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "published-release workflow must retain safeguard {required}"
+        );
+    }
+    for forbidden in [
+        "api.github.com/repos/git-ai-project/git-ai",
+        "github.com/git-ai-project/git-ai/releases",
+        "releases/latest",
+        "continue-on-error: true",
+        "mdm/linux",
+        "~/.numbat",
+        "~/.git-ai/internal/security",
+        "/Library/Application Support/TrackAI/Endpoint",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "published-release workflow must exclude {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn published_update_harnesses_keep_registration_and_fork_identity() {
+    let macos = repo_file("scripts/mdm/test-login-start.sh");
+    for required in [
+        "lifecycle|auto-update",
+        "GIT_AI_INSTALL_SCRIPT",
+        "GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL",
+        "binary updated to $latest",
+        "daemon restarted after update",
+        "login start registration missing after update",
+    ] {
+        assert!(
+            macos.contains(required),
+            "macOS published update harness must retain {required}"
+        );
+    }
+
+    let windows = repo_file("scripts/mdm/test-login-start.ps1");
+    for required in [
+        "'lifecycle', 'auto-update'",
+        "GIT_AI_INSTALL_SCRIPT",
+        "GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL",
+        "binary updated to $latest",
+        "daemon restarted after update",
+        "login start registration missing after update",
+    ] {
+        assert!(
+            windows.contains(required),
+            "Windows published update harness must retain {required}"
+        );
+    }
+    assert!(!macos.contains("--env") && !windows.contains("--env"));
+}
+
+#[test]
 fn cleanup_wrappers_are_dry_run_first_and_explicit() {
     for (name, script) in [
         ("macos", macos_cleanup_script()),
@@ -409,6 +523,22 @@ fn cleanup_wrappers_propagate_uninstall_failure() {
     }
 }
 
+#[test]
+fn macos_cleanup_receipt_contract_is_explicit_and_root_only() {
+    let macos = macos_cleanup_script();
+    for required in [
+        "RECEIPT_ID=\"com.git-ai.git-ai\"",
+        "receipt $RECEIPT_ID retained; rerun as root to forget it",
+        "pkgutil --forget \"$RECEIPT_ID\"",
+        "receipt=$RECEIPT_ID",
+    ] {
+        assert!(
+            macos.contains(required),
+            "macOS cleanup must retain receipt safeguard {required}"
+        );
+    }
+}
+
 /// Exercise the macOS cleanup wrapper end to end with stubbed siblings: the
 /// wrapper must still run `fleet cleanup --apply` when uninstall fails, and
 /// must exit nonzero when either half fails.
@@ -465,5 +595,106 @@ fn macos_cleanup_wrapper_runs_cleanup_and_reports_each_half() {
             calls.contains("fleet cleanup --apply"),
             "cleanup must run despite uninstall failure: {calls}"
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).lines().any(
+                |line| line == "receipt com.git-ai.git-ai retained; rerun as root to forget it"
+            ),
+            "non-root cleanup must disclose that the package receipt remains"
+        );
     }
+}
+
+/// Exercise the root-only receipt path without privileges by rewriting only
+/// absolute system command paths in a disposable copy. This preserves the
+/// production control flow while keeping pkgutil and filesystem mutation fake.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_cleanup_forgets_receipt_only_after_root_cleanup_and_stopped_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let fake_home = dir.join("home");
+    std::fs::create_dir(&fake_home).unwrap();
+    let git_ai = dir.join("git-ai");
+    let dscl = dir.join("dscl");
+    let pkgutil = dir.join("pkgutil");
+    let calls = dir.join("calls.log");
+    let receipts = dir.join("receipts.log");
+
+    write_executable(
+        &git_ai,
+        "#!/bin/sh\necho \"$@\" >> \"$FAKE_LOG\"\ncase \"$*\" in\n  *'bg status'*)\n    if [ \"${FAKE_DAEMON_RUNNING:-0}\" = 1 ]; then echo '{\"daemon_running\": true}'; else echo '{\"daemon_running\": false}'; fi\n    ;;\n  *'fleet cleanup --apply'*) exit \"${FAKE_CLEANUP_EXIT:-0}\" ;;\nesac\nexit 0\n",
+    );
+    write_executable(
+        &dscl,
+        "#!/bin/sh\nprintf 'NFSHomeDirectory: %s\\n' \"$FAKE_HOME\"\n",
+    );
+    write_executable(
+        &pkgutil,
+        "#!/bin/sh\necho \"$@\" >> \"$FAKE_RECEIPTS\"\nexit 0\n",
+    );
+
+    let original = macos_cleanup_script();
+    let transformed = original
+        .replace(
+            "if [ \"$(id -u)\" -eq 0 ]; then",
+            "if [ \"${FAKE_UID:-$(id -u)}\" -eq 0 ]; then",
+        )
+        .replace("/usr/bin/sudo -H -u \"$TARGET_USER\" ", "")
+        .replace("/usr/bin/dscl", &dscl.display().to_string())
+        .replace("/usr/sbin/pkgutil", &pkgutil.display().to_string())
+        .replace(
+            "NUMBAT_ADMIN_DIR=\"/Library/Application Support/TrackAI/Endpoint\"",
+            &format!("NUMBAT_ADMIN_DIR=\"{}\"", dir.join("endpoint").display()),
+        );
+    let cleanup = dir.join("cleanup-endpoint.sh");
+    write_executable(&cleanup, &transformed);
+    let user = std::env::var("USER").expect("USER is set on macOS");
+
+    let run = |daemon_running: bool| {
+        let _ = std::fs::remove_file(&receipts);
+        std::process::Command::new("sh")
+            .arg(&cleanup)
+            .arg("--apply")
+            .arg("--user")
+            .arg(&user)
+            .arg("--bin")
+            .arg(&git_ai)
+            .env("FAKE_UID", "0")
+            .env("FAKE_HOME", &fake_home)
+            .env("FAKE_LOG", &calls)
+            .env("FAKE_RECEIPTS", &receipts)
+            .env(
+                "FAKE_DAEMON_RUNNING",
+                if daemon_running { "1" } else { "0" },
+            )
+            .output()
+            .unwrap()
+    };
+
+    let success = run(false);
+    assert!(
+        success.status.success(),
+        "root cleanup failed: {}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let receipt_calls = std::fs::read_to_string(&receipts).unwrap();
+    assert!(receipt_calls.contains("--pkg-info com.git-ai.git-ai"));
+    assert!(receipt_calls.contains("--forget com.git-ai.git-ai"));
+
+    let daemon_running = run(true);
+    assert!(!daemon_running.status.success());
+    assert!(String::from_utf8_lossy(&daemon_running.stderr).contains("daemon still running"));
+    assert!(
+        !receipts.exists(),
+        "receipt must remain when daemon shutdown did not complete"
+    );
 }
