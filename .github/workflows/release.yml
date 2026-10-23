@@ -100,7 +100,7 @@ jobs:
             ${{ matrix.docker_image }} \
             bash -c "
               apt-get update && \
-              apt-get install -y curl build-essential pkg-config musl-tools && \
+              apt-get install -y curl build-essential libdbus-1-dev pkg-config musl-tools && \
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 --target ${{ matrix.target }} && \
               . \$HOME/.cargo/env && \
               cargo build --release --target ${{ matrix.target }} && \
