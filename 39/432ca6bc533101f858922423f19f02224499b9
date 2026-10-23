@@ -1,0 +1,19 @@
+tests/integration/streams_e2e.rs
+  s_22b02387332269::t_e9e16e381feabc 901-917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "39432ca6bc533101f858922423f19f02224499b9",
+  "prompts": {},
+  "sessions": {
+    "s_22b02387332269": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a165c1-8cd6-7aa3-9dc5-8c4eea33dd56",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
