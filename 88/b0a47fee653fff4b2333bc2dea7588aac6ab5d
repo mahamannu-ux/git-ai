@@ -1,0 +1,21 @@
+src/security/day_one_scan.rs
+  s_0ae9587312e4b5::t_474530cbbc0831 563-565,701-703
+tests/integration/commit_metric_metadata.rs
+  s_0ae9587312e4b5::t_49f6305ea247d5 295-296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "88b0a47fee653fff4b2333bc2dea7588aac6ab5d",
+  "prompts": {},
+  "sessions": {
+    "s_0ae9587312e4b5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1630f-b66b-7753-96dd-fad397a0c7ae",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
