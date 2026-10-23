@@ -160,7 +160,7 @@ pub fn refresh_configured_security_policy(
         .ok_or_else(|| GitAiError::Generic("security state directory unavailable".into()))?
         .join(SECURITY_STATE_DIR);
     let state = crate::security::activation::configured_lease_context();
-    ensure_placeholder_if_inactive(&state, &state_dir, now)?;
+    ensure_placeholder_if_inactive(state, &state_dir, now)?;
     let Some(runtime) = crate::metrics::delivery::MetricDeliveryRuntime::load_optional_default()
         .map_err(|error| GitAiError::Generic(error.to_string()))?
     else {
