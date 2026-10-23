@@ -898,4 +898,21 @@ fn codex_fork_rollout_checkpoint_tracks_one_stream_keyed_by_filename() {
         Some(parent_id),
         "parent resolved from session_meta"
     );
+    let metrics_path = repo
+        .daemon_home_path()
+        .join(".git-ai")
+        .join("internal")
+        .join("metrics-db");
+    let metrics = rusqlite::Connection::open(metrics_path).unwrap();
+    let token_rows: i64 = metrics
+        .query_row(
+            "SELECT COUNT(*) FROM metrics WHERE event_kind = 5 AND event_json LIKE '%token_count%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        token_rows, 1,
+        "the new token event may be queued for upload once"
+    );
 }
