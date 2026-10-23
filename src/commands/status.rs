@@ -339,31 +339,6 @@ fn parse_working_dir_numstat_stats(
     (added_lines, deleted_lines)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decomposed_non_ascii_numstat_matches_normalized_checkpoint_path() {
-        let paths = HashSet::from([normalize_status_path("cafe\u{301}.txt")]);
-        let matcher = build_ignore_matcher(&[]);
-        assert!(needs_working_dir_post_filter(&paths));
-        assert_eq!(
-            parse_working_dir_numstat_stats(
-                "3\t1\t\"caf\\303\\251.txt\"\n",
-                Some(&paths),
-                true,
-                &matcher
-            ),
-            (3, 1)
-        );
-        assert_eq!(
-            parse_working_dir_numstat_stats("4\t0\tother.txt\n", Some(&paths), true, &matcher),
-            (0, 0)
-        );
-    }
-}
-
 /// Count AI-attributed lines from InitialAttributions (uncommitted changes)
 fn count_attributed_lines_from_initial(
     initial: &InitialAttributions,
@@ -400,4 +375,29 @@ fn count_attributed_lines_from_initial(
     }
 
     (ai_lines, known_human_lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decomposed_non_ascii_numstat_matches_normalized_checkpoint_path() {
+        let paths = HashSet::from([normalize_status_path("cafe\u{301}.txt")]);
+        let matcher = build_ignore_matcher(&[]);
+        assert!(needs_working_dir_post_filter(&paths));
+        assert_eq!(
+            parse_working_dir_numstat_stats(
+                "3\t1\t\"caf\\303\\251.txt\"\n",
+                Some(&paths),
+                true,
+                &matcher
+            ),
+            (3, 1)
+        );
+        assert_eq!(
+            parse_working_dir_numstat_stats("4\t0\tother.txt\n", Some(&paths), true, &matcher),
+            (0, 0)
+        );
+    }
 }
