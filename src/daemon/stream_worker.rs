@@ -910,6 +910,14 @@ impl StreamWorker {
         repo_work_dir: Option<&Path>,
     ) -> Result<(), StreamError> {
         let path_str = stream_path.display().to_string();
+        if tool == "codex" && stream.stream_kind == "transcript" {
+            self.streams_db.reconcile_codex_rollout_key(
+                session_id,
+                &path_str,
+                external_session_id.unwrap_or(""),
+                external_parent_session_id,
+            )?;
+        }
         if self
             .streams_db
             .get_stream(session_id, stream.stream_kind, &path_str)?

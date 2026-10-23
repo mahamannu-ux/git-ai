@@ -329,6 +329,80 @@ impl StreamsDatabase {
         })
     }
 
+    /// Re-key an in-progress Codex rollout from the old hook id to its
+    /// filename id. Keep the byte cursor so an upgrade cannot replay events.
+    pub fn reconcile_codex_rollout_key(
+        &self,
+        session_id: &str,
+        stream_path: &str,
+        external_session_id: &str,
+        external_parent_session_id: Option<&str>,
+    ) -> Result<(), StreamError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.transaction().map_err(|e| StreamError::Fatal {
+            message: format!("Failed to start Codex stream reconciliation: {e}"),
+        })?;
+        let mut old_rows = tx.prepare(
+            "SELECT session_id, watermark_value FROM tracked_streams \
+             WHERE tool = 'codex' AND stream_kind = 'transcript' AND stream_path = ?1 AND session_id != ?2",
+        ).map_err(|e| StreamError::Fatal { message: format!("Failed to read Codex stream: {e}") })?;
+        let old: Vec<(String, u64)> = old_rows
+            .query_map(params![stream_path, session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StreamError::Fatal {
+                message: format!("Failed to read Codex cursor: {e}"),
+            })?
+            .map(|row| {
+                let (id, cursor) = row.map_err(|e| StreamError::Fatal {
+                    message: format!("Failed to read Codex cursor: {e}"),
+                })?;
+                let cursor = cursor.parse::<u64>().map_err(|_| StreamError::Fatal {
+                    message: "Invalid Codex byte cursor".to_string(),
+                })?;
+                Ok((id, cursor))
+            })
+            .collect::<Result<_, StreamError>>()?;
+        drop(old_rows);
+        if old.is_empty() {
+            return Ok(());
+        }
+        let current: Option<String> = tx.query_row(
+            "SELECT watermark_value FROM tracked_streams WHERE session_id = ?1 AND stream_kind = 'transcript' AND stream_path = ?2",
+            params![session_id, stream_path], |row| row.get(0),
+        ).optional().map_err(|e| StreamError::Fatal { message: format!("Failed to read canonical Codex cursor: {e}") })?;
+        let max_cursor = old.iter().map(|(_, cursor)| *cursor).max().unwrap_or(0);
+        if let Some(current) = current {
+            let current = current.parse::<u64>().map_err(|_| StreamError::Fatal {
+                message: "Invalid canonical Codex byte cursor".to_string(),
+            })?;
+            tx.execute(
+                "UPDATE tracked_streams SET watermark_value = ?1, external_session_id = ?2, external_parent_session_id = ?3 \
+                 WHERE session_id = ?4 AND stream_kind = 'transcript' AND stream_path = ?5",
+                params![max_cursor.max(current).to_string(), external_session_id, external_parent_session_id, session_id, stream_path],
+            ).map_err(|e| StreamError::Fatal { message: format!("Failed to preserve Codex cursor: {e}") })?;
+        } else {
+            let source_id = &old.iter().max_by_key(|(_, cursor)| *cursor).unwrap().0;
+            tx.execute(
+                "UPDATE tracked_streams SET session_id = ?1, external_session_id = ?2, external_parent_session_id = ?3 \
+                 WHERE session_id = ?4 AND stream_kind = 'transcript' AND stream_path = ?5",
+                params![session_id, external_session_id, external_parent_session_id, source_id, stream_path],
+            ).map_err(|e| StreamError::Fatal { message: format!("Failed to rekey Codex stream: {e}") })?;
+        }
+        for (old_id, _) in old {
+            tx.execute(
+                "DELETE FROM tracked_streams WHERE session_id = ?1 AND stream_kind = 'transcript' AND stream_path = ?2",
+                params![old_id, stream_path],
+            ).map_err(|e| StreamError::Fatal { message: format!("Failed to remove old Codex stream key: {e}") })?;
+        }
+        tx.commit().map_err(|e| StreamError::Fatal {
+            message: format!("Failed to commit Codex stream reconciliation: {e}"),
+        })
+    }
+
     /// Update the watermark for a stream.
     pub fn update_watermark(
         &self,
@@ -553,6 +627,33 @@ mod tests {
             last_error: None,
             repo_work_dir: None,
         }
+    }
+
+    #[test]
+    fn codex_upgrade_keeps_one_stream_and_existing_cursor() {
+        let (db, _temp) = create_test_db();
+        let mut old = create_test_stream("old-parent-key");
+        old.tool = "codex".to_string();
+        old.external_session_id = "parent".to_string();
+        old.watermark_value = "1234".to_string();
+        old.last_known_size = 1234;
+        db.insert_stream(&old).unwrap();
+
+        db.reconcile_codex_rollout_key("new-file-key", &old.stream_path, "child", Some("parent"))
+            .unwrap();
+        db.reconcile_codex_rollout_key("new-file-key", &old.stream_path, "child", Some("parent"))
+            .unwrap();
+
+        let rows = db.all_streams().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "new-file-key");
+        assert_eq!(rows[0].watermark_value, "1234");
+        assert_eq!(rows[0].last_known_size, 1234);
+        assert_eq!(rows[0].external_session_id, "child");
+        assert_eq!(
+            rows[0].external_parent_session_id.as_deref(),
+            Some("parent")
+        );
     }
 
     #[test]

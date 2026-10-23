@@ -7,7 +7,7 @@ use crate::streams::sweep::{DiscoveredSession, StreamFormat, SweepStrategy};
 use crate::streams::types::{StreamBatch, StreamError};
 use crate::streams::watermark::{ByteOffsetWatermark, WatermarkStrategy};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,6 +19,27 @@ pub struct CodexAgent {
 impl CodexAgent {
     pub fn new() -> Self {
         Self { batch_size: 1000 }
+    }
+
+    /// Use the same rollout-file identity for hook notifications and sweeps.
+    pub fn external_session_id_from_rollout_path(path: &Path) -> Option<String> {
+        let stem = path.file_stem()?.to_str()?;
+        stem.strip_prefix("rollout-")?;
+        let id = &stem[stem.len().checked_sub(36)?..];
+        if stem.as_bytes().get(stem.len().checked_sub(37)?) != Some(&b'-') {
+            return None;
+        }
+        if id.as_bytes().iter().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                *b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        }) {
+            Some(id.to_string())
+        } else {
+            None
+        }
     }
 
     #[cfg(test)]
@@ -120,8 +141,9 @@ impl CodexAgent {
     /// the parent session UUID.
     pub fn detect_subagent_parent(path: &Path) -> Option<String> {
         let file = File::open(path).ok()?;
-        let reader = BufReader::new(file);
-        let first_line = reader.lines().next()?.ok()?;
+        let mut reader = BufReader::new(file.take(1024 * 1024));
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).ok()?;
         if first_line.trim().is_empty() {
             return None;
         }
@@ -167,13 +189,10 @@ impl Agent for CodexAgent {
         for path in paths {
             // Codex filename: rollout-2026-02-06T20-35-49-019c35bd-ad8e-7422-834c-3605bc4ee7ac
             // The hook payload sends the UUID as session_id/thread_id (last 36 chars)
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(external_session_id) = Self::external_session_id_from_rollout_path(&path)
+            else {
                 continue;
             };
-            if stem.len() < 36 {
-                continue;
-            }
-            let external_session_id = stem[stem.len() - 36..].to_string();
             let session_id = generate_session_id(&external_session_id, "codex");
             let external_parent_session_id = Self::detect_subagent_parent(&path);
 
