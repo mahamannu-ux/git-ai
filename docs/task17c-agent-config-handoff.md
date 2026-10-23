@@ -1,6 +1,6 @@
 # Task17c agent identity and config handoff
 
-Date: 2026-10-23. GitAI branch: `task/Task17-upstream-sync-gitai`. Base for exact Task17c review: `3552d4640` (fork `origin/main` `3b42f8fbe` integrated after Task17b `1c219f538`; public upstream was not merged). The founder owns push, PR and merge. Task17f owns the combined full Cargo and live gates. No TrackAI server contract, release, MDM, fleet, security module or telemetry worker source was changed. **Recommendation: ready for Task17 lead review; founder-run Task4 restart and live route checks remain pending before any stronger release claim.**
+Date: 2026-10-23. GitAI branch: `task/Task17-upstream-sync-gitai`. Base for exact Task17c review: `3552d4640` (fork `origin/main` `3b42f8fbe` integrated after Task17b `1c219f538`; public upstream was not merged). The founder owns push, PR and merge. Task17f owns the combined full Cargo and live gates. No TrackAI server contract, release, MDM, fleet, security module or telemetry worker source was changed. **Recommendation: ready for Task17 lead review; founder reports the Task4 restart fixture passed on Mac. Live route checks remain pending before any stronger release claim.**
 
 ## Source decisions
 
@@ -43,10 +43,11 @@ The privacy fixture places `PRIVATE_PROMPT_SENTINEL_do_not_upload` in VS Code se
 - `cargo fmt --check` and `git diff --check` passed on the committed code.
 - `task build` passed. Independent read-only `codex review --base 3552d4640` reported no actionable regression. Supplemental `codex review --commit 39432ca6b` found no actionable defect in the final queue-count assertion; that review's own sandboxed test was interrupted, while the same fixture passed separately with local daemon sockets enabled.
 - `task lint` under host Rust/Clippy 1.97.1 stopped on 12 unchanged-line warnings inherited from fork main/Task17b (the project CI toolchain is pinned to 1.93.0); none was in a new Task17c line. `cargo clippy --all-targets -- -D warnings` passed after suppressing only those seven inherited warning categories: `useless_borrows_in_formatting`, `for_kv_map`, `question_mark`, `manual_filter`, `byte_char_slices`, `needless_borrow`, `unnecessary_to_owned`.
+- Founder reported on 2026-10-23 that the Task4 durability restart test passed on his Mac. Its stdout and exact test count were not supplied, so this is founder-reported evidence rather than locally observed output.
 
 ## Remaining gates
 
-The founder can run the heavier Task4 durability restart fixture locally:
+Founder-reported Task4 durability restart command:
 
 ```sh
 cd /Users/manishmahajan/AIProjects/TrackAI-wt/Task17-upstream-sync-gitai
@@ -54,4 +55,4 @@ task build
 task test TEST_FILTER=codex_commit_is_durably_bound_before_daemon_restart_when_delivery_is_offline
 ```
 
-This harness requires local daemon sockets. In Codex's sandbox it needed `env -u CODEX_SANDBOX_NETWORK_DISABLED` and a `test-support` binary; a normal local shell should use the repo's task/test setup. Expected result: one passed fixture, no duplicate delivery after restart. Task17f retains the combined full suite and Task20 security/contract gates. Live agent checks remain pending in a separate macOS account: Claude Code mixed-case hook, Codex actual rollout model plus fork/subagent, and Copilot VS Code selected/Auto with actual agent version, host, capture channel and observed/unknown result. Prove that account's daemon/database before each check. No package was installed on the founder's everyday account.
+This harness requires local daemon sockets. In Codex's sandbox it needed `env -u CODEX_SANDBOX_NETWORK_DISABLED` and a `test-support` binary; a normal local shell uses the repo's task/test setup. The founder reported a pass, but the captured output was not provided here. Task17f retains the combined full suite and Task20 security/contract gates. Live agent checks remain pending in a separate macOS account: Claude Code mixed-case hook, Codex actual rollout model plus fork/subagent, and Copilot VS Code selected/Auto with actual agent version, host, capture channel and observed/unknown result. Prove that account's daemon/database before each check. No package was installed on the founder's everyday account.
