@@ -1,0 +1,25 @@
+src/commands/checkpoint_agent/presets/codex.rs
+  s_22b02387332269::t_9ba5413123e38f 149-162,330-420
+src/streams/agents/codex.rs
+  s_22b02387332269::t_cae24013b480ec 10,24-44,144-146,192-193
+src/streams/db.rs
+  s_22b02387332269::t_5319d72794e8f0 332-405,632-658
+tests/integration/streams_e2e.rs
+  s_22b02387332269::t_a983a8690cea3b 789-901
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "7b5d62aaba4ec43a225fdd3a1b08862bc105dc26",
+  "prompts": {},
+  "sessions": {
+    "s_22b02387332269": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a165c1-8cd6-7aa3-9dc5-8c4eea33dd56",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
