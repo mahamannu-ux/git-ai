@@ -1,0 +1,21 @@
+.github/workflows/install-scripts-local.yml
+  s_148c5698b1601f::t_3ce3348385dc12 68-73
+.github/workflows/lint-format.yml
+  s_148c5698b1601f::t_3c46fdf17491d4 66-71,98-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "2e097bb29801fc6a4b613fcf4edf047168804417",
+  "prompts": {},
+  "sessions": {
+    "s_148c5698b1601f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16999-04f8-7132-9449-4e791fee42d1",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
