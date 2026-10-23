@@ -1,8 +1,13 @@
 use crate::streams::sweep::StreamFormat;
 use crate::streams::types::StreamError;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+const CODEX_SCAN_BYTES: u64 = 50 * 1024;
+const CODEX_HEAD_BYTES: u64 = 1024 * 1024;
+const CODEX_HEAD_LINES: usize = 20;
+const CODEX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub fn extract_model(
     path: &Path,
@@ -14,6 +19,7 @@ pub fn extract_model(
         | StreamFormat::CopilotEventStreamJsonl
         | StreamFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
         StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
+        StreamFormat::CodexJsonl => Ok(extract_codex_model(path)),
         StreamFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
         StreamFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),
         StreamFormat::CopilotOtelSqlite => extract_model_from_copilot_otel_sqlite(path, session_id),
@@ -124,6 +130,116 @@ fn extract_model_from_jsonl_head(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Read only bounded transcript windows and the selected local config model.
+/// Prompt and response content are never returned or logged.
+fn extract_codex_model(path: &Path) -> Option<String> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return codex_config_model(path),
+    };
+    let size = file.metadata().ok()?.len();
+    let start = size.saturating_sub(CODEX_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(CODEX_SCAN_BYTES).read_to_end(&mut tail).ok()?;
+    let tail = if start > 0 {
+        match tail.iter().position(|byte| *byte == b'\n') {
+            Some(first_end) => &tail[first_end + 1..],
+            None => &[],
+        }
+    } else {
+        &tail[..]
+    };
+    if let Some(model) = tail
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .find_map(codex_model_from_line)
+    {
+        return Some(model);
+    }
+
+    let mut head = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(CODEX_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    if let Some(complete_end) = head.iter().rposition(|byte| *byte == b'\n')
+        && let Some(model) = head[..complete_end]
+            .split(|byte| *byte == b'\n')
+            .take(CODEX_HEAD_LINES)
+            .filter(|line| line.len() <= CODEX_SCAN_BYTES as usize)
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .find_map(codex_model_from_line)
+    {
+        return Some(model);
+    }
+
+    codex_config_model(path)
+}
+
+fn codex_model_from_line(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if !matches!(
+        value.get("type").and_then(|field| field.as_str()),
+        Some("turn_context" | "session_meta")
+    ) {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    ["model", "model_id", "modelId"].iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(|model| model.as_str())
+            .and_then(codex_model_candidate)
+    })
+}
+
+fn codex_model_candidate(model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty()
+        || model.eq_ignore_ascii_case("unknown")
+        || model.eq_ignore_ascii_case("auto")
+        || model == "<synthetic>"
+    {
+        return None;
+    }
+    Some(model.to_string())
+}
+
+fn codex_config_model(path: &Path) -> Option<String> {
+    let configured_home = crate::mdm::utils::codex_home_dir();
+    let home = if path.starts_with(&configured_home) {
+        configured_home
+    } else {
+        path.ancestors()
+            .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some(".codex"))?
+            .to_path_buf()
+    };
+    let file = File::open(home.join("config.toml")).ok()?;
+    let mut content = String::new();
+    file.take(CODEX_CONFIG_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > CODEX_CONFIG_BYTES {
+        return None;
+    }
+    let config: toml::Value = toml::from_str(&content).ok()?;
+    config
+        .get("profile")
+        .and_then(toml::Value::as_str)
+        .and_then(|profile| config.get("profiles")?.get(profile)?.get("model"))
+        .and_then(toml::Value::as_str)
+        .and_then(codex_model_candidate)
+        .or_else(|| {
+            config
+                .get("model")
+                .and_then(toml::Value::as_str)
+                .and_then(codex_model_candidate)
+        })
 }
 
 /// Extracts the model from VS Code Copilot's `models.json` debug log.
@@ -567,6 +683,60 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let result = extract_model(file.path(), StreamFormat::ClaudeJsonl, None).unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_model_prefers_latest_turn_context_and_ignores_prompt_content() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "{\"type\":\"session_meta\",\"payload\":{\"model\":\"old-model\",\"prompt\":\"SENTINEL_PRIVATE_PROMPT\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"actual-model\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model(file.path(), StreamFormat::CodexJsonl, None).unwrap(),
+            Some("actual-model".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_model_falls_back_to_selected_profile_and_keeps_absence_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".codex");
+        let session = home.join("sessions/2026/10/23/rollout-test.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, "{\"type\":\"session_meta\",\"payload\":{}}\n").unwrap();
+        assert_eq!(
+            extract_model(&session, StreamFormat::CodexJsonl, None).unwrap(),
+            None
+        );
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"root-model\"\nprofile = \"selected\"\n[profiles.selected]\nmodel = \"profile-model\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model(&session, StreamFormat::CodexJsonl, None).unwrap(),
+            Some("profile-model".to_string())
+        );
+        std::fs::remove_file(&session).unwrap();
+        assert_eq!(
+            extract_model(&session, StreamFormat::CodexJsonl, None).unwrap(),
+            Some("profile-model".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_model_skips_oversized_head_record_with_bounded_scan() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut content = format!("{{\"prompt\":\"{}\"}}\n", "x".repeat(70_000));
+        content.push_str("{\"type\":\"session_meta\",\"payload\":{\"model\":\"head-model\"}}\n");
+        content.push_str(&"{\"type\":\"other\"}\n".repeat(5000));
+        std::fs::write(file.path(), content).unwrap();
+        assert_eq!(
+            extract_model(file.path(), StreamFormat::CodexJsonl, None).unwrap(),
+            Some("head-model".to_string())
+        );
     }
 
     #[test]

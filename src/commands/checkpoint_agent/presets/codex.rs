@@ -10,7 +10,7 @@ use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
 use crate::mdm::utils::codex_home_dir;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct CodexPreset;
 
@@ -115,8 +115,24 @@ impl AgentPreset for CodexPreset {
         }
 
         let model = parse::optional_str(&data, "model")
-            .unwrap_or("unknown")
-            .to_string();
+            .filter(|model| {
+                !model.is_empty()
+                    && !model.eq_ignore_ascii_case("unknown")
+                    && !model.eq_ignore_ascii_case("auto")
+            })
+            .map(str::to_string)
+            .or_else(|| {
+                transcript_path.as_ref().and_then(|transcript| {
+                    crate::streams::model_extraction::extract_model(
+                        Path::new(transcript),
+                        crate::streams::sweep::StreamFormat::CodexJsonl,
+                        None,
+                    )
+                    .ok()
+                    .flatten()
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
 
         let context = PresetContext {
             agent_id: AgentId {
@@ -264,6 +280,42 @@ mod tests {
                 assert_eq!(e.command.as_deref(), Some("echo hello"));
             }
             _ => panic!("Expected PostBashCall"),
+        }
+    }
+
+    #[test]
+    fn test_codex_hook_model_uses_bounded_transcript_evidence_when_missing() {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"selected-model\"}}\n",
+        )
+        .unwrap();
+        for (hook_model, expected) in [
+            (None, "selected-model"),
+            (Some("unknown"), "selected-model"),
+            (Some("hook-model"), "hook-model"),
+        ] {
+            let mut input = json!({
+                "cwd": "/home/user/project",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "session_id": "codex-sess-1",
+                "tool_use_id": "tu-1",
+                "transcript_path": transcript.path()
+            });
+            if let Some(model) = hook_model {
+                input["model"] = json!(model);
+            }
+            let events = CodexPreset
+                .parse(&input.to_string(), "t_test123456789a")
+                .unwrap();
+            match &events[0] {
+                ParsedHookEvent::PostBashCall(event) => {
+                    assert_eq!(event.context.agent_id.model, expected);
+                }
+                _ => panic!("Expected PostBashCall"),
+            }
         }
     }
 
