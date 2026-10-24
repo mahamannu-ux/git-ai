@@ -15,6 +15,13 @@ That is a safe reset mechanism, but the synthetic L17 scenario seed and
 repeatability check have **not yet been established**. Thus L17 before values
 are unknown and all rows below remain unported.
 
+Baseline checks after the fork-main merge: `cargo fmt --check` passed;
+`cargo test --lib task17_security_tick_wires_all_six_actions_in_order_without_timer_or_server`
+passed 1/1; `task build` passed. These ran with the installed Homebrew Rust
+1.97.1 because `rustup`/the requested 1.93.0 toolchain are unavailable here.
+The merge also brought CI, Git 2.56 blame expectations, Task4 test, fleet and
+security fixes from fork main; Task17f still owns the combined final gates.
+
 ## Verdict requested from the Task20 lead before implementation
 
 Please give a take, narrow, or reject verdict for the following groups. In
