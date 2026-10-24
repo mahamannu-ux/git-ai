@@ -1,0 +1,19 @@
+tests/integration/range_authorship_unit.rs
+  s_6e0b40b97728cf::t_85fadc2fea7341 226-256,258,482,484
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "8097f5e4ff4eabcb68a4c38b3bb44fc5c34a0a91",
+  "prompts": {},
+  "sessions": {
+    "s_6e0b40b97728cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16f10-6086-7183-b8c2-4f3cf377f63b",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
