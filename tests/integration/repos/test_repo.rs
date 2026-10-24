@@ -491,6 +491,10 @@ impl DaemonProcess {
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
     command.env("HOME", test_home);
+    // `dirs::home_dir()` uses the Windows known-folder API and ignores the
+    // environment overrides below. Test-support commands use this explicit
+    // home so managed files never escape the per-repository fixture.
+    command.env("GIT_AI_TEST_HOME", test_home);
     if !command
         .get_envs()
         .any(|(key, _)| key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
@@ -3756,6 +3760,12 @@ mod tests {
             notes_db_path,
             Some(test_home.join(".git-ai").join("internal").join("notes-db"))
         );
+        let explicit_test_home = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_AI_TEST_HOME"))
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from);
+        assert_eq!(explicit_test_home, Some(test_home));
     }
 
     #[test]
