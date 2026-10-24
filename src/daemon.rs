@@ -2783,14 +2783,16 @@ fn read_checkpoint_body<R: BufRead>(
 ) -> Result<Vec<u8>, GitAiError> {
     let mut body = vec![0; body_bytes];
     reader.read_exact(&mut body).map_err(|error| {
-        GitAiError::Generic(format!(
-            "failed receiving {body_bytes}-byte checkpoint body: {error}"
+        GitAiError::IoError(io::Error::new(
+            error.kind(),
+            format!("failed receiving {body_bytes}-byte checkpoint body: {error}"),
         ))
     })?;
     let mut delimiter = [0u8; 1];
     reader.read_exact(&mut delimiter).map_err(|error| {
-        GitAiError::Generic(format!(
-            "failed receiving checkpoint body delimiter: {error}"
+        GitAiError::IoError(io::Error::new(
+            error.kind(),
+            format!("failed receiving checkpoint body delimiter: {error}"),
         ))
     })?;
     if delimiter != [b'\n'] {
@@ -3120,6 +3122,8 @@ pub struct ActorDaemonCoordinator {
     // trip proves accept → reader spawn → read → parse is still draining.
     next_trace_drain_probe_id: AtomicU64,
     observed_trace_drain_probe_id: AtomicU64,
+    trace_payloads_dropped_queue_full: AtomicU64,
+    trace_connections_dropped: AtomicU64,
     // Duplicated fds of accepted trace connections, so shutdown can actively
     // close them: a blocked git writer is released the instant its socket is
     // shut down instead of waiting for process exit.
@@ -3240,6 +3244,8 @@ impl ActorDaemonCoordinator {
             trace_ingress_state: Mutex::new(TraceIngressState::default()),
             next_trace_drain_probe_id: AtomicU64::new(0),
             observed_trace_drain_probe_id: AtomicU64::new(0),
+            trace_payloads_dropped_queue_full: AtomicU64::new(0),
+            trace_connections_dropped: AtomicU64::new(0),
             #[cfg(not(windows))]
             trace_connection_registry: Mutex::new(HashMap::new()),
             #[cfg(not(windows))]
@@ -5150,11 +5156,15 @@ impl ActorDaemonCoordinator {
                 ));
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.trace_payloads_dropped_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     component = "daemon",
                     phase = "enqueue_trace_payload",
                     reason = "ingest_worker_queue_full",
-                    "trace ingest queue is full"
+                    queue_capacity = Self::trace_ingest_queue_capacity(),
+                    queued_payloads = self.queued_trace_payloads.load(Ordering::Relaxed),
+                    "trace ingest queue is full; payload lost and daemon shutting down"
                 );
                 self.request_shutdown();
                 return Err(GitAiError::Generic(
@@ -8191,13 +8201,7 @@ fn control_listener_loop_actor(
             if std::thread::Builder::new()
                 .spawn(move || {
                     if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
-                        tracing::error!(
-                            component = "daemon",
-                            phase = "control_receive",
-                            reason = "connection_error",
-                            error = %e,
-                            "daemon control connection failed"
-                        );
+                        log_control_connection_failure(&e);
                     }
                 })
                 .is_err()
@@ -8363,11 +8367,40 @@ fn handle_windows_control_pipe_connection(
     let mut reader = BufReader::new(&mut server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
+        log_control_connection_failure(&e);
+    }
+}
+
+fn connection_error_is_peer_disconnect(error: &GitAiError) -> bool {
+    matches!(
+        error,
+        GitAiError::IoError(io_error)
+            if matches!(
+                io_error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+            ) || (cfg!(target_os = "macos") && io_error.kind() == io::ErrorKind::InvalidInput)
+    )
+}
+
+fn log_control_connection_failure(error: &GitAiError) {
+    if connection_error_is_peer_disconnect(error) {
+        tracing::warn!(
+            component = "daemon",
+            phase = "control_receive",
+            reason = "peer_gone",
+            "daemon control connection dropped by peer"
+        );
+    } else {
         tracing::error!(
             component = "daemon",
             phase = "control_receive",
             reason = "connection_error",
-            error = %e,
+            error = %error,
             "daemon control connection failed"
         );
     }
@@ -8381,11 +8414,7 @@ fn handle_control_connection_actor(
 ) -> Result<(), GitAiError> {
     stream
         .set_recv_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))
-        .map_err(|error| {
-            GitAiError::Generic(format!(
-                "failed setting daemon control receive timeout: {error}"
-            ))
-        })?;
+        .map_err(GitAiError::IoError)?;
     let mut reader = BufReader::new(stream);
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
@@ -8486,14 +8515,24 @@ fn handle_control_connection_actor_reader<R: Read + Write>(
                 let body = match read_checkpoint_body(reader, reservation.body_bytes()) {
                     Ok(body) => body,
                     Err(error) => {
-                        tracing::error!(
-                            component = "daemon",
-                            phase = "checkpoint_receive",
-                            reason = "body_receive_failed",
-                            body_bytes,
-                            %error,
-                            "failed receiving checkpoint body"
-                        );
+                        if connection_error_is_peer_disconnect(&error) {
+                            tracing::warn!(
+                                component = "daemon",
+                                phase = "checkpoint_receive",
+                                reason = "peer_gone",
+                                body_bytes,
+                                "checkpoint sender disconnected during body receive"
+                            );
+                        } else {
+                            tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_receive",
+                                reason = "body_receive_failed",
+                                body_bytes,
+                                %error,
+                                "failed receiving checkpoint body"
+                            );
+                        }
                         return Err(error);
                     }
                 };
@@ -8674,6 +8713,9 @@ fn trace_listener_loop_actor(
             match spawn_trace_connection_reader(stream, coordinator.clone()) {
                 Ok(()) => consecutive_spawn_failures = 0,
                 Err(_error) => {
+                    coordinator
+                        .trace_connections_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::error!("trace listener: failed to spawn reader");
                     consecutive_spawn_failures += 1;
                     if consecutive_spawn_failures >= TRACE_SPAWN_FAILURE_SHUTDOWN_THRESHOLD {
@@ -8764,6 +8806,9 @@ fn windows_trace_pipe_worker_loop(
                 handle_windows_trace_pipe_connection(server, coord);
             })
             .map_err(|e| {
+                coordinator
+                    .trace_connections_dropped
+                    .fetch_add(1, Ordering::Relaxed);
                 GitAiError::Generic(format!(
                     "failed spawning trace pipe handler for {}: {}",
                     trace_socket_path.display(),
@@ -10856,7 +10901,8 @@ mod tests {
         );
 
         let mut truncated = std::io::BufReader::new(std::io::Cursor::new(b"bod".to_vec()));
-        assert!(read_checkpoint_body(&mut truncated, 4).is_err());
+        let error = read_checkpoint_body(&mut truncated, 4).expect_err("truncated body");
+        assert!(connection_error_is_peer_disconnect(&error));
 
         let mut missing_delimiter =
             std::io::BufReader::new(std::io::Cursor::new(b"body!".to_vec()));
@@ -12116,6 +12162,59 @@ mod tests {
         assert_eq!(released.trace_roots_open_mutating, 0);
         assert_eq!(released.sequencer_fenced_families, 0);
         assert!(!released.families[0].fenced);
+    }
+
+    #[test]
+    fn control_peer_disconnects_are_distinct_from_systemic_errors() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert!(connection_error_is_peer_disconnect(&GitAiError::IoError(
+                io::Error::from(kind)
+            )));
+        }
+        assert!(!connection_error_is_peer_disconnect(&GitAiError::IoError(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )));
+    }
+
+    #[tokio::test]
+    async fn local_health_reports_trace_ingest_losses_without_upload_event() {
+        use crate::daemon::health::DaemonHealthSnapshot;
+
+        let coord = ActorDaemonCoordinator::new();
+        coord
+            .trace_payloads_dropped_queue_full
+            .store(2, Ordering::Relaxed);
+        coord.trace_connections_dropped.store(1, Ordering::Relaxed);
+        let status = serde_json::to_value(DaemonHealthSnapshot::capture(&coord)).unwrap();
+        assert_eq!(status["trace_payloads_dropped_queue_full"], 2);
+        assert_eq!(status["trace_connections_dropped"], 1);
+    }
+
+    #[tokio::test]
+    async fn full_trace_ingest_queue_counts_the_lost_payload() {
+        let coord = ActorDaemonCoordinator::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        coord.trace_ingest_tx.set(sender).unwrap();
+        coord
+            .enqueue_trace_payload(json!({"event": "start", "sid": "test-root-1"}))
+            .unwrap();
+
+        let result = coord.enqueue_trace_payload(json!({"event": "start", "sid": "test-root-2"}));
+        assert!(result.is_err());
+        assert_eq!(
+            coord
+                .trace_payloads_dropped_queue_full
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(coord.is_shutting_down());
     }
 
     #[tokio::test]

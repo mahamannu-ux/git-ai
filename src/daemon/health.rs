@@ -76,6 +76,9 @@ pub(crate) struct DaemonHealthSnapshot {
     pub checkpoint_receipt_seq_next: u64,
     pub checkpoint_receipt_seq_processed: u64,
     pub trace_payloads_queued: usize,
+    /// Local-only loss counters; never copied into a metric or heartbeat.
+    pub trace_payloads_dropped_queue_full: u64,
+    pub trace_connections_dropped: u64,
     pub trace_ingest_seq_lag: u64,
     pub trace_roots_open_mutating: usize,
     /// Roots whose final frame the reader has read but the worker has not yet
@@ -325,6 +328,12 @@ impl DaemonHealthSnapshot {
                 .processed_checkpoint_receipt_seq
                 .load(Ordering::Acquire) as u64,
             trace_payloads_queued: coordinator.queued_trace_payloads.load(Ordering::Acquire),
+            trace_payloads_dropped_queue_full: coordinator
+                .trace_payloads_dropped_queue_full
+                .load(Ordering::Relaxed),
+            trace_connections_dropped: coordinator
+                .trace_connections_dropped
+                .load(Ordering::Relaxed),
             trace_ingest_seq_lag: coordinator
                 .next_trace_ingest_seq
                 .load(Ordering::Acquire)
