@@ -1,0 +1,53 @@
+.github/workflows/coverage.yml
+  s_6e0b40b97728cf::t_be54db54748aad 34-38
+.github/workflows/e2e-tests.yml
+  s_6e0b40b97728cf::t_94e09aec4e72ac 47,50
+.github/workflows/git-core-compat.yml
+  s_6e0b40b97728cf::t_36c30d724efc7a 53-57
+.github/workflows/github-integration-tests.yml
+  s_6e0b40b97728cf::t_46ba248836a3e3 31-35
+.github/workflows/install-scripts-local.yml
+  s_6e0b40b97728cf::t_2bf33561a366d4 68-73
+.github/workflows/lint-format.yml
+  s_6e0b40b97728cf::t_35f5213e7ddb89 66-71,98-102
+.github/workflows/nightly-agent-integration.yml
+  s_6e0b40b97728cf::t_ddcef1be7e7b8a 161-165,272-276
+.github/workflows/performance-benchmarks.yml
+  s_6e0b40b97728cf::t_2dd053a0f2f6a4 40-44,101-105
+.github/workflows/release.yml
+  s_6e0b40b97728cf::t_0b66bca1601d2c 103
+.github/workflows/test.yml
+  s_6e0b40b97728cf::t_f57977c766dcd8 132,134-136,497-501
+src/commands/fleet.rs
+  s_6e0b40b97728cf::t_6a0acb94566314 152-159
+src/fleet/cleanup.rs
+  s_6e0b40b97728cf::t_d28f0f2bc91362 266,441
+src/security/policy_apply.rs
+  s_6e0b40b97728cf::t_add4068d277c39 163
+src/security/tail.rs
+  s_6e0b40b97728cf::t_7b654921bf452d 324-328,330-331,352-366,426-428
+src/trust/documents.rs
+  s_6e0b40b97728cf::t_e3c93726a23a6f 149
+tests/integration/blame_flags.rs
+  s_6e0b40b97728cf::t_e2c69f8df8836c 106-129,722-725
+tests/integration/repos/test_repo.rs
+  s_6e0b40b97728cf::t_f654d8108760a9 494-497,3763-3768
+tests/integration/worktrees.rs
+  s_6e0b40b97728cf::t_86cbf429cc2087 85,92-100,102-106,114-130,212-213,225-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "ac6dbe022ba8da6ada05b3af2916346e3d992f51",
+  "prompts": {},
+  "sessions": {
+    "s_6e0b40b97728cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16f10-6086-7183-b8c2-4f3cf377f63b",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
