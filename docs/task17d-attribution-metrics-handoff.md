@@ -104,32 +104,31 @@ counter, root, session or path is uploaded. No new metric/security event kind,
 retention rule or privacy field was added. The A2 mismatch warning contains
 only added/AI/human counts, no file path, repository, session or content.
 
-## Remaining gates and review request
+## Review closure and remaining gates
 
-The founder relayed a **fix first** review on 2026-10-25 for
-one A2 overlap defect and confirmed the shared-worker diff and all other
-reviewed areas. The overlap fix above is committed; its focused tests and
-build passed. **FOUNDER REVIEW:** request read-only re-review of the new
-`HEAD` before **ready to push**. The local
-`codex review --base ac6dbe022` attempt failed in the sandbox because its
-runtime could not write its state database. The escalated attempt was rejected
-by automatic approval review: it may transmit the private diff and handoff to
-an external backend without specific authorization for that destination. No
-indirect review attempt was made. Relay the request below to the standing
-TrackAI-Orchestrator Claude chat, as `AGENTS.md` §12.6 directs.
-The founder can paste this request to the reviewer:
+The founder relayed a **fix first** review on 2026-10-25 for one A2 overlap
+defect. Commit `a100bfcba` excludes blame-confirmed AI lines from attested
+human candidates, adds the conflicting-source fixture (`ai=1, human=0,
+unknown=1`), and warns with counts only before an overcount could be hidden by
+saturation. Its focused tests and build passed.
 
-> Re-review Task17d on `task/Task17-upstream-sync-gitai` at its final `HEAD` in
-> `/Users/manishmahajan/AIProjects/TrackAI-wt/Task17-upstream-sync-gitai`,
-> against fork-main integration base `ac6dbe022`. Read the Task17d prompt,
-> verdict and the exact `src/daemon/telemetry_worker.rs` diff above. The
-> previous review found one A2 overlap defect: blame-confirmed AI and `h_`
-> could count the same line. Inspect the committed exclusion, conflicting-
-> source fixture, and counts-only warning, then return numbered fixes or
-> `ready to push`; do not edit the branch.
+The founder then relayed the read-only re-review verdict **ready to push**, with
+no further fixes. The reviewer checked the sorted, deduplicated AI line lists,
+the disjoint count, the fixture, the counts-only warning in local
+`git-ai stats`, and that the follow-up touched only `diff_ai_accepted.rs`,
+`range_authorship.rs`, and this handoff. The first review also confirmed the
+one-line shared-worker change and unchanged security tick.
 
-**FOUNDER TASK19:** tell answer owners that observed local `stats <range>` human/unknown counts
-can move. **FOUNDER TASK17f:** run full Cargo/combined suites, real Endpoint
-shipper/server gates,
-E20/Intel timing, real long hook, separate-account live agent routes, and the
-one combined GitAI PR. Do not push or open that PR from this session.
+The local `codex review --base ac6dbe022` attempt failed in the sandbox
+because its runtime could not write its state database. Automatic approval
+review rejected an escalated attempt because it could transmit the private
+diff and handoff to an external backend without specific authorization for
+that destination. No indirect attempt was made; the founder-relayed reviews
+above supplied the review gate.
+
+**FOUNDER TASK19:** tell answer owners that observed local `stats <range>`
+human/unknown counts can move. **FOUNDER TASK17f:** run full Cargo and combined
+suites, real Endpoint shipper/server gates, E20/Intel timing, real long hook,
+and separate-account live agent routes before the one combined GitAI PR.
+Founder push follows Task17 lead closure. Do not push or open that PR from this
+session.
