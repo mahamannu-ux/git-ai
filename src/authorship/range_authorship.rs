@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
+use crate::authorship::diff_ai_accepted::{DiffAiAcceptedStats, diff_ai_accepted_stats};
 use crate::authorship::ignore::{
     IgnoreMatcher, build_ignore_matcher, should_ignore_file_with_matcher,
 };
@@ -426,23 +426,50 @@ fn calculate_range_stats_direct(
     let authorship_log =
         create_authorship_log_for_range(repo, &start_sha, &end_sha, commit_shas, ignore_patterns)?;
 
-    let (_, known_human_accepted, _) = accepted_lines_from_attestations(
-        Some(&authorship_log),
-        &diff_ai_stats.added_lines_by_file,
-        false,
-    );
-
     // Step 3: Calculate stats from the authorship log
-    let stats = stats_from_authorship_log(
-        Some(&authorship_log),
+    Ok(range_stats_from_sources(
+        &authorship_log,
+        git_diff_added_lines,
+        git_diff_deleted_lines,
+        &diff_ai_stats,
+    ))
+}
+
+fn range_stats_from_sources(
+    authorship_log: &crate::authorship::authorship_log_serialization::AuthorshipLog,
+    git_diff_added_lines: u32,
+    git_diff_deleted_lines: u32,
+    diff_ai_stats: &DiffAiAcceptedStats,
+) -> CommitStats {
+    let mut human_candidate_lines = diff_ai_stats.added_lines_by_file.clone();
+    for (file, ai_lines) in &diff_ai_stats.ai_lines_by_file {
+        if let Some(lines) = human_candidate_lines.get_mut(file) {
+            // Blame-confirmed AI wins a disagreement with the range's h_ entry.
+            lines.retain(|line| ai_lines.binary_search(line).is_err());
+        }
+    }
+    let (_, known_human_accepted, _) =
+        accepted_lines_from_attestations(Some(authorship_log), &human_candidate_lines, false);
+
+    if u64::from(diff_ai_stats.total_ai_accepted) + u64::from(known_human_accepted)
+        > u64::from(git_diff_added_lines)
+    {
+        tracing::warn!(
+            added_lines = git_diff_added_lines,
+            ai_lines = diff_ai_stats.total_ai_accepted,
+            human_lines = known_human_accepted,
+            "range stats source counts exceed added lines"
+        );
+    }
+
+    stats_from_authorship_log(
+        Some(authorship_log),
         git_diff_added_lines,
         git_diff_deleted_lines,
         diff_ai_stats.total_ai_accepted,
         known_human_accepted,
         &diff_ai_stats.per_tool_model,
-    );
-
-    Ok(stats)
+    )
 }
 
 pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
@@ -509,5 +536,40 @@ mod numstat_tests {
             parse_numstat_stats("3\t1\t\"cafe\\314\\201.txt\"\n2\t0\tother.txt\n", &ignore),
             (2, 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod range_count_tests {
+    use super::*;
+    use crate::authorship::authorship_log::LineRange;
+    use crate::authorship::authorship_log_serialization::{
+        AttestationEntry, AuthorshipLog, FileAttestation,
+    };
+    use crate::authorship::diff_ai_accepted::DiffAiAcceptedStats;
+
+    #[test]
+    fn blame_ai_line_cannot_also_count_as_attested_human() {
+        let log = AuthorshipLog {
+            attestations: vec![FileAttestation {
+                file_path: "file.txt".to_string(),
+                entries: vec![AttestationEntry::new(
+                    "h_conflicting".to_string(),
+                    vec![LineRange::Single(1)],
+                )],
+            }],
+            metadata: Default::default(),
+        };
+        let mut diff = DiffAiAcceptedStats::default();
+        diff.total_ai_accepted = 1;
+        diff.added_lines_by_file
+            .insert("file.txt".to_string(), vec![1, 2]);
+        diff.ai_lines_by_file
+            .insert("file.txt".to_string(), vec![1]);
+
+        let stats = range_stats_from_sources(&log, 2, 0, &diff);
+        assert_eq!(stats.ai_additions, 1);
+        assert_eq!(stats.human_additions, 0);
+        assert_eq!(stats.unknown_additions, 1);
     }
 }
