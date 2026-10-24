@@ -4245,4 +4245,25 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[test]
+    fn agent_usage_throttle_survives_database_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("metrics.db");
+        let mut db = MetricsDatabase::open_at_path(&path).unwrap();
+        assert!(db.should_emit_agent_usage("session", 1_000, 150).unwrap());
+        drop(db);
+
+        let mut restarted = MetricsDatabase::open_at_path(&path).unwrap();
+        assert!(
+            !restarted
+                .should_emit_agent_usage("session", 1_100, 150)
+                .unwrap()
+        );
+        assert!(
+            restarted
+                .should_emit_agent_usage("session", 1_150, 150)
+                .unwrap()
+        );
+    }
 }
