@@ -423,7 +423,9 @@ mod tests {
             TailEntryKind::Record(b"n".to_vec())
         );
 
-        std::fs::remove_file(&path).unwrap();
+        // Keep the original inode allocated so Linux cannot immediately reuse
+        // it for the replacement and make this identity test nondeterministic.
+        std::fs::rename(&path, temp.path().join("retired.ndjson")).unwrap();
         write(&path, b"replacement\n");
         let replaced = read_available(&path, &saved, 500).unwrap();
         assert!(replaced.reset);
