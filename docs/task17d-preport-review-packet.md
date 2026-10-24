@@ -1,5 +1,10 @@
 # Task17d pre-port Task20 review packet — 2026-10-24
 
+> Historical pre-port packet. The founder supplied the Task20 lead's narrow
+> verdict on 2026-10-25. Implementation and remaining gates are recorded in
+> `docs/task17d-attribution-metrics-handoff.md`; the request below is not the
+> current decision state.
+
 **State:** decision request only. No Task17d source row has been ported. The
 existing integration branch contains Task17b/c through `62e1e6a03` and a
 fork-main merge at `ac6dbe022` (fork main `83f367366`). The merge resolved
