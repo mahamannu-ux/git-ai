@@ -223,10 +223,40 @@ fn test_range_authorship_mixed_commits() {
     // Range authorship merges attributions from start to end, filtering to commits in range
     // The exact AI/human split depends on the merge attribution logic
     assert_eq!(stats.range_stats.ai_additions, 2);
-    // range_authorship passes known_human_accepted=0, so human lines appear as unknown_additions
-    assert_eq!(stats.range_stats.human_additions, 0);
-    assert_eq!(stats.range_stats.unknown_additions, 1);
+    // The one observed human addition must not be counted as unknown.
+    assert_eq!(stats.range_stats.human_additions, 1);
+    assert_eq!(stats.range_stats.unknown_additions, 0);
     assert_eq!(stats.range_stats.git_diff_added_lines, 3);
+}
+
+#[test]
+fn test_range_authorship_keeps_unobserved_addition_unknown() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("test.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    let first_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    std::fs::write(repo.path().join("test.txt"), "base\nunknown\n").unwrap();
+    repo.stage_all_and_commit("unobserved edit").unwrap();
+    let head_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let gitai_repo = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
+    let range =
+        CommitRange::new_infer_refname(&gitai_repo, first_sha, head_sha, Some("HEAD".to_string()))
+            .unwrap();
+    let stats = range_authorship(range, false, &[], None).unwrap();
+    assert_eq!(stats.range_stats.git_diff_added_lines, 1);
+    assert_eq!(stats.range_stats.human_additions, 0);
+    assert_eq!(stats.range_stats.ai_additions, 0);
+    assert_eq!(stats.range_stats.unknown_additions, 1);
 }
 
 #[test]
@@ -449,10 +479,9 @@ fn test_range_authorship_mixed_lockfile_and_source() {
     assert_eq!(stats.range_stats.git_diff_added_lines, 3); // Only lib.rs, package-lock.json excluded
     // Verify the total is much less than 3003 (if lockfile was included)
     assert!(stats.range_stats.git_diff_added_lines < 100);
-    // Verify that some AI work is detected and unattested lines exist
+    // Verify observed AI and human lines after excluding the lockfile.
     assert!(stats.range_stats.ai_additions > 0);
-    // range_authorship passes known_human_accepted=0, so human lines show as unknown_additions
-    assert!(stats.range_stats.unknown_additions > 0);
+    assert!(stats.range_stats.human_additions > 0);
 }
 
 #[test]
