@@ -2717,7 +2717,7 @@ fn exec_git_allow_nonzero_with_profile_and_env(
     spawn_probe_log(&effective_args);
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args);
-    apply_internal_git_env(&mut cmd);
+    apply_internal_git_machine_env(&mut cmd);
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -2746,7 +2746,7 @@ pub fn spawn_git_stdout(args: &[String]) -> Result<Child, GitAiError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
-    apply_internal_git_env(&mut cmd);
+    apply_internal_git_machine_env(&mut cmd);
 
     #[cfg(windows)]
     {
@@ -2811,6 +2811,12 @@ pub(crate) fn apply_internal_git_env(cmd: &mut Command) {
     }
 }
 
+/// Normalize output consumed by git-ai while passthrough Git keeps the user's locale.
+pub(crate) fn apply_internal_git_machine_env(cmd: &mut Command) {
+    apply_internal_git_env(cmd);
+    cmd.env("LC_ALL", "C");
+}
+
 /// Helper to execute a git command with an explicit internal profile.
 pub fn exec_git_with_profile(
     args: &[String],
@@ -2852,7 +2858,7 @@ fn spawn_git_piped(effective_args: &[String]) -> Result<Child, GitAiError> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    apply_internal_git_env(&mut cmd);
+    apply_internal_git_machine_env(&mut cmd);
 
     #[cfg(windows)]
     {
@@ -3338,6 +3344,20 @@ mod tests {
                 Some(Some((*value).to_string()))
             );
         }
+    }
+
+    #[test]
+    fn machine_git_forces_c_locale_but_passthrough_does_not() {
+        let mut machine = Command::new("git");
+        apply_internal_git_machine_env(&mut machine);
+        assert_eq!(
+            explicit_command_env(&machine, "LC_ALL"),
+            Some(Some("C".to_string()))
+        );
+
+        let mut passthrough = Command::new("git");
+        apply_internal_git_env(&mut passthrough);
+        assert_eq!(explicit_command_env(&passthrough, "LC_ALL"), None);
     }
 
     #[test]

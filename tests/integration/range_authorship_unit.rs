@@ -260,6 +260,36 @@ fn test_range_authorship_keeps_unobserved_addition_unknown() {
 }
 
 #[test]
+fn test_range_authorship_ignores_c_quoted_non_ascii_path() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("café.txt"), "ignored\n").unwrap();
+    std::fs::write(repo.path().join("app.txt"), "kept\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    let first_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    std::fs::write(repo.path().join("café.txt"), "ignored\nignored addition\n").unwrap();
+    std::fs::write(repo.path().join("app.txt"), "kept\nkept addition\n").unwrap();
+    repo.stage_all_and_commit("add lines").unwrap();
+    let head_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let gitai_repo = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
+    let range =
+        CommitRange::new_infer_refname(&gitai_repo, first_sha, head_sha, Some("HEAD".to_string()))
+            .unwrap();
+    let stats = range_authorship(range, false, &["café.txt".to_string()], None).unwrap();
+    assert_eq!(stats.range_stats.git_diff_added_lines, 1);
+    assert_eq!(stats.range_stats.git_diff_deleted_lines, 0);
+}
+
+#[test]
 fn test_range_authorship_no_changes() {
     let repo = TestRepo::new();
 
