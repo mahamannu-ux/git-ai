@@ -6,11 +6,14 @@ fork-main merge at `ac6dbe022` (fork main `83f367366`). The merge resolved
 only `src/daemon.rs` imports; it added no telemetry or attribution behavior.
 
 Task14a's live migrations 0010–0028, three post-step dry runs, API smoke and
-Company A/B audit isolation are recorded in its handoff. Its disposable
-recovery projects contain copied accounts and rows. The repeatable,
-synthetic-only Lifecycle Lab baseline and reset/restore path have **not yet
-been identified**. Thus L17 before values are unknown and all rows below
-remain unported. Task14a has been asked to identify the approved Lab setup.
+Company A/B audit isolation are recorded in its handoff. Task14a checked its
+standing local recovery databases on 55433–55435: they contain copied tenants
+or accounts and are unsuitable for the synthetic Lab. It verified the TrackAI
+`scripts/it-db.sh` wrapper with PostgreSQL 17: a new random-port database
+reached 29 Drizzle ledger entries and zero tenants, then was removed on exit.
+That is a safe reset mechanism, but the synthetic L17 scenario seed and
+repeatability check have **not yet been established**. Thus L17 before values
+are unknown and all rows below remain unported.
 
 ## Verdict requested from the Task20 lead before implementation
 
