@@ -2,8 +2,8 @@
 
 **Branch:** `task/Task17-upstream-sync-gitai`, fork `mahamannu-ux/git-ai`.
 **Start:** Task17b/c through `62e1e6a03`; fork `origin/main` `83f367366`
-merged locally at `ac6dbe022`. **Code end:** `7e3f2d0d7`; review through
-the final handoff commit at branch `HEAD`.
+merged locally at `ac6dbe022`. Initial code end `7e3f2d0d7`; review fix
+`a100bfcba`. Review through branch `HEAD`.
 All source commits below are Git AI Apache-2.0. No push, PR, upstream-main
 merge, package install, TrackAI schema change or Task17f run occurred.
 Reuse search: none; these are narrow GitAI upstream adaptations, not agent-kit
@@ -21,7 +21,7 @@ small overrun.
 | L17-M1 `d0f864c570` | **Reject for Task17.** The upstream 10,000-entry in-memory limiter can re-emit inside 150 seconds after capacity eviction or a poisoned lock, as well as after restart. This exceeds Task20's condition of at most one extra event per restart and changes usage counts. The fork's SQLite throttle survives reopen (`agent_usage_throttle_survives_database_reopen`). No Task2-owner approval is needed to reject it. A future performance proposal would need a durable, meaning-preserving design and its own owner decision. | Test guard `7e3f2d0d7`; no limiter port |
 | L17-M2 `6210ebff3b`, `0a1afdd26c`, `98c27b210d`, `2be4851036`, `e11298f8d0`, `0389b48c53`, `65e22252ab`, `28cc324c2f`, `898567e747`, `879a39233e` | **Reject for Task17**, per Task20. High conflict with Task4 delivery/dedup and no named fork failure. If a real reingest defect appears, the Task17 lead should open a separately named proposal with pending/delivered replay scenarios; this is not a deferral to finished Task4. | None |
 | L17-A1 `1e400d552a` | **Reject.** Relabels unobserved gaps as human; unknown must remain unknown. | None |
-| L17-A2 `4dc3b1ccf1` | **Adapt.** The before fixture reported an observed human addition as `human=0, unknown=1`; the same synthetic GitAI fixture after the fix reports `human=1, unknown=0`, with AI additions and total diff unchanged. A separate unobserved addition remains `unknown=1`. This is a local range-stat correction using existing `h_` attestations; no note, event, lifecycle definition or evidence pointer is rewritten. | `8097f5e4f` |
+| L17-A2 `4dc3b1ccf1` | **Adapt, then review fix.** The before fixture reported an observed human addition as `human=0, unknown=1`; after the fix it reports `human=1, unknown=0`, with AI additions and total diff unchanged. A separate unobserved addition remains `unknown=1`. The review fix excludes blame-confirmed AI lines from `h_` counting and warns with counts only if totals exceed added lines. No note, event, lifecycle definition or evidence pointer is rewritten. | `8097f5e4f`, `a100bfcba` |
 | L17-A3 `120bcf25cf` | **Reject current upstream patch.** `recover_adjacent_edges` derives `source_session` from `recovery.source_author`, selected from an adjacent line; the synthetic edge has no checkpoint carrying its own exact session ID. Copying that neighbor's tool/model/session would violate Task20's exact-join condition. The upstream fixture itself labels its unknown gap as AI. A future exact-join implementation requires an edge checkpoint with the recorded session ID and an adjacent-unknown guard. | None |
 | `3e2746c8f7` + `069981d3dc` | **Adapt.** Local `usage --period`; five integration cases passed. Excluded upstream pricing-cache refresh, which belongs to Task13. No upload change. | `6bc803221` |
 | `6f7ee5cabe` | **Adapt.** `core.abbrev=no` is supplied to parsed `range-diff`; existing synthetic pull/rebase note and AI-line fixtures passed before and after (2/2 each). | `1b94af533` |
@@ -66,9 +66,12 @@ the Task19 answer owners should receive that note through the founder.
 - Local diagnostics: peer classification, local status counters, full trace
   queue loss and checkpoint-body EOF tests passed. Heartbeat upload-shape
   fixture and six-action two-second security tick passed.
-- A2: 29 range-authorship fixtures passed. The corrected assertion failed
-  before the source change and passed after. Unobserved addition remains
-  unknown. Nine `diff_ai_accepted` unit tests passed.
+- A2: 30 range-authorship fixtures passed after review fix. The original
+  corrected assertion failed before the source change and passed after.
+  Unobserved addition remains unknown. A synthetic conflicting-source unit
+  fixture passed: AI by blame plus `h_` by attestation on one added line
+  yields `ai=1, human=0, unknown=1` for two added lines. Nine
+  `diff_ai_accepted` unit tests passed.
 - Wave 4: non-ASCII range ignore under `fr_FR.UTF-8` passed; two rebase
   note/AI-line fixtures passed before and after `core.abbrev=no`, then passed
   under `fr_FR.UTF-8` after C-locale adaptation. C-quoted/decomposed path and
@@ -98,31 +101,34 @@ the Task20 lead. `bg status` stopped-shape top-level `"daemon_running": false`
 was not changed. The only new uploadable daemon log fields are queue capacity
 and queued payload count on an error line when a trace payload is lost; no
 counter, root, session or path is uploaded. No new metric/security event kind,
-retention rule or privacy field was added.
+retention rule or privacy field was added. The A2 mismatch warning contains
+only added/AI/human counts, no file path, repository, session or content.
 
 ## Remaining gates and review request
 
-An independent read-only review of `ac6dbe022..HEAD` and Task20's
-shared-code verdict is still required before **ready to push**. The local
+The founder relayed a **fix first** review on 2026-10-25 for
+one A2 overlap defect and confirmed the shared-worker diff and all other
+reviewed areas. The overlap fix above is committed; its focused tests and
+build passed. **FOUNDER REVIEW:** request read-only re-review of the new
+`HEAD` before **ready to push**. The local
 `codex review --base ac6dbe022` attempt failed in the sandbox because its
 runtime could not write its state database. The escalated attempt was rejected
 by automatic approval review: it may transmit the private diff and handoff to
 an external backend without specific authorization for that destination. No
-indirect review attempt was made. **FOUNDER REVIEW:** relay the request below
-to the standing TrackAI-Orchestrator Claude chat, as `AGENTS.md` §12.6 directs.
+indirect review attempt was made. Relay the request below to the standing
+TrackAI-Orchestrator Claude chat, as `AGENTS.md` §12.6 directs.
 The founder can paste this request to the reviewer:
 
-> Review Task17d on `task/Task17-upstream-sync-gitai` at its final `HEAD` in
+> Re-review Task17d on `task/Task17-upstream-sync-gitai` at its final `HEAD` in
 > `/Users/manishmahajan/AIProjects/TrackAI-wt/Task17-upstream-sync-gitai`,
 > against fork-main integration base `ac6dbe022`. Read the Task17d prompt,
-> `docs/task17d-attribution-metrics-handoff.md`, Task20's 2026-10-25 narrow
-> verdict and the exact `src/daemon/telemetry_worker.rs` diff above. Check
-> no-loss metric delivery, local-only counters/upload shape, unknown-preserving
-> range stats, rebase notes and source attribution. Return numbered fixes or
+> verdict and the exact `src/daemon/telemetry_worker.rs` diff above. The
+> previous review found one A2 overlap defect: blame-confirmed AI and `h_`
+> could count the same line. Inspect the committed exclusion, conflicting-
+> source fixture, and counts-only warning, then return numbered fixes or
 > `ready to push`; do not edit the branch.
 
-**FOUNDER TASK20:** confirm the one-line shared-worker diff above and tell
-Task19 answer owners that observed local `stats <range>` human/unknown counts
+**FOUNDER TASK19:** tell answer owners that observed local `stats <range>` human/unknown counts
 can move. **FOUNDER TASK17f:** run full Cargo/combined suites, real Endpoint
 shipper/server gates,
 E20/Intel timing, real long hook, separate-account live agent routes, and the
