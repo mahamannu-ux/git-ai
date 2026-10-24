@@ -1055,6 +1055,8 @@ fn run_range_diff(
 ) -> Result<String, GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.extend([
+        "-c".to_string(),
+        "core.abbrev=no".to_string(),
         "range-diff".to_string(),
         "--no-color".to_string(),
         "--no-abbrev".to_string(),
