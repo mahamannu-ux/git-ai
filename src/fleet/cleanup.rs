@@ -263,7 +263,7 @@ impl CommandRunner for SystemRunner {
     }
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn current_uid(runner: &dyn CommandRunner) -> String {
     runner
         .run("id", &["-u"])
@@ -438,7 +438,7 @@ mod tests {
             .collect();
         let policy = serde_json::json!({"version": 1, "repositories": repositories});
         std::fs::write(policy_path(&home), serde_json::to_vec(&policy).unwrap()).unwrap();
-        std::fs::write(state_path(&home), b"{}".to_vec()).unwrap();
+        std::fs::write(state_path(&home), b"{}").unwrap();
         (temp, home)
     }
 

@@ -292,8 +292,8 @@ fn codex_commit_is_durably_bound_before_daemon_restart_when_delivery_is_offline(
     );
 
     let row = || {
-        let connection =
-            rusqlite::Connection::open(&metrics_db_path).expect("metrics database should reopen");
+        let connection = git_ai::sqlite::open_with_memory_limits(&metrics_db_path)
+            .expect("metrics database should reopen");
         connection
             .query_row(
                 "SELECT id, delivery_tenant_id, delivery_repository_url, delivery_api_base_url, \
