@@ -24,6 +24,7 @@ const SCHEMA_VERSION: usize = 9;
 const MAX_METRIC_UPLOAD_ATTEMPTS: u32 = 6;
 const METRIC_PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
 pub(crate) const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
+const EVENT_METADATA_BACKFILL_COMPLETED_KEY: &str = "event_metadata_backfill_completed";
 const NS_PER_SECOND: u128 = 1_000_000_000;
 
 const RETRYABLE_METRIC_IDS_SQL: &str = "SELECT id FROM metrics \
@@ -1915,6 +1916,39 @@ impl MetricsDatabase {
             .map(|(summary, _)| summary)
     }
 
+    pub(crate) fn event_metadata_backfill_completed(&self) -> Result<bool, GitAiError> {
+        let completed: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = ?1",
+                params![EVENT_METADATA_BACKFILL_COMPLETED_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(completed.as_deref() == Some("1"))
+    }
+
+    /// Scan one bounded legacy batch and persist completion only after the end
+    /// has been reached. An interrupted run can restart safely at row zero.
+    pub(crate) fn backfill_event_metadata_batch_once(
+        &mut self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<(MetricMetadataBackfillSummary, Option<i64>), GitAiError> {
+        if limit == 0 || self.event_metadata_backfill_completed()? {
+            return Ok((MetricMetadataBackfillSummary::default(), None));
+        }
+
+        let result = self.backfill_event_metadata_batch_after(after_id, limit)?;
+        if result.0.scanned < limit {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO schema_metadata (key, value) VALUES (?1, '1')",
+                params![EVENT_METADATA_BACKFILL_COMPLETED_KEY],
+            )?;
+        }
+        Ok(result)
+    }
+
     /// Backfill cached event metadata for all currently eligible legacy rows.
     pub fn backfill_event_metadata(&mut self) -> Result<MetricMetadataBackfillSummary, GitAiError> {
         let mut total = MetricMetadataBackfillSummary::default();
@@ -3376,6 +3410,40 @@ mod tests {
             .unwrap();
         assert_eq!(empty_summary, MetricMetadataBackfillSummary::default());
         assert_eq!(empty_last_id, None);
+    }
+
+    #[test]
+    fn metadata_backfill_completion_survives_restart_without_rescanning() {
+        let (mut db, temp_dir) = create_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json) VALUES (?1), (?2)",
+                params![event_json(days_ago(2)), event_json(days_ago(1))],
+            )
+            .unwrap();
+
+        let (first, last_id) = db.backfill_event_metadata_batch_once(0, 1).unwrap();
+        assert_eq!(first.scanned, 1);
+        assert!(!db.event_metadata_backfill_completed().unwrap());
+
+        // An interrupted scan restarts at zero; the first row is already
+        // backfilled, while the second remains eligible.
+        drop(db);
+        let conn = crate::sqlite::open_with_memory_limits(temp_dir.path().join("test-metrics.db"))
+            .unwrap();
+        let mut db = MetricsDatabase { conn };
+        db.initialize_schema().unwrap();
+        let (resumed, _) = db.backfill_event_metadata_batch_once(0, 10).unwrap();
+        assert_eq!(resumed.scanned, 1);
+        assert!(db.event_metadata_backfill_completed().unwrap());
+        assert_eq!(metric_metadata_rows(&db).len(), 2);
+        assert!(metric_metadata_rows(&db).iter().all(|(ts, _)| ts.is_some()));
+
+        // Another daemon start sees the persisted marker and does no scan.
+        let (repeat, repeat_last_id) = db.backfill_event_metadata_batch_once(0, 10).unwrap();
+        assert_eq!(repeat, MetricMetadataBackfillSummary::default());
+        assert_eq!(repeat_last_id, None);
+        assert!(last_id.is_some());
     }
 
     #[test]
