@@ -149,6 +149,14 @@ fn read_bounded(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, &'stat
 }
 
 fn default_policy_path() -> Option<PathBuf> {
+    #[cfg(feature = "test-support")]
+    if let Some(home) = std::env::var_os("GIT_AI_TEST_HOME").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(home)
+                .join(".git-ai")
+                .join(TRACKAI_DELIVERY_POLICY_FILE),
+        );
+    }
     dirs::home_dir().map(|home| home.join(".git-ai").join(TRACKAI_DELIVERY_POLICY_FILE))
 }
 

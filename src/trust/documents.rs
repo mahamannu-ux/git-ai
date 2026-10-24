@@ -146,9 +146,7 @@ fn is_canonical_base64(value: &str) -> bool {
     // Last quantum: XXXX, XXX= or XX==.
     let middle_data = is_b64_char(tail[2]);
     let last_data = is_b64_char(tail[3]);
-    (middle_data && last_data)
-        || (middle_data && tail[3] == b'=')
-        || (tail[2] == b'=' && tail[3] == b'=')
+    (middle_data && (last_data || tail[3] == b'=')) || (tail[2] == b'=' && tail[3] == b'=')
 }
 
 /// Strict base64 like `decodeBase64Strict`: canonical alphabet and padding, bounded

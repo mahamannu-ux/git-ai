@@ -129,9 +129,11 @@ jobs:
       - name: Install Task
         uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2
 
-      - name: Install mold linker (Linux)
+      - name: Install Linux Rust dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y mold
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev mold pkg-config
 
       - name: Run tests (Unix)
         if: runner.os != 'Windows'
@@ -491,6 +493,11 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
+
+      - name: Install Linux Rust dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Cache dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5

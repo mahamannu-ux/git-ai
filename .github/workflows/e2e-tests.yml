@@ -44,14 +44,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install BATS
+      - name: Install Linux Rust and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats
-
-      - name: Install jq
-        run: |
-          sudo apt-get install -y jq
+          sudo apt-get install -y bats jq libdbus-1-dev pkg-config
 
       - name: Install Task
         uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2

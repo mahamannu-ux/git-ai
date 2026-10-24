@@ -82,21 +82,50 @@ fn normalize_blame_output(blame_output: &str) -> String {
         .to_string()
 }
 
-fn normalize_blame_for_format_parity(blame_output: &str) -> String {
+fn normalize_blame_for_format_parity(blame_output: &str, abbreviation_width: usize) -> String {
     blame_output
         .lines()
         .map(|line| {
             if let Some(start_paren) = line.find('(')
                 && let Some(end_paren) = line.rfind(')')
             {
-                let prefix = &line[..start_paren];
+                let raw_prefix = line[..start_paren].trim();
+                let hash = raw_prefix.strip_prefix('^').unwrap_or(raw_prefix);
+                let normalized_hash = if hash.len() >= abbreviation_width
+                    && hash.chars().all(|character| character.is_ascii_hexdigit())
+                {
+                    &hash[..abbreviation_width]
+                } else {
+                    hash
+                };
                 let suffix = &line[end_paren + 1..];
-                return format!("{prefix}(META){suffix}");
+                return if normalized_hash.is_empty() {
+                    format!("(META){suffix}")
+                } else {
+                    format!("{normalized_hash} (META){suffix}")
+                };
             }
             line.to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn blame_format_normalizer_preserves_identity_across_git_auto_abbrev_widths() {
+    let twelve = "0123456789ab (author metadata) content";
+    let thirteen = "0123456789abc (author metadata) content";
+    let different = "1123456789abc (author metadata) content";
+
+    assert_eq!(
+        normalize_blame_for_format_parity(twelve, 12),
+        normalize_blame_for_format_parity(thirteen, 12)
+    );
+    assert_ne!(
+        normalize_blame_for_format_parity(thirteen, 12),
+        normalize_blame_for_format_parity(different, 12),
+        "normalization must retain the requested commit-identity prefix"
+    );
 }
 
 fn unique_worktree_path() -> PathBuf {
@@ -180,8 +209,8 @@ crate::worktree_test_wrappers! {
             .expect("git-ai blame with boundary flags should succeed");
 
         assert_eq!(
-            normalize_blame_for_format_parity(&git_ai_output),
-            normalize_blame_for_format_parity(&git_output),
+            normalize_blame_for_format_parity(&git_ai_output, 12),
+            normalize_blame_for_format_parity(&git_output, 12),
             "git-ai blame should match git formatting for boundary and abbrev in worktrees"
         );
 
@@ -193,8 +222,8 @@ crate::worktree_test_wrappers! {
             .expect("git-ai blame --root should succeed");
 
         assert_eq!(
-            normalize_blame_for_format_parity(&git_ai_root_output),
-            normalize_blame_for_format_parity(&git_root_output),
+            normalize_blame_for_format_parity(&git_ai_root_output, 12),
+            normalize_blame_for_format_parity(&git_root_output, 12),
             "git-ai blame should match git formatting for --root and abbrev in worktrees"
         );
     }
