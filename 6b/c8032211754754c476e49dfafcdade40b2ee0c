@@ -1,0 +1,23 @@
+tests/integration/main.rs
+  s_6e0b40b97728cf::t_a0b0e2e226cd93 149
+tests/integration/test_utils.rs
+  s_6e0b40b97728cf::t_9a81dae0022943 34-51
+tests/integration/usage_period.rs
+  s_6e0b40b97728cf::t_860b30968149ab 1-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.19",
+  "base_commit_sha": "6bc8032211754754c476e49dfafcdade40b2ee0c",
+  "prompts": {},
+  "sessions": {
+    "s_6e0b40b97728cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16f10-6086-7183-b8c2-4f3cf377f63b",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "mahamannu-ux <mahamannu@gmail.com>"
+    }
+  }
+}
