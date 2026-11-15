@@ -7,20 +7,21 @@
 # re-trigger (idempotency), an unusual --bin path, and the login-time lock race
 # covered by `bg start --retry-secs`.
 #
-# Usage: test-login-start.sh lifecycle
+# Usage: test-login-start.sh [lifecycle|auto-update]
 #
 # Environment:
 #   BINARY_SOURCE          local (default) | release
 #   GIT_AI_LOCAL_BINARY    binary to install when BINARY_SOURCE=local
+#   GIT_AI_INSTALL_SCRIPT  immutable fork release installer (release mode)
 #   GIT_AI_RELEASE_TAG     release tag to install when BINARY_SOURCE=release
 #                          (empty = latest)
+#   LATEST_TAG             immutable target tag for auto-update
 #   MDM_TEST_LOG_DIR       where daemon logs are copied (default $RUNNER_TEMP/mdm-logs)
 #
-# Task9b scope: macOS lifecycle only. There is no auto-update scenario, no
-# --env tuning surface (the launchers carry no configuration; Task9c owns it),
-# and no Linux coverage. Ported from upstream snapshot
-# 0670e7ef27590af0e8ff5409267f3f4b09b8fcb4 (same Apache-2.0 project) with the
-# Linux, auto-update, and configuration-transport surface removed.
+# Task9f-mdm-b adds a published N-1 to N regression without adding a launcher
+# configuration surface or Linux coverage. Ported from upstream snapshot
+# 0670e7ef27590af0e8ff5409267f3f4b09b8fcb4 and adapted from
+# git-ai-project/git-ai@0cd8ede139e5cb5287cd09563ce677525d703547.
 set -euo pipefail
 
 SCENARIO="${1:-lifecycle}"
@@ -28,10 +29,15 @@ BINARY_SOURCE="${BINARY_SOURCE:-local}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_OUT="${MDM_TEST_LOG_DIR:-${RUNNER_TEMP:-/tmp}/mdm-logs}"
 BIN="$HOME/.git-ai/bin/git-ai"
+INSTALL_SCRIPT="${GIT_AI_INSTALL_SCRIPT:-$REPO_ROOT/install.sh}"
 DAEMON_DIR="$HOME/.git-ai/internal/daemon"
 LABEL="com.usegitai.bg"
+UPDATE_INTERVAL_SET=0
 
-[ "$SCENARIO" = "lifecycle" ] || { echo "unsupported scenario: $SCENARIO (Task9b runs lifecycle only)" >&2; exit 1; }
+case "$SCENARIO" in
+  lifecycle|auto-update) ;;
+  *) echo "unsupported scenario: $SCENARIO" >&2; exit 1 ;;
+esac
 case "$(uname -s)" in
   Darwin) ;;
   *) echo "unsupported OS: $(uname -s) (Task9b covers macOS here; see test-login-start.ps1 for Windows)" >&2; exit 1 ;;
@@ -50,10 +56,11 @@ install_binary() {
       GIT_AI_LOCAL_BINARY="$GIT_AI_LOCAL_BINARY" bash "$REPO_ROOT/install.sh"
       ;;
     release)
+      [ -f "$INSTALL_SCRIPT" ] || fail "release installer missing: $INSTALL_SCRIPT"
       if [ -n "${GIT_AI_RELEASE_TAG:-}" ]; then
-        GIT_AI_RELEASE_TAG="$GIT_AI_RELEASE_TAG" bash "$REPO_ROOT/install.sh"
+        GIT_AI_RELEASE_TAG="$GIT_AI_RELEASE_TAG" bash "$INSTALL_SCRIPT"
       else
-        bash "$REPO_ROOT/install.sh"
+        bash "$INSTALL_SCRIPT"
       fi
       ;;
     *) fail "BINARY_SOURCE must be local or release" ;;
@@ -100,6 +107,21 @@ stop_daemon() {
 
 daemon_command_line() { ps -p "$(daemon_pid)" -o args= 2>/dev/null || true; }
 
+installed_version() {
+  "$BIN" --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+pid_changed_from() {
+  local previous="$1" current
+  current="$(daemon_pid)"
+  [ -n "$current" ] && [ "$current" != "$previous" ]
+}
+
+set_fast_update_interval() {
+  launchctl setenv GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL 10
+  UPDATE_INTERVAL_SET=1
+}
+
 run_mdm_script() {
   sh "$MDM_SCRIPT" "$@"
 }
@@ -136,6 +158,9 @@ cleanup() {
   mkdir -p "$LOG_OUT"
   cp -R "$DAEMON_DIR/logs" "$LOG_OUT/daemon-logs" 2>/dev/null
   launchctl print "gui/$(id -u)/$LABEL" >"$LOG_OUT/launchctl-print.txt" 2>&1
+  if [ "$UPDATE_INTERVAL_SET" -eq 1 ]; then
+    launchctl unsetenv GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL >/dev/null 2>&1
+  fi
   run_mdm_script --uninstall >/dev/null 2>&1
   [ -x "$BIN" ] && "$BIN" bg shutdown >/dev/null 2>&1
   rm -rf "$STATUS_REPO"
@@ -268,5 +293,40 @@ scenario_launcher_retry() {
   log "launcher retry semantics verified"
 }
 
-scenario_lifecycle
-log "PASS lifecycle on macos"
+scenario_auto_update() {
+  [ "$BINARY_SOURCE" = "release" ] || fail "auto-update needs BINARY_SOURCE=release"
+  [ -n "${GIT_AI_RELEASE_TAG:-}" ] || fail "auto-update needs an immutable older release tag"
+  [ -n "${LATEST_TAG:-}" ] || fail "auto-update needs an immutable latest release tag"
+  local latest="${LATEST_TAG#v}"
+
+  install_binary
+  local before
+  before="$(installed_version)"
+  [ "$before" != "$latest" ] || fail "older and latest release tags resolved to the same version"
+  "$BIN" config set disable_auto_updates false
+  stop_daemon
+
+  # Test-only launchd state accelerates the hosted regression. The managed
+  # launcher itself retains its frozen argument and configuration contract.
+  set_fast_update_interval
+  register_and_wait_for_daemon
+  local pid1
+  pid1="$(daemon_pid)"
+
+  version_is_latest() { [ "$(installed_version)" = "$latest" ]; }
+  wait_for 360 "binary updated to $latest" version_is_latest
+  wait_for 120 "daemon restarted after update" pid_changed_from "$pid1"
+  wait_for 30 "updated daemon healthy" daemon_up
+  registered || fail "login start registration missing after update"
+  mechanism_sane
+
+  run_mdm_script --uninstall
+  ! registered || fail "login start still registered after --uninstall"
+  log "auto-update $before -> $latest completed under login start"
+}
+
+case "$SCENARIO" in
+  lifecycle) scenario_lifecycle ;;
+  auto-update) scenario_auto_update ;;
+esac
+log "PASS $SCENARIO on macos"

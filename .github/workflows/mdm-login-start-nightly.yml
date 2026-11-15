@@ -1,0 +1,268 @@
+name: MDM Published Release Regression
+
+# Adapted from git-ai-project/git-ai@0cd8ede139e5cb5287cd09563ce677525d703547
+# and @97074e657785cb54b5140180e77d867315961feb. The fork uses only its own
+# immutable tags, requires production trust pins and treats asset drift as fatal.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  fixture-harness:
+    name: Synthetic release-selection fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise deterministic fixture cases
+        run: python3 scripts/mdm/select-release-pair.py --self-test
+
+  select-releases:
+    name: Select eligible fork releases
+    runs-on: ubuntu-latest
+    outputs:
+      pair_available: ${{ steps.select.outputs.pair_available }}
+      older: ${{ steps.select.outputs.older }}
+      latest: ${{ steps.select.outputs.latest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read fork releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --output "$RUNNER_TEMP/releases.json"
+
+      - name: Identify tags with production trust pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/candidate-tags.txt" <<'PY'
+          import json, re, sys
+          releases = json.load(open(sys.argv[1], encoding="utf-8"))
+          for release in releases:
+              tag = release.get("tag_name", "")
+              if (not release.get("draft") and not release.get("prerelease")
+                      and re.fullmatch(r"v?\d+\.\d+\.\d+", tag)):
+                  print(tag)
+          PY
+          : > "$RUNNER_TEMP/trusted-tags.txt"
+          while IFS= read -r tag; do
+            policy="$RUNNER_TEMP/policy-${tag}.rs"
+            if ! gh api \
+              -H 'Accept: application/vnd.github.raw+json' \
+              "repos/${GITHUB_REPOSITORY}/contents/src/security/policy_apply.rs?ref=$tag" \
+              > "$policy" 2>/dev/null; then
+              continue
+            fi
+            if python3 - "$policy" <<'PY'
+          import re, sys
+          source = open(sys.argv[1], encoding="utf-8").read()
+          match = re.search(r"const\s+PINNED_ROOT_KEYIDS[^=]*=\s*&\[(.*?)\];", source, re.S)
+          raise SystemExit(0 if match and re.search(r'"[0-9a-f]{64}"', match.group(1)) else 1)
+          PY
+            then
+              printf '%s\n' "$tag" >> "$RUNNER_TEMP/trusted-tags.txt"
+            fi
+          done < "$RUNNER_TEMP/candidate-tags.txt"
+
+      - name: Select immediate N-1 and N
+        id: select
+        run: |
+          set -euo pipefail
+          python3 scripts/mdm/select-release-pair.py \
+            --releases-json "$RUNNER_TEMP/releases.json" \
+            --trusted-tags "$RUNNER_TEMP/trusted-tags.txt" \
+            --github-output "$GITHUB_OUTPUT"
+          if ! grep -qx 'pair_available=true' "$GITHUB_OUTPUT"; then
+            echo 'no eligible release pair' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  published-assets:
+    name: Verify immutable assets (${{ matrix.tag }})
+    needs: select-releases
+    if: needs.select-releases.outputs.pair_available == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        tag:
+          - ${{ needs.select-releases.outputs.older }}
+          - ${{ needs.select-releases.outputs.latest }}
+    steps:
+      - name: Download assets by immutable tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ matrix.tag }}'
+          mkdir -p "$RUNNER_TEMP/release-$tag"
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-$tag" \
+            --pattern 'git-ai-login-start-macos.sh' \
+            --pattern 'git-ai-login-start-windows.ps1' \
+            --pattern 'install.sh' \
+            --pattern 'install.ps1' \
+            --pattern 'git-ai-windows-x64.msi' \
+            --pattern 'trackai-endpoint-macos-arm64.pkg' \
+            --pattern 'trackai-endpoint-macos-x64.pkg' \
+            --pattern 'PKG-SHA256SUMS' \
+            --pattern 'SHA256SUMS'
+
+      - name: Compare MDM assets with the same tag source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ matrix.tag }}'
+          release="$RUNNER_TEMP/release-$tag"
+          for pair in \
+            'git-ai-login-start-macos.sh:mdm/macos/install-login-start.sh' \
+            'git-ai-login-start-windows.ps1:mdm/windows/install-login-start.ps1'; do
+            asset="${pair%%:*}"
+            source="${pair#*:}"
+            gh api \
+              -H 'Accept: application/vnd.github.raw+json' \
+              "repos/${GITHUB_REPOSITORY}/contents/$source?ref=$tag" \
+              > "$RUNNER_TEMP/source-$asset"
+            diff --no-dereference --brief "$RUNNER_TEMP/source-$asset" "$release/$asset"
+          done
+
+      - name: Verify manifest hashes and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ matrix.tag }}'
+          release="$RUNNER_TEMP/release-$tag"
+          source_digest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/$tag" --jq .sha)"
+          test -n "$source_digest"
+          check_hash() {
+            asset="$1" manifest="$2"
+            expected="$(awk -v asset="$asset" '$2 == asset || $2 == "./" asset { print $1 }' "$release/$manifest")"
+            actual="$(sha256sum "$release/$asset" | awk '{print $1}')"
+            test -n "$expected" && test "$expected" = "$actual"
+          }
+          for asset in git-ai-login-start-macos.sh git-ai-login-start-windows.ps1 install.sh install.ps1 git-ai-windows-x64.msi; do
+            check_hash "$asset" SHA256SUMS
+          done
+          for asset in trackai-endpoint-macos-arm64.pkg trackai-endpoint-macos-x64.pkg; do
+            check_hash "$asset" PKG-SHA256SUMS
+          done
+          for asset in \
+            git-ai-login-start-macos.sh \
+            git-ai-login-start-windows.ps1 \
+            install.sh \
+            install.ps1 \
+            git-ai-windows-x64.msi \
+            trackai-endpoint-macos-arm64.pkg \
+            trackai-endpoint-macos-x64.pkg \
+            SHA256SUMS \
+            PKG-SHA256SUMS; do
+            gh attestation verify "$release/$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$source_digest" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+
+  login-start:
+    name: ${{ matrix.scenario }} on ${{ matrix.platform }}
+    needs: [select-releases, published-assets]
+    if: needs.select-releases.outputs.pair_available == 'true' && needs.published-assets.result == 'success'
+    timeout-minutes: 30
+    permissions:
+      attestations: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos, windows]
+        scenario: [lifecycle, auto-update]
+        include:
+          - platform: macos
+            runner: macos-latest
+          - platform: windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      BINARY_SOURCE: release
+      GIT_AI_RELEASE_TAG: ${{ matrix.scenario == 'lifecycle' && needs.select-releases.outputs.latest || needs.select-releases.outputs.older }}
+      LATEST_TAG: ${{ needs.select-releases.outputs.latest }}
+      MDM_TEST_LOG_DIR: ${{ runner.temp }}/mdm-logs
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download and verify selected fork installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GIT_AI_RELEASE_TAG"
+          asset=install.sh
+          if [ '${{ matrix.platform }}' = windows ]; then asset=install.ps1; fi
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP" \
+            --pattern "$asset" \
+            --pattern SHA256SUMS
+          expected="$(awk -v asset="$asset" '$2 == asset || $2 == "./" asset { print $1 }' "$RUNNER_TEMP/SHA256SUMS")"
+          actual="$(sha256sum "$RUNNER_TEMP/$asset" | awk '{print $1}')"
+          test -n "$expected" && test "$expected" = "$actual"
+          source_digest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/$tag" --jq .sha)"
+          test -n "$source_digest"
+          for verified in "$asset" SHA256SUMS; do
+            gh attestation verify "$RUNNER_TEMP/$verified" \
+              --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$source_digest" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+          printf 'GIT_AI_INSTALL_SCRIPT=%s/%s\n' "$RUNNER_TEMP" "$asset" >> "$GITHUB_ENV"
+          if [ "$asset" = install.sh ]; then chmod +x "$RUNNER_TEMP/$asset"; fi
+
+      - name: Run macOS scenario
+        if: matrix.platform == 'macos'
+        run: bash scripts/mdm/test-login-start.sh '${{ matrix.scenario }}'
+
+      - name: Run Windows scenario
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/mdm/test-login-start.ps1 -Scenario '${{ matrix.scenario }}'
+
+      - name: Record Windows boundary
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: '"security: not monitored on Windows" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append'
+
+      - name: Upload bounded synthetic runner logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mdm-published-${{ matrix.platform }}-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/mdm-logs
+          retention-days: 7
+          if-no-files-found: warn
